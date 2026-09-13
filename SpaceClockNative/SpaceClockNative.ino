@@ -131,6 +131,7 @@ bool motionBaselineReady = false;
 static constexpr uint8_t COMPANION_PAGE_COUNT = 4;
 String companionHosts[COMPANION_PAGE_COUNT];
 String companionInternetUrls[COMPANION_PAGE_COUNT];
+String companionNames[COMPANION_PAGE_COUNT] = {"Main", "Studio", "Remote", "Backup"};
 uint16_t companionPorts[COMPANION_PAGE_COUNT] = {16622, 16622, 16622, 16622};
 uint8_t companionPage = 0;
 uint32_t companionCenterPressedAt = 0;
@@ -155,6 +156,10 @@ bool mqttReconnectRequested = false;
 WebServer settingsServer(80);
 bool settingsServerReady = false;
 bool companionRegistered = false;
+static constexpr uint8_t SAVED_WIFI_COUNT = 10;
+String savedWifiSsids[SAVED_WIFI_COUNT];
+String savedWifiPasswords[SAVED_WIFI_COUNT];
+uint32_t lastWifiReconnectAttempt = 0;
 String companionDeviceId = "core2";
 static constexpr uint8_t COMPANION_COLS = 3;
 static constexpr uint8_t COMPANION_ROWS = 2;
@@ -266,6 +271,13 @@ void saveSettings() {
     prefs.putUShort(portKey.c_str(), companionPorts[i]);
     String remoteKey = "compR" + String(i);
     prefs.putString(remoteKey.c_str(), companionInternetUrls[i]);
+    String nameKey = "compN" + String(i);
+    prefs.putString(nameKey.c_str(), companionNames[i]);
+  }
+  for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
+    String ssidKey = "wifiS" + String(i), passwordKey = "wifiP" + String(i);
+    prefs.putString(ssidKey.c_str(), savedWifiSsids[i]);
+    prefs.putString(passwordKey.c_str(), savedWifiPasswords[i]);
   }
   prefs.putBytes("alarms", alarms, sizeof(alarms));
   prefs.putUChar("alarmRev", ALARM_SCHEMA_VERSION);
@@ -323,10 +335,17 @@ void loadSettings() {
     companionPorts[i] = prefs.getUShort(portKey.c_str(), i == 0 ? legacyCompanionPort : 16622);
     String remoteKey = "compR" + String(i);
     companionInternetUrls[i] = prefs.getString(remoteKey.c_str(), "");
+    String nameKey = "compN" + String(i);
+    companionNames[i] = prefs.getString(nameKey.c_str(), ("Page " + String(i + 1)).c_str());
     if (!companionInternetUrls[i].length() && (companionHosts[i].startsWith("http://") || companionHosts[i].startsWith("https://") || companionHosts[i].startsWith("ws://") || companionHosts[i].startsWith("wss://"))) {
       companionInternetUrls[i] = companionHosts[i];
       companionHosts[i] = "";
     }
+  }
+  for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
+    String ssidKey = "wifiS" + String(i), passwordKey = "wifiP" + String(i);
+    savedWifiSsids[i] = prefs.getString(ssidKey.c_str(), "");
+    savedWifiPasswords[i] = prefs.getString(passwordKey.c_str(), "");
   }
   size_t alarmBytes = prefs.getBytesLength("alarms");
   uint8_t alarmRevision = prefs.getUChar("alarmRev", 0);
@@ -341,6 +360,39 @@ void loadSettings() {
     for (int i = 0; i < ALARM_COUNT; ++i) alarms[i].lastDay = -1;
     saveSettings();
   }
+}
+
+bool connectSavedWifi(uint32_t perNetworkTimeoutMs = 6000) {
+  struct Candidate { int slot; int rssi; } candidates[SAVED_WIFI_COUNT];
+  int candidateCount = 0;
+  int found = WiFi.scanNetworks(false, true);
+  for (int slot = 0; slot < SAVED_WIFI_COUNT; ++slot) {
+    if (!savedWifiSsids[slot].length()) continue;
+    int bestRssi = -1000;
+    for (int network = 0; network < found; ++network) {
+      if (WiFi.SSID(network) == savedWifiSsids[slot]) bestRssi = max(bestRssi, (int)WiFi.RSSI(network));
+    }
+    if (bestRssi > -1000) candidates[candidateCount++] = {slot, bestRssi};
+  }
+  WiFi.scanDelete();
+  for (int i = 0; i < candidateCount; ++i) {
+    for (int j = i + 1; j < candidateCount; ++j) {
+      if (candidates[j].rssi > candidates[i].rssi) { Candidate swap = candidates[i]; candidates[i] = candidates[j]; candidates[j] = swap; }
+    }
+  }
+  for (int i = 0; i < candidateCount; ++i) {
+    int slot = candidates[i].slot;
+    WiFi.begin(savedWifiSsids[slot].c_str(), savedWifiPasswords[slot].c_str());
+    if (WiFi.waitForConnectResult(perNetworkTimeoutMs) == WL_CONNECTED) return true;
+  }
+  return false;
+}
+
+void maintainSavedWifi(uint32_t nowMs) {
+  if (WiFi.status() == WL_CONNECTED || nowMs - lastWifiReconnectAttempt < 20000UL) return;
+  lastWifiReconnectAttempt = nowMs;
+  connectSavedWifi(3500);
+  if (WiFi.status() == WL_CONNECTED && !settingsServerReady) { setupSettingsServer(); syncTime(); }
 }
 
 void syncTime() {
@@ -693,20 +745,23 @@ void drawCompanionButton(int key) {
   M5.Display.endWrite();
 }
 
+void drawCompanionPageBar();
+
 void drawCompanionButtons() {
   M5.Display.fillScreen(BG);
   for (int i = 0; i < COMPANION_KEYS; ++i) drawCompanionButton(i);
-  String previousLabel = String((companionPage + COMPANION_PAGE_COUNT - 1) % COMPANION_PAGE_COUNT + 1);
-  String currentLabel = String(companionPage + 1);
-  String nextLabel = String((companionPage + 1) % COMPANION_PAGE_COUNT + 1);
-  drawBottomBar(previousLabel.c_str(), currentLabel.c_str(), nextLabel.c_str());
+  drawCompanionPageBar();
 }
 
 void drawCompanionPageBar() {
-  String previousLabel = String((companionPage + COMPANION_PAGE_COUNT - 1) % COMPANION_PAGE_COUNT + 1);
-  String currentLabel = String(companionPage + 1);
-  String nextLabel = String((companionPage + 1) % COMPANION_PAGE_COUNT + 1);
-  drawBottomBar(previousLabel.c_str(), currentLabel.c_str(), nextLabel.c_str());
+  M5.Display.fillRect(0, 215, 320, 25, BG);
+  M5.Display.fillTriangle(45, 227, 59, 219, 59, 235, ACCENT);
+  M5.Display.fillTriangle(275, 227, 261, 219, 261, 235, ACCENT);
+  String name = companionNames[companionPage];
+  if (!name.length()) name = "Page " + String(companionPage + 1);
+  if (name.length() > 16) name = name.substring(0, 16);
+  useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(ACCENT, BG);
+  M5.Display.drawString(name, 160, 228);
 }
 
 void clearCompanionPageData() {
@@ -1850,7 +1905,7 @@ void publishMqttSettings() {
   }
   JsonArray companion = doc["companion"].to<JsonArray>();
   for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
-    JsonObject page = companion.add<JsonObject>(); page["page"] = i + 1; page["host"] = companionHosts[i]; page["port"] = companionPorts[i]; page["internet_url"] = companionInternetUrls[i];
+    JsonObject page = companion.add<JsonObject>(); page["page"] = i + 1; page["name"] = companionNames[i]; page["host"] = companionHosts[i]; page["port"] = companionPorts[i]; page["internet_url"] = companionInternetUrls[i];
   }
   JsonObject mqtt = doc["mqtt"].to<JsonObject>();
   mqtt["enabled"] = mqttEnabled; mqtt["host"] = mqttHost; mqtt["port"] = mqttPort;
@@ -1919,6 +1974,7 @@ bool applyMqttSettings(const String& payload, String& error) {
   JsonArrayConst companion = root["companion"];
   for (JsonObjectConst item : companion) {
     int i = (item["page"] | 0) - 1; if (i < 0 || i >= COMPANION_PAGE_COUNT) continue;
+    if (item["name"].is<const char*>()) companionNames[i] = item["name"].as<const char*>();
     if (item["host"].is<const char*>()) { String host = item["host"].as<const char*>(); reconnectCompanion |= host != companionHosts[i]; companionHosts[i] = host; }
     if (item["port"].is<int>()) { uint16_t port = constrain(item["port"].as<int>(), 1, 65535); reconnectCompanion |= port != companionPorts[i]; companionPorts[i] = port; }
     if (item["internet_url"].is<const char*>()) { String url = item["internet_url"].as<const char*>(); reconnectCompanion |= url != companionInternetUrls[i]; companionInternetUrls[i] = url; }
@@ -2026,8 +2082,13 @@ void sendSettingsPage(const String& message = "") {
   page += "<p>Device time: <b>" + String(webTime) + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</p>";
   if (message.length()) page += "<p class='ok'>" + htmlEscape(message) + "</p>";
   page += "<form method='post' action='/save'>";
-  page += "<label class='field'>Wi-Fi SSID<input name='ssid' value='" + htmlEscape(WiFi.SSID()) + "'></label>";
-  page += "<label class='field'>New Wi-Fi password (leave blank to keep current)<input type='password' name='password'></label>";
+  page += "<h2>Saved Wi-Fi networks</h2><p>Up to 10 networks. Passwords are stored only on this Core2 and are never shown. Leave a password blank to keep it unchanged.</p>";
+  for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
+    page += "<div class='alarm'><b>Wi-Fi " + String(i + 1) + "</b>";
+    page += "<label class='field'>SSID<input name='wifiS" + String(i) + "' value='" + htmlEscape(savedWifiSsids[i]) + "'></label>";
+    page += "<label class='field'>New password<input type='password' name='wifiP" + String(i) + "' placeholder='Leave blank to keep current'></label>";
+    page += "<label><input type='checkbox' name='wifiD" + String(i) + "'> Remove this network</label></div>";
+  }
   page += "<label class='field'>Time zone (major city)<select name='timeZone'>";
   for (int i = 0; i < TIME_ZONE_COUNT; ++i) page += "<option value='" + String(i) + "'" + (i == timeZoneIndex ? " selected" : "") + ">" + TIME_ZONES[i].city + "</option>";
   page += "</select></label>";
@@ -2099,6 +2160,7 @@ void sendSettingsPage(const String& message = "") {
   page += "<h2>Companion pages</h2><p>The local host is preferred automatically. If unavailable, the Internet WebSocket URL is used. Either field may be blank.</p>";
   for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
     page += "<div class='alarm'><b>Page " + String(i + 1) + "</b>";
+    page += "<label class='field'>Host name<input name='compName" + String(i) + "' maxlength='24' value='" + htmlEscape(companionNames[i]) + "'></label>";
     page += "<label class='field'>Local host/IP<input name='compHost" + String(i) + "' placeholder='10.43.50.145' value='" + htmlEscape(companionHosts[i]) + "'></label>";
     page += "<label class='field'>Local TCP port<input type='number' min='1' max='65535' name='compPort" + String(i) + "' value='" + String(companionPorts[i]) + "'></label>";
     page += "<label class='field'>Internet WebSocket URL<input name='compRemote" + String(i) + "' placeholder='https://example.com/satellite' value='" + htmlEscape(companionInternetUrls[i]) + "'></label></div>";
@@ -2180,9 +2242,15 @@ void setupSettingsServer() {
       }
     });
   settingsServer.on("/save", HTTP_POST, []() {
-    String oldSsid = WiFi.SSID();
-    String newSsid = settingsServer.arg("ssid");
-    String newPassword = settingsServer.arg("password");
+    bool wifiChanged = false;
+    for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
+      String nextSsid = settingsServer.arg("wifiS" + String(i)); nextSsid.trim();
+      String nextPassword = settingsServer.arg("wifiP" + String(i));
+      if (settingsServer.hasArg("wifiD" + String(i))) { nextSsid = ""; nextPassword = ""; }
+      else if (!nextPassword.length() && nextSsid == savedWifiSsids[i]) nextPassword = savedWifiPasswords[i];
+      wifiChanged |= nextSsid != savedWifiSsids[i] || nextPassword != savedWifiPasswords[i];
+      savedWifiSsids[i] = nextSsid; savedWifiPasswords[i] = nextPassword;
+    }
     timeZoneIndex = constrain(settingsServer.arg("timeZone").toInt(), 0, (int)TIME_ZONE_COUNT - 1);
     clockFace = static_cast<ClockFace>(constrain(settingsServer.arg("face").toInt(), 0, 1));
     use24HourTime = settingsServer.arg("time24").toInt() != 0;
@@ -2243,8 +2311,10 @@ void setupSettingsServer() {
     for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
       String nextHost = settingsServer.arg("compHost" + String(i));
       String nextRemote = settingsServer.arg("compRemote" + String(i));
+      String nextName = settingsServer.arg("compName" + String(i)); nextName.trim();
       uint16_t nextPort = (uint16_t)constrain(settingsServer.arg("compPort" + String(i)).toInt(), 1, 65535);
       if (nextHost != companionHosts[i] || nextRemote != companionInternetUrls[i] || nextPort != companionPorts[i]) reconnectCompanion = true;
+      companionNames[i] = nextName.length() ? nextName : "Page " + String(i + 1);
       companionHosts[i] = nextHost;
       companionInternetUrls[i] = nextRemote;
       companionPorts[i] = nextPort;
@@ -2255,8 +2325,8 @@ void setupSettingsServer() {
     }
     saveSettings();
     sendSettingsPage("Settings saved. The clock will apply them now.");
-    if (newSsid.length() && (newSsid != oldSsid || newPassword.length())) {
-      delay(300); WiFi.disconnect(); WiFi.begin(newSsid.c_str(), newPassword.c_str());
+    if (wifiChanged) {
+      delay(300); WiFi.disconnect(false); connectSavedWifi();
     } else {
       syncTime();
       m5::rtc_datetime_t brightnessNow; getClockDateTime(&brightnessNow); applyDisplayBrightness(brightnessNow);
@@ -2293,8 +2363,10 @@ void setup() {
   WiFi.mode(WIFI_STA); WiFi.setSleep(true); WiFi.begin();
   drawClock(true); drawAstronaut();
   if (WiFi.waitForConnectResult(4000) != WL_CONNECTED) {
-    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
-    WiFi.waitForConnectResult(10000);
+    if (!connectSavedWifi() && strlen(DEFAULT_WIFI_SSID)) {
+      WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
+      WiFi.waitForConnectResult(10000);
+    }
   }
   if (WiFi.status() == WL_CONNECTED) { setupSettingsServer(); syncTime(); drawClock(true); drawAstronaut(); }
 }
@@ -2311,6 +2383,7 @@ void loop() {
   handleTouch();
   handleSerialConfig();
   uint32_t nowMs = millis();
+  maintainSavedWifi(nowMs);
   maintainMqtt(nowMs);
   if (meditationAmbientPendingAt && (int32_t)(nowMs - meditationAmbientPendingAt) >= 0) {
     meditationAmbientPendingAt = 0;

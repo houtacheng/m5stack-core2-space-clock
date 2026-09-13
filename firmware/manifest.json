@@ -1,7 +1,7 @@
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "1a9b1126dc85106091143bdf1f8987aede3161217e8226b319138aba884f0073",
-  "size": 4560432,
-  "notes": "Adds automatic local TCP and Internet WSS switching for every Companion page and removes all build-time Wi-Fi credentials."
+  "sha256": "f28530e75a8e1c0da4dc47fd18fbd6d161049e86cd59b1eac2b1d3f3eccce18c",
+  "size": 4565120,
+  "notes": "Adds ten saved Wi-Fi networks with automatic strongest-network reconnect, plus names for Companion hosts displayed between graphical page arrows."
 }
