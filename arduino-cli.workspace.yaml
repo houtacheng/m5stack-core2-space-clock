@@ -1,0 +1,10 @@
+board_manager:
+  additional_urls: []
+directories:
+  builtin:
+    libraries: /Applications/Arduino IDE.app/Contents/Resources/app/node_modules/arduino-ide-extension/Examples
+  data: /Users/sunda/Library/Arduino15
+  downloads: /Users/sunda/Documents/m5stack core2/.arduino-cache/downloads
+  user: /Users/sunda/Documents/Arduino
+build_cache:
+  path: /Users/sunda/Documents/m5stack core2/.arduino-cache/builds

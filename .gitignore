@@ -1,0 +1,9 @@
+.arduino-build/
+.arduino-cache/
+*.bin
+*.elf
+*.map
+SpaceClockNative/wifi_secrets.h
+agentdeck-reference/
+original-space-clock/
+!firmware/SpaceClockNative-OTA.bin
