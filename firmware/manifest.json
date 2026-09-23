@@ -1,7 +1,7 @@
 {
-  "version": "2.9.4",
+  "version": "2.9.5",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "e327da9cd2c6868ad384ca6a48df8df97c235eedd9a97345ed42880a53541252",
-  "size": 4386944,
-  "notes": "Adds long-press night-light toggle from the clock settings icon, configurable night-light color and brightness, and a bilingual categorized web settings interface with independent per-page saving."
+  "sha256": "07ec569bb54d3a0924ab05269f0bef63e0cb3c4b9d0c38e64e32f1b82f424886",
+  "size": 4651440,
+  "notes": "Adds the emotion-observation wizard and reminders, configurable device name, PocketBase API login and submission, and bilingual per-page settings. Existing settings are preserved during OTA."
 }
