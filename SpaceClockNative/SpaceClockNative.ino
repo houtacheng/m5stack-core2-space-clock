@@ -557,9 +557,11 @@ void drawClockNavigationIcons() {
 }
 
 void resetMatrixRain() {
-  const int glyphHeight = 8 * matrixGlyphScale;
-  const int usableColumns = min((int)MATRIX_COLUMNS, 320 / glyphHeight);
-  const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphHeight + 2);
+  const int scale = matrixGlyphScale == 1 ? 1 : 2;
+  const int columnPitch = 16 * scale;
+  const int rowPitch = 18 * scale;
+  const int usableColumns = min((int)MATRIX_COLUMNS, 320 / columnPitch);
+  const int rows = min((int)MATRIX_MAX_ROWS, 240 / rowPitch + 2);
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     matrixActive[i] = i < usableColumns && (esp_random() % 100) < matrixRainDensity;
     matrixHead[i] = -((float)(esp_random() % rows));
@@ -717,13 +719,19 @@ void drawMatrixRainFrame(uint32_t nowMs) {
   float dt = lastMatrixFrame ? (nowMs - lastMatrixFrame) / 1000.0f : frameInterval / 1000.0f;
   if (dt > 0.25f) dt = 0.25f;
   lastMatrixFrame = nowMs;
-  const int glyphSize = 8 * matrixGlyphScale;
-  const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphSize + 2);
+  const int scale = matrixGlyphScale == 1 ? 1 : 2;
+  const int columnPitch = 16 * scale;
+  const int rowPitch = 18 * scale;
+  const int columns = min((int)MATRIX_COLUMNS, 320 / columnPitch);
+  const int rows = min((int)MATRIX_MAX_ROWS, 240 / rowPitch + 2);
   matrixCanvas.fillSprite(TFT_BLACK);
-  matrixCanvas.setTextDatum(top_left);
+  // Keep the font's 12 px glyphs inside separate 16×18 px cells at 1x;
+  // the extra black gutters prevent adjacent symbols from joining into lines.
+  matrixCanvas.setTextDatum(middle_center);
   matrixCanvas.setFont(&SourceHanSansTC_UI8pt8b);
   matrixCanvas.setTextSize(matrixGlyphScale);
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
+    if (i >= columns) { matrixActive[i] = false; continue; }
     if (!matrixActive[i]) {
       // Reintroduce inactive lanes over time so lower density never goes blank.
       if ((esp_random() % 1000) < matrixRainDensity * 3) {
@@ -731,7 +739,7 @@ void drawMatrixRainFrame(uint32_t nowMs) {
         matrixHead[i] = -((float)(esp_random() % max(1, rows / 2)));
       } else continue;
     }
-    int x = i * glyphSize;
+    int cellX = i * columnPitch;
     int previousHead = (int)matrixHead[i];
     matrixHead[i] += matrixSpeed[i] * (0.7f + matrixRainSpeed * 0.095f) * dt;
     int head = (int)matrixHead[i];
@@ -753,7 +761,8 @@ void drawMatrixRainFrame(uint32_t nowMs) {
       matrixCanvas.setTextColor(matrixGlint[i][row]
         ? M5.Display.color565(220, 255, 230)
         : matrixTrailColor(trail, matrixLength[i]));
-      matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row]], x, row * glyphSize);
+      matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row]], cellX + columnPitch / 2,
+                              row * rowPitch + rowPitch / 2);
     }
     if (matrixHead[i] - matrixLength[i] > rows) {
       matrixHead[i] = -((float)(esp_random() % max(1, rows / 2)));
@@ -765,16 +774,18 @@ void drawMatrixRainFrame(uint32_t nowMs) {
   }
   // Add the rare glows after the text is composed, then redraw the crisp symbol.
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
-    if (!matrixActive[i]) continue;
-    int x = i * glyphSize;
+    if (!matrixActive[i] || i >= columns) continue;
+    int cellX = i * columnPitch;
     for (int row = 0; row < rows; ++row) {
       if (!matrixGlint[i][row]) continue;
-      addMatrixGlintBloom(matrixCanvas, x + glyphSize / 2, row * glyphSize + glyphSize / 2,
+      addMatrixGlintBloom(matrixCanvas, cellX + columnPitch / 2, row * rowPitch + rowPitch / 2,
                           matrixGlint[i][row] * 9);
       matrixCanvas.setTextColor(M5.Display.color565(230, 255, 238));
-      matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row]], x, row * glyphSize);
+      matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row]], cellX + columnPitch / 2,
+                              row * rowPitch + rowPitch / 2);
     }
   }
+  matrixCanvas.setTextDatum(top_left);
   drawMatrixClockPanel(matrixCanvas);
   drawMatrixStatus(matrixCanvas);
   drawMatrixNavigationIcons(matrixCanvas);

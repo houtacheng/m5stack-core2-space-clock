@@ -1,7 +1,7 @@
 {
-  "version": "2.9.1",
+  "version": "2.9.2",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "379f03b3dfca4563fd966b423f3fdacb62e0f1fb11039770a8ed2db000f06c9a",
-  "size": 4372032,
-  "notes": "Matrix rain restored to falling drops: white tips fade into the selected phosphor colour and then to transparent tails, with sparse glowing glyphs. Network examples are sanitized."
+  "sha256": "12347e782a4d55167066ca209733cc12319adb781aaca87ed5f1565cb28c14d0",
+  "size": 4372080,
+  "notes": "Matrix rain glyphs now have clear horizontal and vertical spacing to avoid touching or forming continuous lines. Falling drops retain their white tips, colour fades, and sparse glow."
 }
