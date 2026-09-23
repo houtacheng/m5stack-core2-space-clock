@@ -1,7 +1,7 @@
 {
-  "version": "2.9.0",
+  "version": "2.9.1",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "e3d0c7c5a02d6978e0b74b00daae9590a626611064ab19ecdcb2814e663dfc09",
-  "size": 4371504,
-  "notes": "Matrix rain now uses stationary glyphs illuminated by independent flowing waves, with random soft glints and local glow. Wi-Fi examples are sanitized; no saved network credentials are included."
+  "sha256": "379f03b3dfca4563fd966b423f3fdacb62e0f1fb11039770a8ed2db000f06c9a",
+  "size": 4372032,
+  "notes": "Matrix rain restored to falling drops: white tips fade into the selected phosphor colour and then to transparent tails, with sparse glowing glyphs. Network examples are sanitized."
 }

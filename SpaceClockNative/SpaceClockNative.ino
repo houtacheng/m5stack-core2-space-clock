@@ -184,13 +184,11 @@ uint32_t lastClockDraw = 0, lastAnim = 0;
 int lastMinute = -1;
 static constexpr uint8_t MATRIX_COLUMNS = 40;
 static constexpr uint8_t MATRIX_MAX_ROWS = 32;
-float matrixColumnPhase[MATRIX_COLUMNS];
-float matrixColumnSpeed[MATRIX_COLUMNS];
-float matrixColumnWobble[MATRIX_COLUMNS];
+float matrixHead[MATRIX_COLUMNS];
+float matrixSpeed[MATRIX_COLUMNS];
+uint8_t matrixLength[MATRIX_COLUMNS];
 uint8_t matrixGlyphs[MATRIX_COLUMNS][MATRIX_MAX_ROWS];
 uint8_t matrixGlint[MATRIX_COLUMNS][MATRIX_MAX_ROWS];
-uint8_t matrixFrameStrength[MATRIX_COLUMNS][MATRIX_MAX_ROWS];
-bool matrixFrameHot[MATRIX_COLUMNS][MATRIX_MAX_ROWS];
 bool matrixActive[MATRIX_COLUMNS];
 uint32_t lastMatrixFrame = 0;
 uint8_t matrixRainSpeed = 25;       // 10 = calm, 100 = fast
@@ -561,22 +559,18 @@ void drawClockNavigationIcons() {
 void resetMatrixRain() {
   const int glyphHeight = 8 * matrixGlyphScale;
   const int usableColumns = min((int)MATRIX_COLUMNS, 320 / glyphHeight);
+  const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphHeight + 2);
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     matrixActive[i] = i < usableColumns && (esp_random() % 100) < matrixRainDensity;
-    // Rezmason's rain is not a stack of moving characters: the glyph grid is
-    // stationary and a travelling sawtooth wave illuminates it. Each column
-    // gets its own phase, speed, and slight nonlinear wobble.
-    matrixColumnPhase[i] = (esp_random() % 10000) / 1000.0f;
-    matrixColumnSpeed[i] = 0.65f + (esp_random() % 1000) / 1000.0f * 0.7f;
-    matrixColumnWobble[i] = (esp_random() % 1000) / 1000.0f * 6.28318f;
+    matrixHead[i] = -((float)(esp_random() % rows));
+    matrixSpeed[i] = 1.0f + (esp_random() % 100) / 100.0f * 2.5f;
+    matrixLength[i] = 5 + (esp_random() % max(2, rows - 4));
     for (int row = 0; row < MATRIX_MAX_ROWS; ++row) {
       matrixGlyphs[i][row] = esp_random() % MATRIX_GLYPH_COUNT;
       matrixGlint[i][row] = 0;
-      matrixFrameStrength[i][row] = 0;
-      matrixFrameHot[i][row] = false;
     }
   }
-  // A few seeded lanes guarantee that the rain remains visible even at low density.
+  // Keep a few streams at the lowest density so the background never dies.
   for (int i = 0; i < min(3, usableColumns); ++i) matrixActive[i] = true;
   lastMatrixFrame = 0;
 }
@@ -586,6 +580,49 @@ uint16_t matrixColor(uint8_t strength) {
   uint8_t g = ((matrixRainColor >> 8) & 255) * strength / 100;
   uint8_t b = (matrixRainColor & 255) * strength / 100;
   return M5.Display.color565(r, g, b);
+}
+
+uint16_t matrixTrailColor(uint8_t trail, uint8_t length) {
+  if (trail == 0) return M5.Display.color565(245, 255, 250);
+  float position = (float)trail / max(1, (int)length - 1);
+  uint8_t themeR = (matrixRainColor >> 16) & 255;
+  uint8_t themeG = (matrixRainColor >> 8) & 255;
+  uint8_t themeB = matrixRainColor & 255;
+  if (position <= 0.28f) {
+    // The first part of the tail smoothly changes from the white falling tip
+    // to the selected Matrix phosphor colour.
+    float blend = position / 0.28f;
+    return M5.Display.color565(
+      245 - (245 - themeR) * blend,
+      255 - (255 - themeG) * blend,
+      250 - (250 - themeB) * blend);
+  }
+  // The remainder keeps the theme hue while fading gently to transparent.
+  float fade = 1.0f - (position - 0.28f) / 0.72f;
+  fade = fade * fade * (3.0f - 2.0f * fade);
+  return matrixColor((uint8_t)(fade * 100.0f));
+}
+
+void addMatrixGlintBloom(M5Canvas& canvas, int cx, int cy, uint8_t strength) {
+  const int radius = matrixGlyphScale == 1 ? 4 : 6;
+  const int radiusSquared = radius * radius;
+  const uint8_t themeR = (matrixRainColor >> 16) & 255;
+  const uint8_t themeG = (matrixRainColor >> 8) & 255;
+  const uint8_t themeB = matrixRainColor & 255;
+  for (int dy = -radius; dy <= radius; ++dy) {
+    for (int dx = -radius; dx <= radius; ++dx) {
+      int distanceSquared = dx * dx + dy * dy;
+      if (distanceSquared > radiusSquared) continue;
+      int px = cx + dx, py = cy + dy;
+      if (px < 0 || px >= 320 || py < 0 || py >= 240) continue;
+      uint16_t base = canvas.readPixel(px, py);
+      int falloff = (radiusSquared + 1 - distanceSquared) * strength / (radiusSquared + 1);
+      uint8_t r = min(255, ((base >> 11) & 0x1F) * 255 / 31 + themeR * falloff / 100);
+      uint8_t g = min(255, ((base >> 5) & 0x3F) * 255 / 63 + themeG * falloff / 100);
+      uint8_t b = min(255, (base & 0x1F) * 255 / 31 + themeB * falloff / 100);
+      canvas.drawPixel(px, py, M5.Display.color565(r, g, b));
+    }
+  }
 }
 
 uint16_t blendMatrixGlass(uint16_t base, uint8_t opacity) {
@@ -677,78 +714,64 @@ void drawMatrixRainFrame(uint32_t nowMs) {
   if (clockFace != ClockFace::Matrix || screenNow != Screen::Clock || alarmActive >= 0) return;
   uint32_t frameInterval = 100;  // CM4 uses 10 fps for the live rain layer.
   if (nowMs - lastMatrixFrame < frameInterval) return;
+  float dt = lastMatrixFrame ? (nowMs - lastMatrixFrame) / 1000.0f : frameInterval / 1000.0f;
+  if (dt > 0.25f) dt = 0.25f;
   lastMatrixFrame = nowMs;
   const int glyphSize = 8 * matrixGlyphScale;
   const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphSize + 2);
-  const float elapsed = nowMs / 1000.0f;
-  const float rowPhase = matrixGlyphScale == 1 ? 0.118f : 0.167f;
   matrixCanvas.fillSprite(TFT_BLACK);
   matrixCanvas.setTextDatum(top_left);
   matrixCanvas.setFont(&SourceHanSansTC_UI8pt8b);
   matrixCanvas.setTextSize(matrixGlyphScale);
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     if (!matrixActive[i]) {
-      // Let sparse columns rejoin over time instead of leaving fixed gaps.
-      if ((esp_random() % 1000) < matrixRainDensity * 2) {
+      // Reintroduce inactive lanes over time so lower density never goes blank.
+      if ((esp_random() % 1000) < matrixRainDensity * 3) {
         matrixActive[i] = true;
-        matrixColumnPhase[i] = (esp_random() % 10000) / 1000.0f;
-        matrixColumnSpeed[i] = 0.65f + (esp_random() % 1000) / 1000.0f * 0.7f;
+        matrixHead[i] = -((float)(esp_random() % max(1, rows / 2)));
       } else continue;
     }
     int x = i * glyphSize;
-    // 10–100 maps to a gentle 0.35–2.0 row steps/s. The time remains
-    // continuous, while each lane drifts at a different rate.
-    float fall = elapsed * (0.35f + matrixRainSpeed * 0.0165f) * matrixColumnSpeed[i];
-    for (int row = 0; row < rows; ++row) {
-      float wave = row * rowPhase - fall + matrixColumnPhase[i];
-      wave += 0.16f * sinf(row * 0.19f + elapsed * 0.23f + matrixColumnWobble[i]);
-      float fraction = wave - floorf(wave);
-      float brightness = 1.0f - fraction;
-      float belowWave = (row + 1) * rowPhase - fall + matrixColumnPhase[i];
-      belowWave += 0.16f * sinf((row + 1) * 0.19f + elapsed * 0.23f + matrixColumnWobble[i]);
-      float belowBrightness = 1.0f - (belowWave - floorf(belowWave));
-      bool tracer = brightness > belowBrightness;
+    int previousHead = (int)matrixHead[i];
+    matrixHead[i] += matrixSpeed[i] * (0.7f + matrixRainSpeed * 0.095f) * dt;
+    int head = (int)matrixHead[i];
+    if (head != previousHead && head >= 0) {
+      matrixGlyphs[i][head % MATRIX_MAX_ROWS] = esp_random() % MATRIX_GLYPH_COUNT;
+    }
+    // Keep glyph changes occasional rather than making the whole screen flicker.
+    if ((esp_random() % 100) < 3) matrixGlyphs[i][esp_random() % rows] = esp_random() % MATRIX_GLYPH_COUNT;
+    for (int row = 0; row < rows; ++row) if (matrixGlint[i][row]) --matrixGlint[i][row];
 
-      // A very dark phosphor floor keeps symbols present between drops.
-      uint8_t strength = 5 + (uint8_t)(brightness * 73.0f);
-      if (matrixGlint[i][row]) --matrixGlint[i][row];
-      // Organic, sparse flashes: short-lived random glints plus the brighter
-      // sawtooth cusp at each raindrop's tip.
-      if ((esp_random() % 1400) == 0) matrixGlint[i][row] = 3 + esp_random() % 5;
-      bool glint = matrixGlint[i][row] != 0;
-      if (tracer) strength = 100;
-      if (glint) strength = max(strength, (uint8_t)(84 + (esp_random() % 17)));
-
-      // Retain some previous light each frame, like the reference renderer's
-      // brightness-decay blend. Glints soften away instead of switching off sharply.
-      int priorStrength = matrixFrameStrength[i][row];
-      matrixFrameStrength[i][row] = constrain(priorStrength + ((int)strength - priorStrength) * 68 / 100, 0, 100);
-      matrixFrameHot[i][row] = tracer || glint;
-
-      // Symbols stay fixed in their cells, but occasionally cycle to avoid a
-      // frozen wallpaper. The probability is intentionally low to preserve legibility.
-      if ((esp_random() % 1800) == 0) matrixGlyphs[i][row] = esp_random() % MATRIX_GLYPH_COUNT;
+    for (int trail = 0; trail < matrixLength[i]; ++trail) {
+      int row = head - trail;
+      if (row < 0 || row >= rows) continue;
+      // A few glyphs in the middle of a trail briefly brighten and leave a
+      // small additive phosphor halo.
+      if (trail > 1 && trail < matrixLength[i] - 1 && !matrixGlint[i][row] && (esp_random() % 1200) == 0) {
+        matrixGlint[i][row] = 3 + esp_random() % 4;
+      }
+      matrixCanvas.setTextColor(matrixGlint[i][row]
+        ? M5.Display.color565(220, 255, 230)
+        : matrixTrailColor(trail, matrixLength[i]));
+      matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row]], x, row * glyphSize);
+    }
+    if (matrixHead[i] - matrixLength[i] > rows) {
+      matrixHead[i] = -((float)(esp_random() % max(1, rows / 2)));
+      matrixSpeed[i] = 1.0f + (esp_random() % 100) / 100.0f * 2.5f;
+      matrixLength[i] = 5 + (esp_random() % max(2, rows - 4));
+      // Always leave a few seed columns running; the others follow the density setting.
+      matrixActive[i] = i < 3 || (esp_random() % 100) < matrixRainDensity;
     }
   }
-  // Bloom is emitted in its own pass so the halo never paints over glyphs
-  // already drawn in neighbouring cells. Then crisp glyphs are composited on top.
+  // Add the rare glows after the text is composed, then redraw the crisp symbol.
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     if (!matrixActive[i]) continue;
     int x = i * glyphSize;
     for (int row = 0; row < rows; ++row) {
-      if (!matrixFrameHot[i][row]) continue;
-      uint8_t haloStrength = matrixGlint[i][row] ? 26 : 18;
-      matrixCanvas.fillCircle(x + glyphSize / 2, row * glyphSize + glyphSize / 2,
-                              matrixGlyphScale == 1 ? 3 : 5, matrixColor(haloStrength));
-    }
-  }
-  for (int i = 0; i < MATRIX_COLUMNS; ++i) {
-    if (!matrixActive[i]) continue;
-    int x = i * glyphSize;
-    for (int row = 0; row < rows; ++row) {
-      matrixCanvas.setTextColor(matrixFrameHot[i][row]
-        ? M5.Display.color565(210, 255, 224)
-        : matrixColor(matrixFrameStrength[i][row]));
+      if (!matrixGlint[i][row]) continue;
+      addMatrixGlintBloom(matrixCanvas, x + glyphSize / 2, row * glyphSize + glyphSize / 2,
+                          matrixGlint[i][row] * 9);
+      matrixCanvas.setTextColor(M5.Display.color565(230, 255, 238));
       matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row]], x, row * glyphSize);
     }
   }

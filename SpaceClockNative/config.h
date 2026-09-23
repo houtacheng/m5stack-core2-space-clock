@@ -1,6 +1,6 @@
 #pragma once
 
-#define SPACE_CLOCK_VERSION "2.9.0"
+#define SPACE_CLOCK_VERSION "2.9.1"
 #define SPACE_CLOCK_MANIFEST_URL "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/manifest.json"
 #define SPACE_CLOCK_BLE_NAME "M5Stack Core2"
 #define SPACE_CLOCK_WIFI_AP "SpaceClock-Setup"
