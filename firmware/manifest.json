@@ -1,7 +1,7 @@
 {
-  "version": "2.6.0",
+  "version": "2.7.0",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "e8ef5ffb8d898b0bccc17f1aa71c92645a75adda1213a7c3f07ea79c4234120b",
-  "size": 4590592,
-  "notes": "Rebuilds Matrix rain using independent streams with bright heads and fading trails, rendered as complete sprite frames to remove flicker. The theme color now also applies to the battery and charging icon."
+  "sha256": "af60136ba0a2eba33f7d5e40bb0ef524fe6c84f714a2db3a2611883263d723a9",
+  "size": 4592112,
+  "notes": "Fixes Matrix rain streams so they continuously respawn instead of ending on a black screen. Uses sparse katakana-style trails, white time with phosphor shadow, theme-color date, and single-frame status/navigation rendering to remove flicker."
 }

@@ -187,7 +187,7 @@ static constexpr uint8_t MATRIX_MAX_ROWS = 32;
 float matrixHead[MATRIX_COLUMNS];
 float matrixSpeed[MATRIX_COLUMNS];
 uint8_t matrixLength[MATRIX_COLUMNS];
-char matrixChars[MATRIX_COLUMNS][MATRIX_MAX_ROWS];
+uint8_t matrixGlyphs[MATRIX_COLUMNS][MATRIX_MAX_ROWS];
 bool matrixActive[MATRIX_COLUMNS];
 uint32_t lastMatrixFrame = 0;
 uint8_t matrixRainSpeed = 25;       // 10 = calm, 100 = fast
@@ -195,6 +195,13 @@ uint8_t matrixRainDensity = 35;     // percentage of visible columns
 uint8_t matrixGlyphScale = 1;       // 1x or 2x Source Han glyphs
 uint32_t matrixRainColor = 0x00E86B;
 uint8_t matrixGlassOpacity = 58;    // dithered black veil over the time card
+static const char* const MATRIX_GLYPH_SET[] = {
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+  "ｱ", "ｲ", "ｳ", "ｴ", "ｵ", "ｶ", "ｷ", "ｸ", "ｹ", "ｺ", "ｻ", "ｼ", "ｽ", "ｾ", "ｿ",
+  "ﾀ", "ﾁ", "ﾂ", "ﾃ", "ﾄ", "ﾅ", "ﾆ", "ﾇ", "ﾈ", "ﾉ", "ﾊ", "ﾋ", "ﾌ", "ﾍ", "ﾎ",
+  "ﾏ", "ﾐ", "ﾑ", "ﾒ", "ﾓ", "ﾔ", "ﾕ", "ﾖ", "ﾗ", "ﾘ", "ﾙ", "ﾚ", "ﾛ", "ﾜ"
+};
+static constexpr uint8_t MATRIX_GLYPH_COUNT = sizeof(MATRIX_GLYPH_SET) / sizeof(MATRIX_GLYPH_SET[0]);
 
 static constexpr uint16_t BG = 0x0000;
 static constexpr uint16_t FG = 0xF79E;
@@ -553,7 +560,6 @@ void resetMatrixRain() {
   const int glyphHeight = 8 * matrixGlyphScale;
   const int usableColumns = min((int)MATRIX_COLUMNS, 320 / glyphHeight);
   const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphHeight + 2);
-  static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%+-";
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     matrixActive[i] = i < usableColumns && (esp_random() % 100) < matrixRainDensity;
     matrixHead[i] = -((float)(esp_random() % rows));
@@ -561,7 +567,7 @@ void resetMatrixRain() {
     // and a visibly different trail length for each stream.
     matrixSpeed[i] = 1.0f + (esp_random() % 100) / 100.0f * 2.5f;
     matrixLength[i] = 5 + (esp_random() % max(2, rows - 4));
-    for (int row = 0; row < MATRIX_MAX_ROWS; ++row) matrixChars[i][row] = glyphs[esp_random() % (sizeof(glyphs) - 1)];
+    for (int row = 0; row < MATRIX_MAX_ROWS; ++row) matrixGlyphs[i][row] = esp_random() % MATRIX_GLYPH_COUNT;
   }
   // Keep a few streams at the lowest density so the background never dies.
   for (int i = 0; i < min(3, usableColumns); ++i) matrixActive[i] = true;
@@ -596,13 +602,54 @@ void drawMatrixClockPanel(M5Canvas& canvas) {
   drawMatrixGlassPanel(canvas);
   int shownHour = use24HourTime ? dt.time.hours : (dt.time.hours % 12 ? dt.time.hours % 12 : 12);
   snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
-  canvas.setTextDatum(middle_center); canvas.setTextColor(matrixColor(100));
+  // The reference look uses a heavy white time with a quiet phosphor shadow,
+  // while secondary information stays in the selected rain colour.
   canvas.setFont(&SourceHanSansTC_Medium28pt7b); canvas.setTextSize(1);
+  canvas.setTextDatum(middle_center); canvas.setTextColor(matrixColor(38));
+  canvas.drawString(buf, 162, 114);
+  canvas.setTextColor(TFT_WHITE);
   canvas.drawString(buf, 160, 112);
   snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
-  canvas.setTextColor(TFT_LIGHTGREY); canvas.setFont(&SourceHanSansTC_UI14pt8b); canvas.setTextSize(1);
+  canvas.setTextColor(matrixColor(92)); canvas.setFont(&SourceHanSansTC_UI14pt8b); canvas.setTextSize(1);
   canvas.drawString(buf, 160, 160);
   canvas.setTextDatum(top_left);
+}
+
+void drawMatrixStatus(M5Canvas& canvas) {
+  int level = constrain(M5.Power.getBatteryLevel(), 0, 100);
+  bool charging = M5.Power.isCharging();
+  uint16_t theme = matrixColor(100);
+  uint16_t battery = level <= 20 ? TFT_RED : theme;
+  canvas.setTextDatum(top_left); canvas.setFont(&SourceHanSansTC_UI8pt8b); canvas.setTextSize(1);
+  canvas.setTextColor(WiFi.status() == WL_CONNECTED ? theme : TFT_RED);
+  canvas.drawString(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Wi-Fi offline", 5, 7);
+  canvas.setTextDatum(top_right); canvas.setTextColor(battery);
+  canvas.drawString(String(level) + "%", 278, 9);
+  canvas.drawRoundRect(282, 5, 32, 19, 4, battery);
+  canvas.fillRoundRect(285, 8, max(2, level * 25 / 100), 13, 2, battery);
+  canvas.fillRect(314, 10, 4, 9, battery);
+  if (charging) {
+    canvas.fillTriangle(299, 6, 293, 15, 299, 15, theme);
+    canvas.fillTriangle(299, 13, 305, 13, 297, 23, theme);
+  }
+  canvas.setTextDatum(top_left);
+}
+
+void drawMatrixGearNavigationIcon(M5Canvas& canvas, int cx, int cy) {
+  uint16_t theme = matrixColor(100);
+  canvas.drawCircle(cx, cy, 8, theme); canvas.drawCircle(cx, cy, 7, theme); canvas.fillCircle(cx, cy, 3, theme);
+  for (int i = 0; i < 8; ++i) {
+    float a = i * PI / 4.0f;
+    int x1 = cx + lroundf(cosf(a) * 8), y1 = cy + lroundf(sinf(a) * 8);
+    int x2 = cx + lroundf(cosf(a) * 11), y2 = cy + lroundf(sinf(a) * 11);
+    canvas.drawLine(x1, y1, x2, y2, theme); canvas.fillCircle(x2, y2, 1, theme);
+  }
+}
+
+void drawMatrixNavigationIcons(M5Canvas& canvas) {
+  canvas.drawPng(nav_companion_png, nav_companion_png_len, 41, 215);
+  canvas.drawPng(nav_meditation_png, nav_meditation_png_len, 148, 215);
+  drawMatrixGearNavigationIcon(canvas, 267, 227);
 }
 
 void drawMatrixRainFrame(uint32_t nowMs) {
@@ -614,42 +661,49 @@ void drawMatrixRainFrame(uint32_t nowMs) {
   lastMatrixFrame = nowMs;
   const int glyphSize = 8 * matrixGlyphScale;
   const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphSize + 2);
-  static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%+-";
   matrixCanvas.fillSprite(TFT_BLACK);
   matrixCanvas.setTextDatum(top_left);
   matrixCanvas.setFont(&SourceHanSansTC_UI8pt8b);
   matrixCanvas.setTextSize(matrixGlyphScale);
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
-    if (!matrixActive[i]) continue;
+    if (!matrixActive[i]) {
+      // Dormant lanes periodically return from above the screen. This makes
+      // density a living distribution rather than a one-time random choice.
+      if ((esp_random() % 1000) < matrixRainDensity * 3) {
+        matrixActive[i] = true;
+        matrixHead[i] = -((float)(esp_random() % max(1, rows / 2)));
+      } else continue;
+    }
     int x = i * glyphSize;
     int before = (int)matrixHead[i];
     // User speed maps to 1.5–11 cells/s: calm by default, never a blur.
     matrixHead[i] += matrixSpeed[i] * (0.7f + matrixRainSpeed * 0.095f) * dt;
     int head = (int)matrixHead[i];
-    if (head != before && head >= 0) matrixChars[i][head % MATRIX_MAX_ROWS] = glyphs[esp_random() % (sizeof(glyphs) - 1)];
+    if (head != before && head >= 0) matrixGlyphs[i][head % MATRIX_MAX_ROWS] = esp_random() % MATRIX_GLYPH_COUNT;
     // A little character flicker inside a tail gives the rain its living look.
-    if ((esp_random() % 100) < 12) matrixChars[i][esp_random() % rows] = glyphs[esp_random() % (sizeof(glyphs) - 1)];
+    if ((esp_random() % 100) < 12) matrixGlyphs[i][esp_random() % rows] = esp_random() % MATRIX_GLYPH_COUNT;
     for (int trail = 0; trail < matrixLength[i]; ++trail) {
       int row = head - trail;
       if (row < 0 || row >= rows) continue;
       uint8_t strength = trail == 0 ? 100 : max(7, 78 - (trail * 72 / max(1, (int)matrixLength[i] - 1)));
       uint16_t color = trail == 0 ? M5.Display.color565(205, 255, 215) : matrixColor(strength);
       matrixCanvas.setTextColor(color);
-      matrixCanvas.drawChar(matrixChars[i][row % MATRIX_MAX_ROWS], x, row * glyphSize);
+      matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row % MATRIX_MAX_ROWS]], x, row * glyphSize);
     }
     if (matrixHead[i] - matrixLength[i] > rows) {
       matrixHead[i] = -((float)(esp_random() % max(1, rows / 2)));
       matrixSpeed[i] = 1.0f + (esp_random() % 100) / 100.0f * 2.5f;
       matrixLength[i] = 5 + (esp_random() % max(2, rows - 4));
-      matrixActive[i] = (esp_random() % 100) < matrixRainDensity;
+      // Permanent seed streams prevent the display becoming empty after a
+      // full cycle; other columns continue to enter and leave at the chosen
+      // density, just like the reference CodeRain implementation.
+      matrixActive[i] = i < 3 || (esp_random() % 100) < matrixRainDensity;
     }
   }
   drawMatrixClockPanel(matrixCanvas);
+  drawMatrixStatus(matrixCanvas);
+  drawMatrixNavigationIcons(matrixCanvas);
   matrixCanvas.pushSprite(0, 0);
-  // UI is layered after a complete frame; no incremental clearing means no
-  // flashing, including while the status text or battery level changes.
-  drawClockStatus(TFT_BLACK);
-  drawClockNavigationIcons();
 }
 
 void drawMeditationNavigationIcons() {
