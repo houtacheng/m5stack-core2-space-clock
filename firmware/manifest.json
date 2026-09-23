@@ -1,7 +1,7 @@
 {
-  "version": "2.9.3",
+  "version": "2.9.4",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "abbc891a9716eae9b10ce75ddc888c72fb8aa259f1efb6969cdf0b6deee63a0c",
-  "size": 4372656,
-  "notes": "Improved Wi-Fi recovery: gives saved credentials time to connect before scanning, reconnects automatically, attempts every saved network including scan misses, and keeps the display responsive during retries."
+  "sha256": "e327da9cd2c6868ad384ca6a48df8df97c235eedd9a97345ed42880a53541252",
+  "size": 4386944,
+  "notes": "Adds long-press night-light toggle from the clock settings icon, configurable night-light color and brightness, and a bilingual categorized web settings interface with independent per-page saving."
 }

@@ -115,6 +115,10 @@ uint32_t nightLightColor = 0xFFF0C8;
 uint8_t nightLightBrightness = 18;
 uint8_t nightLightMode = 0;
 uint16_t nightLightSeconds = 60;
+// A long press can temporarily force the night light on or off without
+// changing the automatic screen-off night-light preference.
+bool manualNightLightOverride = false;
+bool manualNightLightActive = false;
 bool screenSleeping = false;
 bool automaticFirmwareUpdate = false;
 uint8_t firmwareCheckHour = 3;
@@ -136,6 +140,8 @@ String companionNames[COMPANION_PAGE_COUNT] = {"Main", "Studio", "Remote", "Back
 uint16_t companionPorts[COMPANION_PAGE_COUNT] = {16622, 16622, 16622, 16622};
 uint8_t companionPage = 0;
 uint32_t companionCenterPressedAt = 0;
+uint32_t clockSettingsPressedAt = 0;
+bool clockSettingsPressValid = false;
 WiFiClient companionClient;
 WebSocketsClient companionWebSocket;
 bool companionWebSocketMode = false;
@@ -1937,6 +1943,11 @@ void updateAlarmBaseLights(uint32_t nowMs) {
       strength = ((age / 180UL) & 1) ? 0 : alarmLightBrightness;
     }
     color = alarmLightColor;
+  } else if (manualNightLightOverride) {
+    if (manualNightLightActive) {
+      color = nightLightColor;
+      strength = nightLightBrightness;
+    }
   } else if (meditationLightEnabled && (screenNow == Screen::Meditation || meditationState == MeditationState::Running || meditationState == MeditationState::Paused || meditationState == MeditationState::Done)) {
     uint32_t age = nowMs - meditationLightEventStarted;
     if (meditationState == MeditationState::Ready || meditationState == MeditationState::Paused) {
@@ -2028,9 +2039,37 @@ void handleClockTouch(const m5::touch_detail_t& t) {
     }
     return;
   }
-  if (!t.wasReleased() || t.y < 210) return;
+  const bool inNavigation = t.y >= 210;
+  const bool inSettings = inNavigation && t.x >= 214;
+  if (t.wasPressed()) {
+    clockSettingsPressValid = inSettings;
+    clockSettingsPressedAt = inSettings ? millis() : 0;
+  }
+  if (!t.wasReleased()) return;
+  if (t.y < 210) {
+    clockSettingsPressValid = false;
+    clockSettingsPressedAt = 0;
+    return;
+  }
   haptic();
-  if (t.x < 107) showCompanion(); else if (t.x < 214) showMeditation(); else showMenu();
+  if (t.x < 107) {
+    clockSettingsPressValid = false;
+    showCompanion();
+  } else if (t.x < 214) {
+    clockSettingsPressValid = false;
+    showMeditation();
+  } else {
+    const bool longPress = clockSettingsPressValid && clockSettingsPressedAt && millis() - clockSettingsPressedAt >= 700UL;
+    clockSettingsPressValid = false;
+    clockSettingsPressedAt = 0;
+    if (longPress) {
+      manualNightLightOverride = true;
+      manualNightLightActive = !manualNightLightActive;
+      updateAlarmBaseLights(millis());
+    } else {
+      showMenu();
+    }
+  }
 }
 
 bool deviceIsFlat() {
@@ -2613,116 +2652,122 @@ void maintainMqtt(uint32_t nowMs) {
   }
 }
 
-void sendSettingsPage(const String& message = "") {
+void sendSettingsPage(const String& message = "", const String& requestedPage = "", const String& requestedLanguage = "") {
+  String pageId = requestedPage.length() ? requestedPage : settingsServer.arg("page");
+  String language = requestedLanguage.length() ? requestedLanguage : settingsServer.arg("lang");
+  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "mqtt" && pageId != "companion" && pageId != "firmware") pageId = "clock";
+  bool zh = language == "zh" || (!language.length());
+  auto tr = [zh](const char* en, const char* zhText) -> String { return zh ? String(zhText) : String(en); };
   String page;
-  page.reserve(28000);
-  page = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-         "<title>Space Clock</title><style>body{font-family:system-ui;background:#08111f;color:#eef4ff;max-width:620px;margin:auto;padding:20px}"
-         "h1{color:#65b9ff}h2{margin-top:30px}.field{display:block;margin-top:14px}.field input,.field select{box-sizing:border-box;width:100%;padding:11px;border-radius:8px;border:1px solid #52657a;background:#142236;color:white}"
-         ".alarm{background:#101d2e;border:1px solid #344b63;border-radius:10px;padding:12px;margin:10px 0}.alarm summary{cursor:pointer;font-weight:700}.days{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}.days label{white-space:nowrap}"
-         "button,.button{box-sizing:border-box;display:block;width:100%;padding:13px;margin-top:22px;border:0;border-radius:9px;background:#1688e5;color:white;font-size:17px;text-align:center;text-decoration:none}.ok{color:#70e39a}</style></head><body>";
-  page += "<h1>Space Clock settings</h1><p>Device IP: <b>" + WiFi.localIP().toString() + "</b></p>";
+  page.reserve(19000);
+  page = "<!doctype html><html lang='" + String(zh ? "zh-Hant" : "en") + "'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+         "<title>Space Clock</title><style>*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#08111f;color:#eef4ff;max-width:760px;margin:auto;padding:18px}"
+         "header{display:flex;align-items:center;justify-content:space-between;gap:12px}h1{color:#65b9ff;font-size:25px;margin:8px 0}h2{font-size:19px;margin:24px 0 8px}.muted{color:#aabbd0;font-size:14px}.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.tabs a,.lang{border:1px solid #344b63;border-radius:999px;padding:8px 12px;color:#c8d9ee;text-decoration:none;font-size:14px}.tabs a.active{background:#1688e5;border-color:#1688e5;color:white}.lang{white-space:nowrap}.panel{background:#101d2e;border:1px solid #263b52;border-radius:16px;padding:16px}.field{display:block;margin-top:15px;font-size:15px}.field input:not([type=checkbox]),.field select{display:block;width:100%;padding:11px;margin-top:6px;border-radius:9px;border:1px solid #52657a;background:#142236;color:white;font-size:16px}.field input[type=range]{padding:0}.field input[type=color]{height:48px;padding:5px}.check{display:flex;align-items:center;gap:9px;margin:15px 0}.check input{width:20px;height:20px;accent-color:#1688e5}.card{background:#0b1727;border:1px solid #344b63;border-radius:12px;padding:12px;margin:12px 0}.card summary{cursor:pointer;font-weight:700}.days{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px}.days label{white-space:nowrap}.btn,button{display:block;width:100%;padding:13px;margin-top:18px;border:0;border-radius:10px;background:#1688e5;color:white;font-size:16px;text-align:center;text-decoration:none;cursor:pointer}.btn.secondary{background:#20354e}.ok{color:#70e39a}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:520px){body{padding:12px}.panel{padding:13px}.grid{grid-template-columns:1fr}}</style></head><body>";
   m5::rtc_datetime_t webNow; getClockDateTime(&webNow);
   char webTime[24]; snprintf(webTime, sizeof(webTime), "%04d-%02d-%02d %02d:%02d:%02d", webNow.date.year, webNow.date.month, webNow.date.date, webNow.time.hours, webNow.time.minutes, webNow.time.seconds);
-  page += "<p>Device time: <b>" + String(webTime) + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</p>";
+  page += "<header><div><h1>" + tr("Space Clock settings", "太空時鐘設定") + "</h1><div class='muted'>" + tr("IP", "設備 IP") + ": <b>" + WiFi.localIP().toString() + "</b> · " + tr("Device time", "裝置時間") + ": <b>" + webTime + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</div></div>";
+  page += "<a class='lang' href='/?page=" + pageId + "&lang=" + String(zh ? "en" : "zh") + "'>" + tr("中文", "English") + "</a></header>";
+  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "mqtt", "companion", "firmware"};
+  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "MQTT", "Companion", "Firmware"};
+  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "MQTT", "Companion", "韌體更新"};
+  page += "<nav class='tabs'>";
+  for (int i = 0; i < 7; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
+  page += "</nav>";
   if (message.length()) page += "<p class='ok'>" + htmlEscape(message) + "</p>";
-  page += "<form method='post' action='/save'>";
-  page += "<h2>Saved Wi-Fi networks</h2><p>Up to 10 networks. Passwords are stored only on this Core2 and are never shown. Leave a password blank to keep it unchanged.</p>";
-  for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
-    page += "<div class='alarm'><b>Wi-Fi " + String(i + 1) + "</b>";
-    page += "<label class='field'>SSID<input name='wifiS" + String(i) + "' value='" + htmlEscape(savedWifiSsids[i]) + "'></label>";
-    page += "<label class='field'>New password<input type='password' name='wifiP" + String(i) + "' placeholder='Leave blank to keep current'></label>";
-    page += "<label><input type='checkbox' name='wifiD" + String(i) + "'> Remove this network</label></div>";
+  page += "<form method='post' action='/save'><input type='hidden' name='page' value='" + pageId + "'><input type='hidden' name='lang' value='" + String(zh ? "zh" : "en") + "'><section class='panel'>";
+
+  if (pageId == "wifi") {
+    page += "<h2>" + tr("Saved Wi-Fi networks", "已儲存的 Wi-Fi 網路") + "</h2><p class='muted'>" + tr("Up to 10 networks. Passwords stay on this Core2 and are never displayed. Leave a password blank to keep it unchanged.", "最多儲存 10 組網路。密碼只保存在 Core2，不會顯示；密碼留白即可保留原密碼。") + "</p>";
+    for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
+      page += "<div class='card'><b>Wi-Fi " + String(i + 1) + "</b><label class='field'>SSID<input name='wifiS" + String(i) + "' value='" + htmlEscape(savedWifiSsids[i]) + "'></label>";
+      page += "<label class='field'>" + tr("New password", "新密碼") + "<input type='password' name='wifiP" + String(i) + "' placeholder='" + tr("Leave blank to keep current", "留白以保留目前密碼") + "'></label><label class='check'><input type='checkbox' name='wifiD" + String(i) + "'>" + tr("Remove this network", "移除此網路") + "</label></div>";
+    }
+  } else if (pageId == "clock") {
+    page += "<h2>" + tr("Clock display", "時鐘顯示") + "</h2>";
+    page += "<label class='field'>" + tr("Time zone (major city)", "時區（主要城市）") + "<select name='timeZone'>";
+    for (int i = 0; i < TIME_ZONE_COUNT; ++i) page += "<option value='" + String(i) + "'" + (i == timeZoneIndex ? " selected" : "") + ">" + TIME_ZONES[i].city + "</option>";
+    page += "</select></label><label class='field'>" + tr("Clock face", "表盤") + "<select name='face'>";
+    const char* faceEn[] = {"Space", "Flip clock", "Matrix rain"}; const char* faceZh[] = {"太空漫遊", "翻頁時鐘", "Matrix code rain"};
+    for (int i = 0; i < 3; ++i) page += "<option value='" + String(i) + "'" + (i == (int)clockFace ? " selected" : "") + ">" + tr(faceEn[i], faceZh[i]) + "</option>";
+    page += "</select></label>";
+    page += "<h2>" + tr("Matrix rain appearance", "Matrix 雨幕外觀") + "</h2><p class='muted'>" + tr("Lower speed and density create a calmer background. Glass opacity controls how much code is visible behind the clock.", "降低速度與密度可讓背景更平靜；時鐘框不透明度控制背景字元的透出程度。") + "</p>";
+    page += "<label class='field'>" + tr("Rain speed", "雨滴速度") + ": <output id='matrixSpeedOut'>" + String(matrixRainSpeed) + "</output><input type='range' min='10' max='100' step='5' name='matrixSpeed' value='" + String(matrixRainSpeed) + "' oninput='matrixSpeedOut.value=this.value'></label>";
+    page += "<label class='field'>" + tr("Rain density", "雨幕密度") + ": <output id='matrixDensityOut'>" + String(matrixRainDensity) + "%</output><input type='range' min='10' max='100' step='5' name='matrixDensity' value='" + String(matrixRainDensity) + "' oninput='matrixDensityOut.value=this.value+\"%\"'></label>";
+    page += "<label class='field'>" + tr("Glyph size", "字元大小") + "<select name='matrixSize'><option value='1'" + String(matrixGlyphScale == 1 ? " selected" : "") + ">" + tr("Small", "小") + "</option><option value='2'" + String(matrixGlyphScale == 2 ? " selected" : "") + ">" + tr("Large", "大") + "</option></select></label>";
+    page += "<label class='field'>" + tr("Rain color", "雨幕顏色") + "<input type='color' name='matrixColor' value='" + colorHex(matrixRainColor) + "'></label>";
+    page += "<label class='field'>" + tr("Clock glass opacity", "時鐘框半透明度") + ": <output id='matrixGlassOut'>" + String(matrixGlassOpacity) + "%</output><input type='range' min='15' max='90' step='5' name='matrixGlass' value='" + String(matrixGlassOpacity) + "' oninput='matrixGlassOut.value=this.value+\"%\"'></label>";
+    page += "<h2>" + tr("Screen and brightness", "螢幕與亮度") + "</h2>";
+    page += "<label class='field'>" + tr("Time format", "時間格式") + "<select name='time24'><option value='1'" + String(use24HourTime ? " selected" : "") + ">24-hour</option><option value='0'" + String(!use24HourTime ? " selected" : "") + ">12-hour</option></select></label>";
+    page += "<label class='check'><input type='checkbox' name='flatButtons'" + String(flatVirtualButtonsEnabled ? " checked" : "") + ">" + tr("Enable the three virtual buttons while the device is lying flat", "裝置平放時啟用三顆虛擬按鈕") + "</label>";
+    page += "<label class='check'><input type='checkbox' name='autoBrightness'" + String(adaptiveBrightness ? " checked" : "") + ">" + tr("Automatic brightness (day 07:00–20:59)", "自動亮度（白天 07:00–20:59）") + "</label>";
+    page += "<div class='grid'><label class='field'>" + tr("Day brightness", "白天亮度") + ": <output id='dayOut'>" + String(dayBrightness) + "%</output><input type='range' min='10' max='100' step='5' name='dayBrightness' value='" + String(dayBrightness) + "' oninput='dayOut.value=this.value+\"%\"'></label>";
+    page += "<label class='field'>" + tr("Night brightness", "夜間亮度") + ": <output id='nightOut'>" + String(nightBrightness) + "%</output><input type='range' min='5' max='100' step='5' name='nightBrightness' value='" + String(nightBrightness) + "' oninput='nightOut.value=this.value+\"%\"'></label></div>";
+    page += "<label class='field'>" + tr("Screen automatically turns off after", "螢幕自動關閉時間") + "<select name='screenOff'>";
+    const uint16_t offValues[] = {0,30,60,300,600,1800}; const char* offEn[] = {"Never","30 seconds","1 minute","5 minutes","10 minutes","30 minutes"}; const char* offZh[] = {"永不","30 秒","1 分鐘","5 分鐘","10 分鐘","30 分鐘"};
+    for (int i = 0; i < 6; ++i) page += "<option value='" + String(offValues[i]) + "'" + (screenOffSeconds == offValues[i] ? " selected" : "") + ">" + tr(offEn[i], offZh[i]) + "</option>";
+    page += "</select></label>";
+    page += "<h2>" + tr("Night light", "小夜燈") + "</h2><p class='muted'>" + tr("Long-press the gear icon on the clock to manually toggle the light. This setting controls automatic lighting while the display is off.", "在時鐘首頁長按齒輪可手動開關小夜燈。以下設定控制螢幕關閉時的自動亮燈。") + "</p>";
+    page += "<label class='check'><input type='checkbox' name='nightLight'" + String(nightLightEnabled ? " checked" : "") + ">" + tr("Enable automatic Bottom2 night light while screen is off", "螢幕關閉時自動開啟 Bottom2 小夜燈") + "</label>";
+    page += "<div class='grid'><label class='field'>" + tr("LED color", "LED 顏色") + "<input type='color' name='nightColor' value='" + colorHex(nightLightColor) + "'></label>";
+    page += "<label class='field'>" + tr("LED brightness", "LED 亮度") + ": <output id='nightLedOut'>" + String(nightLightBrightness) + "%</output><input type='range' min='1' max='100' name='nightLedBrightness' value='" + String(nightLightBrightness) + "' oninput='nightLedOut.value=this.value+\"%\"'></label></div>";
+    page += "<label class='field'>" + tr("Automatic mode", "自動模式") + "<select name='nightLightMode'><option value='0'" + String(nightLightMode == 0 ? " selected" : "") + ">" + tr("Stay on while screen is off", "螢幕關閉期間持續亮起") + "</option><option value='1'" + String(nightLightMode == 1 ? " selected" : "") + ">" + tr("Turn off after set time", "指定時間後關閉") + "</option><option value='2'" + String(nightLightMode == 2 ? " selected" : "") + ">" + tr("Fade out after set time", "指定時間後逐漸熄滅") + "</option></select></label>";
+    page += "<label class='field'>" + tr("On time (seconds)", "持續時間（秒）") + "<input type='number' min='5' max='3600' name='nightLightSeconds' value='" + String(nightLightSeconds) + "'></label>";
+  } else if (pageId == "alarms") {
+    page += "<h2>" + tr("Alarm sound", "鬧鐘音效") + "</h2><label class='field'>" + tr("Volume", "音量") + ": <output id='volumeOut'>" + String(alarmVolume) + "%</output><input type='range' min='10' max='100' step='5' name='alarmVolume' value='" + String(alarmVolume) + "' oninput='volumeOut.value=this.value+\"%\"'></label>";
+    const char* soundsEn[] = {"Da Ban", "Chime", "Stream", "Water drop"}; const char* soundsZh[] = {"打版", "磬聲", "流水聲", "水滴聲"};
+    page += "<label class='field'>" + tr("Alarm sound", "鬧鐘音效") + "<select id='alarmSound' name='alarmSound'>";
+    for (int i = 0; i < 4; ++i) page += "<option value='" + String(i) + "'" + (alarmSound == i ? " selected" : "") + ">" + tr(soundsEn[i], soundsZh[i]) + "</option>";
+    page += "</select></label><button class='btn secondary' type='button' onclick='fetch(\"/preview?sound=\"+document.getElementById(\"alarmSound\").value+\"&volume=\"+document.querySelector(\"[name=alarmVolume]\").value)'>" + tr("Preview alarm sound on Core2", "在 Core2 預聽鬧鐘音效") + "</button>";
+    page += "<h2>" + tr("Alarm light reminder", "鬧鐘燈光提醒") + "</h2><label class='check'><input type='checkbox' name='alarmLight'" + String(alarmLightEnabled ? " checked" : "") + ">" + tr("Enable Bottom2 alarm lighting", "啟用 Bottom2 鬧鐘燈光") + "</label>";
+    page += "<div class='grid'><label class='field'>" + tr("Color", "顏色") + "<input type='color' name='alarmLightColor' value='" + colorHex(alarmLightColor) + "'></label><label class='field'>" + tr("Brightness", "亮度") + ": <output id='alarmLedOut'>" + String(alarmLightBrightness) + "%</output><input type='range' min='1' max='100' name='alarmLightBrightness' value='" + String(alarmLightBrightness) + "' oninput='alarmLedOut.value=this.value+\"%\"'></label></div>";
+    const char* alarmModesEn[] = {"Continuous breathing", "Continuous fast flash", "Three breathing cycles", "Three fast-flash cycles"}; const char* alarmModesZh[] = {"持續呼吸", "持續快閃", "三輪呼吸", "三輪快閃"};
+    page += "<label class='field'>" + tr("Light mode", "燈光模式") + "<select name='alarmLightMode'>";
+    for (int i = 0; i < 4; ++i) page += "<option value='" + String(i) + "'" + (alarmLightMode == i ? " selected" : "") + ">" + tr(alarmModesEn[i], alarmModesZh[i]) + "</option>";
+    page += "</select></label><h2>" + tr("Alarm schedules", "鬧鐘排程") + "</h2><p class='muted'>" + tr("Select a time and repeat days. No selected day means a one-time alarm.", "設定時間及重複星期；未選星期代表單次鬧鐘。") + "</p>";
+    const char* daysEn[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}; const char* daysZh[] = {"日","一","二","三","四","五","六"};
+    for (int i = 0; i < ALARM_COUNT; ++i) {
+      char tv[6]; snprintf(tv, sizeof(tv), "%02u:%02u", alarms[i].hour, alarms[i].minute);
+      page += "<details class='card'" + String(i < 4 ? " open" : "") + "><summary>" + tr("Alarm ", "鬧鐘 ") + String(i + 1) + " — " + tv + (alarms[i].enabled ? " (ON)" : " (OFF)") + "</summary>";
+      page += "<label class='field'>" + tr("Time", "時間") + "<input type='time' name='a" + String(i) + "_time' value='" + tv + "'></label><label class='check'><input type='checkbox' name='a" + String(i) + "_on'" + String(alarms[i].enabled ? " checked" : "") + ">" + tr("Enabled", "啟用") + "</label><div class='days'>";
+      for (int d = 0; d < 7; ++d) page += "<label><input type='checkbox' name='a" + String(i) + "_d" + String(d) + "'" + String((alarms[i].weekdays & (1 << d)) ? " checked" : "") + ">" + tr(daysEn[d], daysZh[d]) + "</label>";
+      page += "</div></details>";
+    }
+  } else if (pageId == "meditation") {
+    page += "<h2>" + tr("Meditation timer", "靜心時鐘") + "</h2><div class='grid'><label class='field'>" + tr("Preset time 1 (minutes)", "預設時間 1（分鐘）") + "<input type='number' min='1' max='180' name='medPreset1' value='" + String(meditationPresetMinutes[0]) + "'></label><label class='field'>" + tr("Preset time 2 (minutes)", "預設時間 2（分鐘）") + "<input type='number' min='1' max='180' name='medPreset2' value='" + String(meditationPresetMinutes[1]) + "'></label></div>";
+    page += "<label class='check'><input type='checkbox' name='medSoundEnabled'" + String(meditationSoundEnabled ? " checked" : "") + ">" + tr("Enable sound reminders", "啟用聲音提醒") + "</label>";
+    const char* soundsEn[] = {"Da Ban", "Chime", "Stream", "Water drop"}; const char* soundsZh[] = {"打版", "磬聲", "流水聲", "水滴聲"};
+    page += "<label class='field'>" + tr("Start sound", "開始計時音效") + "<select id='medStartSound' name='medStartSound'>";
+    for (int i = 0; i < 4; ++i) page += "<option value='" + String(i) + "'" + (meditationStartSound == i ? " selected" : "") + ">" + tr(soundsEn[i], soundsZh[i]) + "</option>";
+    page += "</select></label><label class='field'>" + tr("Start volume", "開始音量") + ": <output id='medStartOut'>" + String(meditationStartVolume) + "%</output><input id='medStartVolume' type='range' min='5' max='100' step='5' name='medStartVolume' value='" + String(meditationStartVolume) + "' oninput='medStartOut.value=this.value+\"%\"'></label><button class='btn secondary' type='button' onclick='previewSound(\"start\")'>" + tr("Preview start sound on Core2", "在 Core2 預聽開始音效") + "</button>";
+    page += "<label class='field'>" + tr("Time-up sound", "時間到音效") + "<select id='medEndSound' name='medEndSound'>";
+    for (int i = 0; i < 4; ++i) page += "<option value='" + String(i) + "'" + (meditationEndSound == i ? " selected" : "") + ">" + tr(soundsEn[i], soundsZh[i]) + "</option>";
+    page += "</select></label><label class='field'>" + tr("Time-up volume", "時間到音量") + ": <output id='medEndOut'>" + String(meditationEndVolume) + "%</output><input id='medEndVolume' type='range' min='5' max='100' step='5' name='medEndVolume' value='" + String(meditationEndVolume) + "' oninput='medEndOut.value=this.value+\"%\"'></label><button class='btn secondary' type='button' onclick='previewSound(\"end\")'>" + tr("Preview time-up sound on Core2", "在 Core2 預聽時間到音效") + "</button>";
+    page += "<label class='check'><input type='checkbox' name='medLightEnabled'" + String(meditationLightEnabled ? " checked" : "") + ">" + tr("Enable lighting effects", "啟用燈光效果") + "</label><label class='check'><input type='checkbox' name='medNoiseEnabled'" + String(meditationNoiseEnabled ? " checked" : "") + ">" + tr("Play background sound during countdown", "倒數期間播放白底燥音效") + "</label>";
+    const char* noiseEn[] = {"Stream", "Rain (original)", "Summer night insects (original)"}; const char* noiseZh[] = {"流水聲", "雨聲（原創）", "夏夜蟲鳴（原創）"};
+    page += "<label class='field'>" + tr("Background sound", "白底燥音效") + "<select id='medNoise' name='medNoise'>";
+    for (int i = 0; i < 3; ++i) page += "<option value='" + String(i) + "'" + (meditationNoise == i ? " selected" : "") + ">" + tr(noiseEn[i], noiseZh[i]) + "</option>";
+    page += "</select></label><label class='field'>" + tr("Background volume", "白底燥音量") + ": <output id='medNoiseOut'>" + String(meditationNoiseVolume) + "%</output><input id='medNoiseVolume' type='range' min='5' max='80' step='5' name='medNoiseVolume' value='" + String(meditationNoiseVolume) + "' oninput='medNoiseOut.value=this.value+\"%\"'></label><button class='btn secondary' type='button' onclick='fetch(\"/preview-ambient?sound=\"+document.getElementById(\"medNoise\").value+\"&volume=\"+document.getElementById(\"medNoiseVolume\").value)'>" + tr("Preview background sound on Core2", "在 Core2 預聽白底燥音效") + "</button>";
+  } else if (pageId == "mqtt") {
+    page += "<h2>MQTT</h2><p class='muted'>" + tr("Publish current time, meditation state and sensor values; receive commands and settings updates. Home Assistant auto-discovery is supported.", "發佈目前時間、靜心狀態與感測值；接收控制指令與設定更新，並支援 Home Assistant 自動探索。") + "</p><a class='btn secondary' href='/mqtt-guide'>" + tr("Open complete MQTT guide", "開啟完整 MQTT 設定指南") + "</a>";
+    page += "<label class='check'><input type='checkbox' name='mqttEnabled'" + String(mqttEnabled ? " checked" : "") + ">" + tr("Enable MQTT", "啟用 MQTT") + "</label><label class='field'>" + tr("Broker host/IP", "Broker 主機／IP") + "<input name='mqttHost' value='" + htmlEscape(mqttHost) + "'></label>";
+    page += "<div class='grid'><label class='field'>" + tr("Port", "連接埠") + "<input type='number' min='1' max='65535' name='mqttPort' value='" + String(mqttPort) + "'></label><label class='field'>" + tr("Base topic", "基礎 Topic") + "<input name='mqttBaseTopic' value='" + htmlEscape(mqttBaseTopic) + "'></label></div>";
+    page += "<label class='field'>" + tr("Username", "使用者名稱") + "<input name='mqttUsername' value='" + htmlEscape(mqttUsername) + "'></label><label class='field'>" + tr("Password", "密碼") + "<input type='password' name='mqttPassword' placeholder='" + tr("Leave blank to keep current", "留白以保留目前密碼") + "'></label>";
+  } else if (pageId == "companion") {
+    page += "<h2>Companion</h2><p class='muted'>" + tr("Local host is preferred automatically; the Internet URL is used when the local connection is unavailable. You may fill either or both.", "優先連接區域網路主機；連不上時改用網際網路網址。可填其中一種，也可兩者都填。") + "</p>";
+    for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
+      page += "<div class='card'><b>" + tr("Page ", "頁面 ") + String(i + 1) + "</b><label class='field'>" + tr("Host name", "主機名稱") + "<input name='compName" + String(i) + "' maxlength='24' value='" + htmlEscape(companionNames[i]) + "'></label>";
+      page += "<label class='field'>" + tr("Local host/IP", "區域網路主機／IP") + "<input name='compHost" + String(i) + "' placeholder='10.43.50.145' value='" + htmlEscape(companionHosts[i]) + "'></label><label class='field'>" + tr("Local TCP port", "區域網路 TCP 連接埠") + "<input type='number' min='1' max='65535' name='compPort" + String(i) + "' value='" + String(companionPorts[i]) + "'></label>";
+      page += "<label class='field'>" + tr("Internet WebSocket URL", "網際網路 WebSocket 網址") + "<input name='compRemote" + String(i) + "' placeholder='wss://example.com/satellite' value='" + htmlEscape(companionInternetUrls[i]) + "'></label></div>";
+    }
+  } else if (pageId == "firmware") {
+    page += "<h2>" + tr("Firmware update", "韌體更新") + "</h2><p class='muted'>" + tr("Current version", "目前版本") + ": <b>" SPACE_CLOCK_VERSION "</b></p><a class='btn secondary' href='/update'>" + tr("Open wireless firmware update", "開啟無線韌體更新") + "</a>";
+    page += "<h2>" + tr("Automatic update", "自動更新") + "</h2><label class='check'><input type='checkbox' name='fwAuto'" + String(automaticFirmwareUpdate ? " checked" : "") + ">" + tr("Automatically install new firmware from GitHub", "從 GitHub 自動安裝新韌體") + "</label><label class='field'>" + tr("Daily check hour", "每日檢查時間") + "<select name='fwHour'>";
+    for (int hour = 0; hour < 24; ++hour) { char label[7]; snprintf(label, sizeof(label), "%02d:00", hour); page += "<option value='" + String(hour) + "'" + (firmwareCheckHour == hour ? " selected" : "") + ">" + label + "</option>"; }
+    page += "</select></label><p class='muted'>" + tr("If an update is available, the device downloads it and restarts automatically. Keep it powered and connected to Wi-Fi.", "發現更新時裝置會自動下載並重新啟動。請保持供電並連接 Wi-Fi。") + "</p>";
   }
-  page += "<label class='field'>Time zone (major city)<select name='timeZone'>";
-  for (int i = 0; i < TIME_ZONE_COUNT; ++i) page += "<option value='" + String(i) + "'" + (i == timeZoneIndex ? " selected" : "") + ">" + TIME_ZONES[i].city + "</option>";
-  page += "</select></label>";
-  page += "<label class='field'>Clock face<select name='face'>";
-  const char* faceNames[] = {"Space", "Flip clock", "Matrix rain"};
-  for (int i = 0; i < 3; ++i) page += "<option value='" + String(i) + "'" + (i == (int)clockFace ? " selected" : "") + ">" + faceNames[i] + "</option>";
-  page += "</select></label>";
-  page += "<h2>Matrix rain appearance</h2><p>Applies when Matrix rain is selected. Lower speed and density create a calmer background. Glass opacity controls how much code is visible behind the clock.</p>";
-  page += "<label class='field'>Rain speed: <output id='matrixSpeedOut'>" + String(matrixRainSpeed) + "</output><input type='range' min='10' max='100' step='5' name='matrixSpeed' value='" + String(matrixRainSpeed) + "' oninput='matrixSpeedOut.value=this.value'></label>";
-  page += "<label class='field'>Rain density: <output id='matrixDensityOut'>" + String(matrixRainDensity) + "%</output><input type='range' min='10' max='100' step='5' name='matrixDensity' value='" + String(matrixRainDensity) + "' oninput='matrixDensityOut.value=this.value+\"%\"'></label>";
-  page += "<label class='field'>Glyph size<select name='matrixSize'><option value='1'" + String(matrixGlyphScale == 1 ? " selected" : "") + ">Small</option><option value='2'" + String(matrixGlyphScale == 2 ? " selected" : "") + ">Large</option></select></label>";
-  page += "<label class='field'>Rain color<input type='color' name='matrixColor' value='" + colorHex(matrixRainColor) + "'></label>";
-  page += "<label class='field'>Clock glass opacity: <output id='matrixGlassOut'>" + String(matrixGlassOpacity) + "%</output><input type='range' min='15' max='90' step='5' name='matrixGlass' value='" + String(matrixGlassOpacity) + "' oninput='matrixGlassOut.value=this.value+\"%\"'></label>";
-  page += "<label class='field'>Time format<select name='time24'><option value='1'"+String(use24HourTime?" selected":"")+">24-hour</option><option value='0'"+String(!use24HourTime?" selected":"")+">12-hour</option></select></label>";
-  page += "<label class='field'><input type='checkbox' name='flatButtons'"+String(flatVirtualButtonsEnabled?" checked":"")+"> Enable the three virtual buttons while device is lying flat</label>";
-  page += "<label class='field'><input type='checkbox' name='autoBrightness'" + String(adaptiveBrightness ? " checked" : "") + "> Automatic brightness (day 07:00–20:59)</label>";
-  page += "<label class='field'>Day brightness: <output id='dayOut'>" + String(dayBrightness) + "%</output><input type='range' min='10' max='100' step='5' name='dayBrightness' value='" + String(dayBrightness) + "' oninput='dayOut.value=this.value+\"%\"'></label>";
-  page += "<label class='field'>Night brightness: <output id='nightOut'>" + String(nightBrightness) + "%</output><input type='range' min='5' max='100' step='5' name='nightBrightness' value='" + String(nightBrightness) + "' oninput='nightOut.value=this.value+\"%\"'></label>";
-  page += "<label class='field'>Alarm volume: <output id='volumeOut'>" + String(alarmVolume) + "%</output><input type='range' min='10' max='100' step='5' name='alarmVolume' value='" + String(alarmVolume) + "' oninput='volumeOut.value=this.value+\"%\"'></label>";
-  const char* allSoundNames[] = {"Da Ban", "Chime", "Stream", "Water drop"};
-  page += "<label class='field'>Alarm sound<select id='alarmSound' name='alarmSound'>";
-  for(int i=0;i<4;++i) page += "<option value='"+String(i)+"'"+(alarmSound==i?" selected":"")+">"+allSoundNames[i]+"</option>";
-  page += "</select></label><button type='button' onclick='fetch(\"/preview?sound=\"+document.getElementById(\"alarmSound\").value+\"&volume=\"+document.querySelector(\"[name=alarmVolume]\").value)'>Preview alarm sound on Core2</button>";
-  page += "<label class='field'>Screen automatically turns off after<select name='screenOff'>";
-  const uint16_t screenOffValues[] = {0, 30, 60, 300, 600, 1800};
-  const char* screenOffNames[] = {"Never", "30 seconds", "1 minute", "5 minutes", "10 minutes", "30 minutes"};
-  for (int i = 0; i < 6; ++i) page += "<option value='" + String(screenOffValues[i]) + "'" + (screenOffSeconds == screenOffValues[i] ? " selected" : "") + ">" + screenOffNames[i] + "</option>";
-  page += "</select></label>";
-  page += "<h2>Night light</h2>";
-  page += "<label class='field'><input type='checkbox' name='nightLight'" + String(nightLightEnabled ? " checked" : "") + "> Enable Bottom2 night light when screen is off</label>";
-  page += "<label class='field'>Color<input type='color' name='nightColor' value='" + colorHex(nightLightColor) + "'></label>";
-  page += "<label class='field'>Brightness: <output id='nightLedOut'>" + String(nightLightBrightness) + "%</output><input type='range' min='1' max='100' name='nightLedBrightness' value='" + String(nightLightBrightness) + "' oninput='nightLedOut.value=this.value+\"%\"'></label>";
-  page += "<label class='field'>Mode<select name='nightLightMode'><option value='0'" + String(nightLightMode==0?" selected":"") + ">Stay on while screen is off</option><option value='1'" + String(nightLightMode==1?" selected":"") + ">Turn off after set time</option><option value='2'" + String(nightLightMode==2?" selected":"") + ">Fade out after set time</option></select></label>";
-  page += "<label class='field'>On time (seconds)<input type='number' min='5' max='3600' name='nightLightSeconds' value='" + String(nightLightSeconds) + "'></label>";
-  page += "<h2>Alarm light reminder</h2>";
-  page += "<label class='field'><input type='checkbox' name='alarmLight'" + String(alarmLightEnabled?" checked":"") + "> Enable Bottom2 alarm lighting</label>";
-  page += "<label class='field'>Color<input type='color' name='alarmLightColor' value='" + colorHex(alarmLightColor) + "'></label>";
-  page += "<label class='field'>Brightness: <output id='alarmLedOut'>" + String(alarmLightBrightness) + "%</output><input type='range' min='1' max='100' name='alarmLightBrightness' value='" + String(alarmLightBrightness) + "' oninput='alarmLedOut.value=this.value+\"%\"'></label>";
-  const char* alarmModeNames[] = {"Continuous breathing", "Continuous fast flash", "Three breathing cycles", "Three fast-flash cycles"};
-  page += "<label class='field'>Mode<select name='alarmLightMode'>";
-  for(int i=0;i<4;++i) page += "<option value='"+String(i)+"'"+(alarmLightMode==i?" selected":"")+">"+alarmModeNames[i]+"</option>";
-  page += "</select></label>";
-  page += "<h2>Meditation timer</h2>";
-  page += "<label class='field'>Preset time 1 (minutes)<input type='number' min='1' max='180' name='medPreset1' value='"+String(meditationPresetMinutes[0])+"'></label>";
-  page += "<label class='field'>Preset time 2 (minutes)<input type='number' min='1' max='180' name='medPreset2' value='"+String(meditationPresetMinutes[1])+"'></label>";
-  page += "<label class='field'><input type='checkbox' name='medSoundEnabled'"+String(meditationSoundEnabled?" checked":"")+"> Enable sound reminders</label>";
-  const char* medSoundNames[] = {"Da Ban", "Chime", "Stream", "Water drop"};
-  page += "<label class='field'>Start sound<select id='medStartSound' name='medStartSound'>";
-  for(int i=0;i<4;++i) page += "<option value='"+String(i)+"'"+(meditationStartSound==i?" selected":"")+">"+medSoundNames[i]+"</option>";
-  page += "</select></label><label class='field'>Start volume: <output id='medStartOut'>"+String(meditationStartVolume)+"%</output><input id='medStartVolume' type='range' min='5' max='100' step='5' name='medStartVolume' value='"+String(meditationStartVolume)+"' oninput='medStartOut.value=this.value+\"%\"'></label><button type='button' onclick='previewSound(\"start\")'>Preview start sound on Core2</button>";
-  page += "<label class='field'>Time-up sound<select id='medEndSound' name='medEndSound'>";
-  for(int i=0;i<4;++i) page += "<option value='"+String(i)+"'"+(meditationEndSound==i?" selected":"")+">"+medSoundNames[i]+"</option>";
-  page += "</select></label><label class='field'>Time-up volume: <output id='medEndOut'>"+String(meditationEndVolume)+"%</output><input id='medEndVolume' type='range' min='5' max='100' step='5' name='medEndVolume' value='"+String(meditationEndVolume)+"' oninput='medEndOut.value=this.value+\"%\"'></label><button type='button' onclick='previewSound(\"end\")'>Preview time-up sound on Core2</button>";
-  page += "<label class='field'><input type='checkbox' name='medLightEnabled'"+String(meditationLightEnabled?" checked":"")+"> Enable meditation lighting effects</label>";
-  page += "<label class='field'><input type='checkbox' name='medNoiseEnabled'"+String(meditationNoiseEnabled?" checked":"")+"> Play background sound during countdown</label>";
-  const char* noiseNames[] = {"Stream", "Rain (original)", "Summer night insects (original)"};
-  page += "<label class='field'>Background sound<select id='medNoise' name='medNoise'>";
-  for(int i=0;i<3;++i) page += "<option value='"+String(i)+"'"+(meditationNoise==i?" selected":"")+">"+noiseNames[i]+"</option>";
-  page += "</select></label><label class='field'>Background volume: <output id='medNoiseOut'>"+String(meditationNoiseVolume)+"%</output><input id='medNoiseVolume' type='range' min='5' max='80' step='5' name='medNoiseVolume' value='"+String(meditationNoiseVolume)+"' oninput='medNoiseOut.value=this.value+\"%\"'></label><button type='button' onclick='fetch(\"/preview-ambient?sound=\"+document.getElementById(\"medNoise\").value+\"&volume=\"+document.getElementById(\"medNoiseVolume\").value)'>Preview background sound on Core2</button>";
-  page += "<h2>Alarms</h2><p>Choose a time, enable the alarm, and select its repeat days. No selected day means one-time.</p>";
-  const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-  for (int i = 0; i < ALARM_COUNT; ++i) {
-    char timeValue[6]; snprintf(timeValue, sizeof(timeValue), "%02u:%02u", alarms[i].hour, alarms[i].minute);
-    page += "<details class='alarm'" + String(i < 4 ? " open" : "") + "><summary>Alarm " + String(i + 1) + " — " + timeValue + (alarms[i].enabled ? " (ON)" : " (OFF)") + "</summary>";
-    page += "<label class='field'>Time<input type='time' name='a" + String(i) + "_time' value='" + timeValue + "'></label>";
-    page += "<label><input type='checkbox' name='a" + String(i) + "_on'" + String(alarms[i].enabled ? " checked" : "") + "> Enabled</label><div class='days'>";
-    for (int d = 0; d < 7; ++d) page += "<label><input type='checkbox' name='a" + String(i) + "_d" + String(d) + "'" + String((alarms[i].weekdays & (1 << d)) ? " checked" : "") + ">" + dayNames[d] + "</label>";
-    page += "</div></details>";
-  }
-  page += "<h2>MQTT</h2><p>Live time and meditation data: <b>base topic/state</b> (every second). Full settings: <b>base topic/settings</b>. Send partial JSON settings to <b>base topic/set</b>; result: <b>base topic/ack</b>. Existing commands remain at <b>base topic/command/#</b>.</p>";
-  page += "<a class='button' href='/mqtt-guide'>Open complete MQTT guide</a>";
-  page += "<label class='field'><input type='checkbox' name='mqttEnabled'"+String(mqttEnabled?" checked":"")+"> Enable MQTT</label>";
-  page += "<label class='field'>Broker host/IP<input name='mqttHost' value='"+htmlEscape(mqttHost)+"'></label><label class='field'>Port<input type='number' min='1' max='65535' name='mqttPort' value='"+String(mqttPort)+"'></label>";
-  page += "<label class='field'>Username<input name='mqttUsername' value='"+htmlEscape(mqttUsername)+"'></label><label class='field'>Password<input type='password' name='mqttPassword' placeholder='Leave blank to keep current'></label><label class='field'>Base topic<input name='mqttBaseTopic' value='"+htmlEscape(mqttBaseTopic)+"'></label>";
-  page += "<h2>Companion pages</h2><p>The local host is preferred automatically. If unavailable, the Internet WebSocket URL is used. Either field may be blank.</p>";
-  for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
-    page += "<div class='alarm'><b>Page " + String(i + 1) + "</b>";
-    page += "<label class='field'>Host name<input name='compName" + String(i) + "' maxlength='24' value='" + htmlEscape(companionNames[i]) + "'></label>";
-    page += "<label class='field'>Local host/IP<input name='compHost" + String(i) + "' placeholder='10.43.50.145' value='" + htmlEscape(companionHosts[i]) + "'></label>";
-    page += "<label class='field'>Local TCP port<input type='number' min='1' max='65535' name='compPort" + String(i) + "' value='" + String(companionPorts[i]) + "'></label>";
-    page += "<label class='field'>Internet WebSocket URL<input name='compRemote" + String(i) + "' placeholder='https://example.com/satellite' value='" + htmlEscape(companionInternetUrls[i]) + "'></label></div>";
-  }
-  page += "<h2>Automatic firmware update</h2><label class='field'><input type='checkbox' name='fwAuto'"+String(automaticFirmwareUpdate?" checked":"")+"> Automatically install new firmware from GitHub</label>";
-  page += "<label class='field'>Daily check hour<select name='fwHour'>";
-  for (int hour=0;hour<24;++hour) { char label[7]; snprintf(label,sizeof(label),"%02d:00",hour); page += "<option value='"+String(hour)+"'"+(firmwareCheckHour==hour?" selected":"")+">"+String(label)+"</option>"; }
-  page += "</select></label>";
-  page += "<button type='submit'>Save settings</button></form><script>function previewSound(k){const s=document.getElementById(k==='start'?'medStartSound':'medEndSound').value,v=document.getElementById(k==='start'?'medStartVolume':'medEndVolume').value;fetch('/preview?sound='+s+'&volume='+v);}</script>";
-  page += "<h2>Firmware update</h2><p>Current version: <b>" SPACE_CLOCK_VERSION "</b>. Automatic update can also be configured on the Core2 under Settings → Firmware update.</p>";
-  page += "<a class='button' href='/update'>Open wireless firmware update</a></body></html>";
+
+  page += "</section><button type='submit'>" + tr("Save this page", "儲存本頁設定") + "</button></form>";
+  page += "<script>function previewSound(k){const s=document.getElementById(k==='start'?'medStartSound':'medEndSound').value,v=document.getElementById(k==='start'?'medStartVolume':'medEndVolume').value;fetch('/preview?sound='+s+'&volume='+v);}</script></body></html>";
   settingsServer.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -2793,104 +2838,115 @@ void setupSettingsServer() {
       }
     });
   settingsServer.on("/save", HTTP_POST, []() {
+    String pageId = settingsServer.arg("page");
+    String language = settingsServer.arg("lang");
+    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "mqtt" && pageId != "companion" && pageId != "firmware") pageId = "clock";
     bool wifiChanged = false;
-    for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
-      String nextSsid = settingsServer.arg("wifiS" + String(i)); nextSsid.trim();
-      String nextPassword = settingsServer.arg("wifiP" + String(i));
-      if (settingsServer.hasArg("wifiD" + String(i))) { nextSsid = ""; nextPassword = ""; }
-      else if (!nextPassword.length() && nextSsid == savedWifiSsids[i]) nextPassword = savedWifiPasswords[i];
-      wifiChanged |= nextSsid != savedWifiSsids[i] || nextPassword != savedWifiPasswords[i];
-      savedWifiSsids[i] = nextSsid; savedWifiPasswords[i] = nextPassword;
-    }
-    timeZoneIndex = constrain(settingsServer.arg("timeZone").toInt(), 0, (int)TIME_ZONE_COUNT - 1);
-    clockFace = static_cast<ClockFace>(constrain(settingsServer.arg("face").toInt(), 0, 2));
-    matrixRainSpeed = constrain(settingsServer.arg("matrixSpeed").toInt(), 10, 100);
-    matrixRainDensity = constrain(settingsServer.arg("matrixDensity").toInt(), 10, 100);
-    matrixGlyphScale = constrain(settingsServer.arg("matrixSize").toInt(), 1, 2);
-    matrixRainColor = parseWebColor(settingsServer.arg("matrixColor"), matrixRainColor);
-    matrixGlassOpacity = constrain(settingsServer.arg("matrixGlass").toInt(), 15, 90);
-    resetMatrixRain();
-    use24HourTime = settingsServer.arg("time24").toInt() != 0;
-    flatVirtualButtonsEnabled = settingsServer.hasArg("flatButtons");
-    adaptiveBrightness = settingsServer.hasArg("autoBrightness");
-    dayBrightness = constrain(settingsServer.arg("dayBrightness").toInt(), 10, 100);
-    nightBrightness = constrain(settingsServer.arg("nightBrightness").toInt(), 5, 100);
-    alarmVolume = constrain(settingsServer.arg("alarmVolume").toInt(), 10, 100);
-    alarmSound = constrain(settingsServer.arg("alarmSound").toInt(), 0, 3);
-    screenOffSeconds = constrain(settingsServer.arg("screenOff").toInt(), 0, 1800);
-    automaticFirmwareUpdate = settingsServer.hasArg("fwAuto");
-    firmwareCheckHour = constrain(settingsServer.arg("fwHour").toInt(), 0, 23);
-    nightLightEnabled = settingsServer.hasArg("nightLight");
-    nightLightColor = parseWebColor(settingsServer.arg("nightColor"), nightLightColor);
-    nightLightBrightness = constrain(settingsServer.arg("nightLedBrightness").toInt(), 1, 100);
-    nightLightMode = constrain(settingsServer.arg("nightLightMode").toInt(), 0, 2);
-    nightLightSeconds = constrain(settingsServer.arg("nightLightSeconds").toInt(), 5, 3600);
-    alarmLightEnabled = settingsServer.hasArg("alarmLight");
-    alarmLightColor = parseWebColor(settingsServer.arg("alarmLightColor"), alarmLightColor);
-    alarmLightBrightness = constrain(settingsServer.arg("alarmLightBrightness").toInt(), 1, 100);
-    alarmLightMode = constrain(settingsServer.arg("alarmLightMode").toInt(), 0, 3);
-    meditationPresetMinutes[0] = constrain(settingsServer.arg("medPreset1").toInt(), 1, 180);
-    meditationPresetMinutes[1] = constrain(settingsServer.arg("medPreset2").toInt(), 1, 180);
-    meditationSoundEnabled = settingsServer.hasArg("medSoundEnabled");
-    meditationStartSound = constrain(settingsServer.arg("medStartSound").toInt(), 0, 3);
-    meditationStartVolume = constrain(settingsServer.arg("medStartVolume").toInt(), 5, 100);
-    meditationEndSound = constrain(settingsServer.arg("medEndSound").toInt(), 0, 3);
-    meditationEndVolume = constrain(settingsServer.arg("medEndVolume").toInt(), 5, 100);
-    meditationLightEnabled = settingsServer.hasArg("medLightEnabled");
-    meditationNoiseEnabled = settingsServer.hasArg("medNoiseEnabled");
-    meditationNoise = constrain(settingsServer.arg("medNoise").toInt(),0,2);
-    meditationNoiseVolume = constrain(settingsServer.arg("medNoiseVolume").toInt(),5,80);
-    mqttEnabled = settingsServer.hasArg("mqttEnabled");
-    mqttHost = settingsServer.arg("mqttHost");
-    mqttPort = constrain(settingsServer.arg("mqttPort").toInt(),1,65535);
-    mqttUsername = settingsServer.arg("mqttUsername");
-    if(settingsServer.arg("mqttPassword").length()) mqttPassword=settingsServer.arg("mqttPassword");
-    mqttBaseTopic = settingsServer.arg("mqttBaseTopic"); mqttBaseTopic.trim();
-    while(mqttBaseTopic.endsWith("/")) mqttBaseTopic.remove(mqttBaseTopic.length()-1);
-    mqttClient.disconnect();
-    for (int i = 0; i < ALARM_COUNT; ++i) {
-      String prefix = "a" + String(i);
-      uint8_t oldHour = alarms[i].hour, oldMinute = alarms[i].minute, oldWeekdays = alarms[i].weekdays;
-      bool oldEnabled = alarms[i].enabled;
-      String alarmTime = settingsServer.arg(prefix + "_time");
-      if (alarmTime.length() >= 5) {
-        alarms[i].hour = constrain(alarmTime.substring(0, 2).toInt(), 0, 23);
-        alarms[i].minute = constrain(alarmTime.substring(3, 5).toInt(), 0, 59);
-      }
-      alarms[i].enabled = settingsServer.hasArg(prefix + "_on");
-      alarms[i].weekdays = 0;
-      for (int d = 0; d < 7; ++d) if (settingsServer.hasArg(prefix + "_d" + String(d))) alarms[i].weekdays |= 1 << d;
-      if (oldHour != alarms[i].hour || oldMinute != alarms[i].minute || oldWeekdays != alarms[i].weekdays || (!oldEnabled && alarms[i].enabled)) {
-        alarms[i].lastDay = -1;
-      }
-    }
     bool reconnectCompanion = false;
-    for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
-      String nextHost = settingsServer.arg("compHost" + String(i));
-      String nextRemote = settingsServer.arg("compRemote" + String(i));
-      String nextName = settingsServer.arg("compName" + String(i)); nextName.trim();
-      uint16_t nextPort = (uint16_t)constrain(settingsServer.arg("compPort" + String(i)).toInt(), 1, 65535);
-      if (nextHost != companionHosts[i] || nextRemote != companionInternetUrls[i] || nextPort != companionPorts[i]) reconnectCompanion = true;
-      companionNames[i] = nextName.length() ? nextName : "Page " + String(i + 1);
-      companionHosts[i] = nextHost;
-      companionInternetUrls[i] = nextRemote;
-      companionPorts[i] = nextPort;
+    if (pageId == "wifi") {
+      for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
+        String nextSsid = settingsServer.arg("wifiS" + String(i)); nextSsid.trim();
+        String nextPassword = settingsServer.arg("wifiP" + String(i));
+        if (settingsServer.hasArg("wifiD" + String(i))) { nextSsid = ""; nextPassword = ""; }
+        else if (!nextPassword.length() && nextSsid == savedWifiSsids[i]) nextPassword = savedWifiPasswords[i];
+        wifiChanged |= nextSsid != savedWifiSsids[i] || nextPassword != savedWifiPasswords[i];
+        savedWifiSsids[i] = nextSsid; savedWifiPasswords[i] = nextPassword;
+      }
+    } else if (pageId == "clock") {
+      timeZoneIndex = constrain(settingsServer.arg("timeZone").toInt(), 0, (int)TIME_ZONE_COUNT - 1);
+      clockFace = static_cast<ClockFace>(constrain(settingsServer.arg("face").toInt(), 0, 2));
+      matrixRainSpeed = constrain(settingsServer.arg("matrixSpeed").toInt(), 10, 100);
+      matrixRainDensity = constrain(settingsServer.arg("matrixDensity").toInt(), 10, 100);
+      matrixGlyphScale = constrain(settingsServer.arg("matrixSize").toInt(), 1, 2);
+      matrixRainColor = parseWebColor(settingsServer.arg("matrixColor"), matrixRainColor);
+      matrixGlassOpacity = constrain(settingsServer.arg("matrixGlass").toInt(), 15, 90);
+      resetMatrixRain();
+      use24HourTime = settingsServer.arg("time24").toInt() != 0;
+      flatVirtualButtonsEnabled = settingsServer.hasArg("flatButtons");
+      adaptiveBrightness = settingsServer.hasArg("autoBrightness");
+      dayBrightness = constrain(settingsServer.arg("dayBrightness").toInt(), 10, 100);
+      nightBrightness = constrain(settingsServer.arg("nightBrightness").toInt(), 5, 100);
+      screenOffSeconds = constrain(settingsServer.arg("screenOff").toInt(), 0, 1800);
+      nightLightEnabled = settingsServer.hasArg("nightLight");
+      nightLightColor = parseWebColor(settingsServer.arg("nightColor"), nightLightColor);
+      nightLightBrightness = constrain(settingsServer.arg("nightLedBrightness").toInt(), 1, 100);
+      nightLightMode = constrain(settingsServer.arg("nightLightMode").toInt(), 0, 2);
+      nightLightSeconds = constrain(settingsServer.arg("nightLightSeconds").toInt(), 5, 3600);
+    } else if (pageId == "alarms") {
+      alarmVolume = constrain(settingsServer.arg("alarmVolume").toInt(), 10, 100);
+      alarmSound = constrain(settingsServer.arg("alarmSound").toInt(), 0, 3);
+      alarmLightEnabled = settingsServer.hasArg("alarmLight");
+      alarmLightColor = parseWebColor(settingsServer.arg("alarmLightColor"), alarmLightColor);
+      alarmLightBrightness = constrain(settingsServer.arg("alarmLightBrightness").toInt(), 1, 100);
+      alarmLightMode = constrain(settingsServer.arg("alarmLightMode").toInt(), 0, 3);
+      for (int i = 0; i < ALARM_COUNT; ++i) {
+        String prefix = "a" + String(i);
+        uint8_t oldHour = alarms[i].hour, oldMinute = alarms[i].minute, oldWeekdays = alarms[i].weekdays;
+        bool oldEnabled = alarms[i].enabled;
+        String alarmTime = settingsServer.arg(prefix + "_time");
+        if (alarmTime.length() >= 5) {
+          alarms[i].hour = constrain(alarmTime.substring(0, 2).toInt(), 0, 23);
+          alarms[i].minute = constrain(alarmTime.substring(3, 5).toInt(), 0, 59);
+        }
+        alarms[i].enabled = settingsServer.hasArg(prefix + "_on");
+        alarms[i].weekdays = 0;
+        for (int d = 0; d < 7; ++d) if (settingsServer.hasArg(prefix + "_d" + String(d))) alarms[i].weekdays |= 1 << d;
+        if (oldHour != alarms[i].hour || oldMinute != alarms[i].minute || oldWeekdays != alarms[i].weekdays || (!oldEnabled && alarms[i].enabled)) alarms[i].lastDay = -1;
+      }
+    } else if (pageId == "meditation") {
+      meditationPresetMinutes[0] = constrain(settingsServer.arg("medPreset1").toInt(), 1, 180);
+      meditationPresetMinutes[1] = constrain(settingsServer.arg("medPreset2").toInt(), 1, 180);
+      meditationSoundEnabled = settingsServer.hasArg("medSoundEnabled");
+      meditationStartSound = constrain(settingsServer.arg("medStartSound").toInt(), 0, 3);
+      meditationStartVolume = constrain(settingsServer.arg("medStartVolume").toInt(), 5, 100);
+      meditationEndSound = constrain(settingsServer.arg("medEndSound").toInt(), 0, 3);
+      meditationEndVolume = constrain(settingsServer.arg("medEndVolume").toInt(), 5, 100);
+      meditationLightEnabled = settingsServer.hasArg("medLightEnabled");
+      meditationNoiseEnabled = settingsServer.hasArg("medNoiseEnabled");
+      meditationNoise = constrain(settingsServer.arg("medNoise").toInt(), 0, 2);
+      meditationNoiseVolume = constrain(settingsServer.arg("medNoiseVolume").toInt(), 5, 80);
+    } else if (pageId == "mqtt") {
+      mqttEnabled = settingsServer.hasArg("mqttEnabled");
+      mqttHost = settingsServer.arg("mqttHost");
+      mqttPort = constrain(settingsServer.arg("mqttPort").toInt(), 1, 65535);
+      mqttUsername = settingsServer.arg("mqttUsername");
+      if (settingsServer.arg("mqttPassword").length()) mqttPassword = settingsServer.arg("mqttPassword");
+      mqttBaseTopic = settingsServer.arg("mqttBaseTopic"); mqttBaseTopic.trim();
+      while (mqttBaseTopic.endsWith("/")) mqttBaseTopic.remove(mqttBaseTopic.length() - 1);
+      mqttClient.disconnect();
+    } else if (pageId == "companion") {
+      for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
+        String nextHost = settingsServer.arg("compHost" + String(i));
+        String nextRemote = settingsServer.arg("compRemote" + String(i));
+        String nextName = settingsServer.arg("compName" + String(i)); nextName.trim();
+        uint16_t nextPort = (uint16_t)constrain(settingsServer.arg("compPort" + String(i)).toInt(), 1, 65535);
+        if (nextHost != companionHosts[i] || nextRemote != companionInternetUrls[i] || nextPort != companionPorts[i]) reconnectCompanion = true;
+        companionNames[i] = nextName.length() ? nextName : "Page " + String(i + 1);
+        companionHosts[i] = nextHost;
+        companionInternetUrls[i] = nextRemote;
+        companionPorts[i] = nextPort;
+      }
+    } else if (pageId == "firmware") {
+      automaticFirmwareUpdate = settingsServer.hasArg("fwAuto");
+      firmwareCheckHour = constrain(settingsServer.arg("fwHour").toInt(), 0, 23);
     }
     if (reconnectCompanion) {
       stopCompanion();
       clearCompanionPageData();
     }
     saveSettings();
-    sendSettingsPage("Settings saved. The clock will apply them now.");
+    sendSettingsPage(language == "zh" ? "本頁設定已儲存並套用。" : "This page was saved and applied.", pageId, language);
     if (wifiChanged) {
       wifiWasConnected = false;
       wifiDefaultFallbackAttempted = false;
       if (hasSavedWifiProfiles()) startWifiProfileScan(millis());
       else beginLegacyWifiRetry(millis());
     } else {
-      syncTime();
-      m5::rtc_datetime_t brightnessNow; getClockDateTime(&brightnessNow); applyDisplayBrightness(brightnessNow);
-      drawClock(true); drawAstronaut();
+      if (pageId == "clock") syncTime();
+      if (pageId == "clock" || pageId == "alarms") {
+        m5::rtc_datetime_t brightnessNow; getClockDateTime(&brightnessNow); applyDisplayBrightness(brightnessNow);
+        updateAlarmBaseLights(millis()); drawClock(true); drawAstronaut();
+      }
     }
   });
   settingsServer.onNotFound([]() { settingsServer.sendHeader("Location", "/"); settingsServer.send(302); });
