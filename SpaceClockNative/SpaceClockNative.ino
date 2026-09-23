@@ -173,6 +173,7 @@ CompanionImage companionImages[COMPANION_KEYS];
 M5Canvas astronautCanvas(&M5.Display);
 M5Canvas companionButtonCanvas(&M5.Display);
 M5Canvas meditationCardCanvas(&M5.Display);
+M5Canvas matrixCanvas(&M5.Display);
 static constexpr uint8_t BOTTOM_LED_PIN = 25;
 static constexpr uint8_t BOTTOM_LED_COUNT = 10;
 Adafruit_NeoPixel bottomLeds(BOTTOM_LED_COUNT, BOTTOM_LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -182,8 +183,11 @@ bool alarmLedsOn = false;
 uint32_t lastClockDraw = 0, lastAnim = 0;
 int lastMinute = -1;
 static constexpr uint8_t MATRIX_COLUMNS = 40;
-int16_t matrixHead[MATRIX_COLUMNS];
-uint8_t matrixSpeed[MATRIX_COLUMNS];
+static constexpr uint8_t MATRIX_MAX_ROWS = 32;
+float matrixHead[MATRIX_COLUMNS];
+float matrixSpeed[MATRIX_COLUMNS];
+uint8_t matrixLength[MATRIX_COLUMNS];
+char matrixChars[MATRIX_COLUMNS][MATRIX_MAX_ROWS];
 bool matrixActive[MATRIX_COLUMNS];
 uint32_t lastMatrixFrame = 0;
 uint8_t matrixRainSpeed = 25;       // 10 = calm, 100 = fast
@@ -491,7 +495,8 @@ void drawClockStatus(uint16_t background) {
   if (!transparentMatrix) M5.Display.fillRect(0, 0, 320, 29, background);
   int level = constrain(M5.Power.getBatteryLevel(), 0, 100);
   bool charging = M5.Power.isCharging();
-  uint16_t batteryColor = charging ? TFT_GREEN : (level <= 20 ? TFT_RED : TFT_WHITE);
+  uint16_t themeColor = matrixColor(100);
+  uint16_t batteryColor = level <= 20 ? TFT_RED : (clockFace == ClockFace::Matrix ? themeColor : (charging ? TFT_GREEN : TFT_WHITE));
   M5.Display.setTextDatum(top_left);
   useUIFont(1);
   if (transparentMatrix) M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED);
@@ -507,8 +512,9 @@ void drawClockStatus(uint16_t background) {
   M5.Display.fillRoundRect(285, 8, max(2, level * 25 / 100), 13, 2, batteryColor);
   M5.Display.fillRect(314, 10, 4, 9, batteryColor);
   if (charging) {
-    M5.Display.fillTriangle(299, 6, 293, 15, 299, 15, TFT_YELLOW);
-    M5.Display.fillTriangle(299, 13, 305, 13, 297, 23, TFT_YELLOW);
+    uint16_t boltColor = clockFace == ClockFace::Matrix ? themeColor : TFT_YELLOW;
+    M5.Display.fillTriangle(299, 6, 293, 15, 299, 15, boltColor);
+    M5.Display.fillTriangle(299, 13, 305, 13, 297, 23, boltColor);
   }
   M5.Display.setTextDatum(top_left);
 }
@@ -544,14 +550,20 @@ void drawClockNavigationIcons() {
 }
 
 void resetMatrixRain() {
-  const int glyphWidth = 8 * matrixGlyphScale;
-  const int usableColumns = min((int)MATRIX_COLUMNS, 320 / glyphWidth);
+  const int glyphHeight = 8 * matrixGlyphScale;
+  const int usableColumns = min((int)MATRIX_COLUMNS, 320 / glyphHeight);
+  const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphHeight + 2);
+  static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%+-";
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     matrixActive[i] = i < usableColumns && (esp_random() % 100) < matrixRainDensity;
-    matrixHead[i] = -((int)(esp_random() % 28) * glyphWidth);
-    matrixSpeed[i] = 1 + (esp_random() % 3);
+    matrixHead[i] = -((float)(esp_random() % rows));
+    // Match the CM4 renderer: independent columns, with a broad speed range
+    // and a visibly different trail length for each stream.
+    matrixSpeed[i] = 1.0f + (esp_random() % 100) / 100.0f * 2.5f;
+    matrixLength[i] = 5 + (esp_random() % max(2, rows - 4));
+    for (int row = 0; row < MATRIX_MAX_ROWS; ++row) matrixChars[i][row] = glyphs[esp_random() % (sizeof(glyphs) - 1)];
   }
-  // Preserve at least a few streams even at the minimum density.
+  // Keep a few streams at the lowest density so the background never dies.
   for (int i = 0; i < min(3, usableColumns); ++i) matrixActive[i] = true;
   lastMatrixFrame = 0;
 }
@@ -563,64 +575,79 @@ uint16_t matrixColor(uint8_t strength) {
   return M5.Display.color565(r, g, b);
 }
 
-void drawMatrixGlassPanel() {
+void drawMatrixGlassPanel(M5Canvas& canvas) {
   const int x0 = 42, y0 = 72, width = 236, height = 113;
-  // TFT hardware has no alpha channel. A fine ordered dither gives a stable
-  // translucent, frosted-glass veil while leaving rain visible underneath.
+  // Core2's TFT has no alpha channel. This fine ordered dither is stable on
+  // camera and resembles frosted glass while exposing the rain beneath.
   uint8_t coveredTiles = (matrixGlassOpacity * 16 + 99) / 100;
   for (int y = y0 + 4; y < y0 + height - 4; y += 4) {
     for (int x = x0 + 4; x < x0 + width - 4; x += 4) {
       uint8_t pattern = ((x >> 2) * 5 + (y >> 2) * 3 + ((x >> 3) ^ (y >> 3))) & 15;
-      if (pattern < coveredTiles) M5.Display.fillRect(x, y, 4, 4, TFT_BLACK);
+      if (pattern < coveredTiles) canvas.fillRect(x, y, 4, 4, TFT_BLACK);
     }
   }
-  M5.Display.drawRoundRect(x0, y0, width, height, 10, matrixColor(72));
-  M5.Display.drawRoundRect(x0 + 2, y0 + 2, width - 4, height - 4, 8, matrixColor(25));
+  canvas.drawRoundRect(x0, y0, width, height, 10, matrixColor(72));
+  canvas.drawRoundRect(x0 + 2, y0 + 2, width - 4, height - 4, 8, matrixColor(25));
 }
 
-void drawMatrixClockPanel() {
+void drawMatrixClockPanel(M5Canvas& canvas) {
   m5::rtc_datetime_t dt; getClockDateTime(&dt);
   char buf[24];
-  drawMatrixGlassPanel();
+  drawMatrixGlassPanel(canvas);
   int shownHour = use24HourTime ? dt.time.hours : (dt.time.hours % 12 ? dt.time.hours % 12 : 12);
   snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
-  M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(matrixColor(100)); useUILargeFont();
-  M5.Display.drawString(buf, 160, 112);
+  canvas.setTextDatum(middle_center); canvas.setTextColor(matrixColor(100));
+  canvas.setFont(&SourceHanSansTC_Medium28pt7b); canvas.setTextSize(1);
+  canvas.drawString(buf, 160, 112);
   snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
-  M5.Display.setTextColor(TFT_LIGHTGREY); useUIMediumFont();
-  M5.Display.drawString(buf, 160, 160);
-  M5.Display.setTextDatum(top_left);
+  canvas.setTextColor(TFT_LIGHTGREY); canvas.setFont(&SourceHanSansTC_UI14pt8b); canvas.setTextSize(1);
+  canvas.drawString(buf, 160, 160);
+  canvas.setTextDatum(top_left);
 }
 
 void drawMatrixRainFrame(uint32_t nowMs) {
-  if (clockFace != ClockFace::Matrix || screenNow != Screen::Clock || alarmActive >= 0 || nowMs - lastMatrixFrame < 70UL) return;
-  uint32_t frameInterval = 60 + (100 - matrixRainSpeed) * 4UL;
+  if (clockFace != ClockFace::Matrix || screenNow != Screen::Clock || alarmActive >= 0) return;
+  uint32_t frameInterval = 100;  // CM4 uses 10 fps for the live rain layer.
   if (nowMs - lastMatrixFrame < frameInterval) return;
+  float dt = lastMatrixFrame ? (nowMs - lastMatrixFrame) / 1000.0f : frameInterval / 1000.0f;
+  if (dt > 0.25f) dt = 0.25f;
   lastMatrixFrame = nowMs;
   const int glyphSize = 8 * matrixGlyphScale;
+  const int rows = min((int)MATRIX_MAX_ROWS, 240 / glyphSize + 2);
+  static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%+-";
+  matrixCanvas.fillSprite(TFT_BLACK);
+  matrixCanvas.setTextDatum(top_left);
+  matrixCanvas.setFont(&SourceHanSansTC_UI8pt8b);
+  matrixCanvas.setTextSize(matrixGlyphScale);
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     if (!matrixActive[i]) continue;
     int x = i * glyphSize;
-    int y = matrixHead[i];
-    int tailY = y - glyphSize * 8;
-    if (tailY >= 0 && tailY < 240) M5.Display.fillRect(x, tailY, glyphSize, glyphSize, TFT_BLACK);
-    if (y >= 0 && y < 240) {
-      static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%+-";
-      char glyph = glyphs[esp_random() % (sizeof(glyphs) - 1)];
-      uint16_t rain = (i % 11 == 0) ? TFT_WHITE : matrixColor(i % 3 == 0 ? 100 : 55);
-      M5.Display.setTextDatum(top_left); M5.Display.setTextColor(rain); useUIFont(matrixGlyphScale);
-      M5.Display.drawChar(glyph, x, y);
+    int before = (int)matrixHead[i];
+    // User speed maps to 1.5–11 cells/s: calm by default, never a blur.
+    matrixHead[i] += matrixSpeed[i] * (0.7f + matrixRainSpeed * 0.095f) * dt;
+    int head = (int)matrixHead[i];
+    if (head != before && head >= 0) matrixChars[i][head % MATRIX_MAX_ROWS] = glyphs[esp_random() % (sizeof(glyphs) - 1)];
+    // A little character flicker inside a tail gives the rain its living look.
+    if ((esp_random() % 100) < 12) matrixChars[i][esp_random() % rows] = glyphs[esp_random() % (sizeof(glyphs) - 1)];
+    for (int trail = 0; trail < matrixLength[i]; ++trail) {
+      int row = head - trail;
+      if (row < 0 || row >= rows) continue;
+      uint8_t strength = trail == 0 ? 100 : max(7, 78 - (trail * 72 / max(1, (int)matrixLength[i] - 1)));
+      uint16_t color = trail == 0 ? M5.Display.color565(205, 255, 215) : matrixColor(strength);
+      matrixCanvas.setTextColor(color);
+      matrixCanvas.drawChar(matrixChars[i][row % MATRIX_MAX_ROWS], x, row * glyphSize);
     }
-    matrixHead[i] += matrixSpeed[i] * max(1, (int)matrixGlyphScale);
-    if (matrixHead[i] > 240 + glyphSize) {
-      matrixHead[i] = -((int)(esp_random() % 28) * glyphSize);
-      matrixSpeed[i] = 1 + (esp_random() % 3);
+    if (matrixHead[i] - matrixLength[i] > rows) {
+      matrixHead[i] = -((float)(esp_random() % max(1, rows / 2)));
+      matrixSpeed[i] = 1.0f + (esp_random() % 100) / 100.0f * 2.5f;
+      matrixLength[i] = 5 + (esp_random() % max(2, rows - 4));
       matrixActive[i] = (esp_random() % 100) < matrixRainDensity;
     }
   }
-  // Repaint UI overlays after rain so both the status and navigation regions
-  // retain their normal functionality while rain remains behind them.
-  drawMatrixClockPanel();
+  drawMatrixClockPanel(matrixCanvas);
+  matrixCanvas.pushSprite(0, 0);
+  // UI is layered after a complete frame; no incremental clearing means no
+  // flashing, including while the status text or battery level changes.
   drawClockStatus(TFT_BLACK);
   drawClockNavigationIcons();
 }
@@ -702,7 +729,10 @@ void drawClock(bool full = false) {
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
     M5.Display.drawString(buf, 120, 174);
   } else if (clockFace == ClockFace::Matrix) {
-    drawMatrixClockPanel();
+    // Matrix is always composed as one complete sprite frame. This avoids
+    // partial redraws that show up as flicker on the Core2 TFT.
+    lastMatrixFrame = millis() - 100;
+    drawMatrixRainFrame(millis());
   } else {
     static int shownMinute = -1, shownHour = -1, shownDay = -1;
     if (full) shownMinute = shownHour = shownDay = -1;
@@ -2616,6 +2646,8 @@ void setup() {
   companionButtonCanvas.createSprite(96, 96);
   meditationCardCanvas.setColorDepth(16);
   meditationCardCanvas.createSprite(98, 96);
+  matrixCanvas.setColorDepth(16);
+  matrixCanvas.createSprite(320, 240);
   loadSettings();
   lastUserActivity = millis();
   m5::rtc_datetime_t startupTime; getClockDateTime(&startupTime); applyDisplayBrightness(startupTime);
