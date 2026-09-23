@@ -184,7 +184,13 @@ int lastMinute = -1;
 static constexpr uint8_t MATRIX_COLUMNS = 40;
 int16_t matrixHead[MATRIX_COLUMNS];
 uint8_t matrixSpeed[MATRIX_COLUMNS];
+bool matrixActive[MATRIX_COLUMNS];
 uint32_t lastMatrixFrame = 0;
+uint8_t matrixRainSpeed = 25;       // 10 = calm, 100 = fast
+uint8_t matrixRainDensity = 35;     // percentage of visible columns
+uint8_t matrixGlyphScale = 1;       // 1x or 2x Source Han glyphs
+uint32_t matrixRainColor = 0x00E86B;
+uint8_t matrixGlassOpacity = 58;    // dithered black veil over the time card
 
 static constexpr uint16_t BG = 0x0000;
 static constexpr uint16_t FG = 0xF79E;
@@ -235,6 +241,11 @@ void saveSettings() {
   prefs.begin("spaceclock", false);
   prefs.putUChar("tzCity", timeZoneIndex);
   prefs.putUChar("face", static_cast<uint8_t>(clockFace));
+  prefs.putUChar("matrixSpd", matrixRainSpeed);
+  prefs.putUChar("matrixDen", matrixRainDensity);
+  prefs.putUChar("matrixSize", matrixGlyphScale);
+  prefs.putUInt("matrixColor", matrixRainColor);
+  prefs.putUChar("matrixGlass", matrixGlassOpacity);
   prefs.putBool("autoBright", adaptiveBrightness);
   prefs.putUChar("dayBright", dayBrightness);
   prefs.putUChar("nightBright", nightBrightness);
@@ -298,6 +309,11 @@ void loadSettings() {
   if (timeZoneIndex >= TIME_ZONE_COUNT) timeZoneIndex = 18;
   uint8_t savedFace = prefs.getUChar("face", 0);
   clockFace = savedFace <= static_cast<uint8_t>(ClockFace::Matrix) ? static_cast<ClockFace>(savedFace) : ClockFace::Space;
+  matrixRainSpeed = constrain((int)prefs.getUChar("matrixSpd", 25), 10, 100);
+  matrixRainDensity = constrain((int)prefs.getUChar("matrixDen", 35), 10, 100);
+  matrixGlyphScale = constrain((int)prefs.getUChar("matrixSize", 1), 1, 2);
+  matrixRainColor = prefs.getUInt("matrixColor", 0x00E86B) & 0xFFFFFF;
+  matrixGlassOpacity = constrain((int)prefs.getUChar("matrixGlass", 58), 15, 90);
   adaptiveBrightness = prefs.getBool("autoBright", true);
   dayBrightness = constrain((int)prefs.getUChar("dayBright", 80), 10, 100);
   nightBrightness = constrain((int)prefs.getUChar("nightBright", 20), 5, 100);
@@ -471,18 +487,21 @@ void checkMotionWake(uint32_t nowMs) {
 }
 
 void drawClockStatus(uint16_t background) {
-  M5.Display.fillRect(0, 0, 320, 29, background);
+  bool transparentMatrix = clockFace == ClockFace::Matrix && background == TFT_BLACK;
+  if (!transparentMatrix) M5.Display.fillRect(0, 0, 320, 29, background);
   int level = constrain(M5.Power.getBatteryLevel(), 0, 100);
   bool charging = M5.Power.isCharging();
   uint16_t batteryColor = charging ? TFT_GREEN : (level <= 20 ? TFT_RED : TFT_WHITE);
   M5.Display.setTextDatum(top_left);
   useUIFont(1);
-  M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED, background);
+  if (transparentMatrix) M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED);
+  else M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED, background);
   String label = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Wi-Fi offline";
   M5.Display.drawString(label, 5, 7);
   M5.Display.setTextDatum(top_right);
   useUIFont(1);
-  M5.Display.setTextColor(batteryColor, background);
+  if (transparentMatrix) M5.Display.setTextColor(batteryColor);
+  else M5.Display.setTextColor(batteryColor, background);
   M5.Display.drawString(String(level) + "%", 278, 9);
   M5.Display.drawRoundRect(282, 5, 32, 19, 4, batteryColor);
   M5.Display.fillRoundRect(285, 8, max(2, level * 25 / 100), 13, 2, batteryColor);
@@ -516,7 +535,7 @@ void drawClockNavigationIcon(int cx, int cy) {
 }
 
 void drawClockNavigationIcons() {
-  M5.Display.fillRect(0, 215, 320, 25, BG);
+  if (clockFace != ClockFace::Matrix) M5.Display.fillRect(0, 215, 320, 25, BG);
   // Both supplied bitmaps are normalized to a 24 × 24 visible canvas.
   M5.Display.drawPng(nav_companion_png, nav_companion_png_len, 41, 215);
   M5.Display.drawPng(nav_meditation_png, nav_meditation_png_len, 148, 215);
@@ -525,38 +544,85 @@ void drawClockNavigationIcons() {
 }
 
 void resetMatrixRain() {
+  const int glyphWidth = 8 * matrixGlyphScale;
+  const int usableColumns = min((int)MATRIX_COLUMNS, 320 / glyphWidth);
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
-    matrixHead[i] = -((int)(esp_random() % 24) * 8);
+    matrixActive[i] = i < usableColumns && (esp_random() % 100) < matrixRainDensity;
+    matrixHead[i] = -((int)(esp_random() % 28) * glyphWidth);
     matrixSpeed[i] = 1 + (esp_random() % 3);
   }
+  // Preserve at least a few streams even at the minimum density.
+  for (int i = 0; i < min(3, usableColumns); ++i) matrixActive[i] = true;
   lastMatrixFrame = 0;
+}
+
+uint16_t matrixColor(uint8_t strength) {
+  uint8_t r = ((matrixRainColor >> 16) & 255) * strength / 100;
+  uint8_t g = ((matrixRainColor >> 8) & 255) * strength / 100;
+  uint8_t b = (matrixRainColor & 255) * strength / 100;
+  return M5.Display.color565(r, g, b);
+}
+
+void drawMatrixGlassPanel() {
+  const int x0 = 42, y0 = 72, width = 236, height = 113;
+  // TFT hardware has no alpha channel. A fine ordered dither gives a stable
+  // translucent, frosted-glass veil while leaving rain visible underneath.
+  uint8_t coveredTiles = (matrixGlassOpacity * 16 + 99) / 100;
+  for (int y = y0 + 4; y < y0 + height - 4; y += 4) {
+    for (int x = x0 + 4; x < x0 + width - 4; x += 4) {
+      uint8_t pattern = ((x >> 2) * 5 + (y >> 2) * 3 + ((x >> 3) ^ (y >> 3))) & 15;
+      if (pattern < coveredTiles) M5.Display.fillRect(x, y, 4, 4, TFT_BLACK);
+    }
+  }
+  M5.Display.drawRoundRect(x0, y0, width, height, 10, matrixColor(72));
+  M5.Display.drawRoundRect(x0 + 2, y0 + 2, width - 4, height - 4, 8, matrixColor(25));
+}
+
+void drawMatrixClockPanel() {
+  m5::rtc_datetime_t dt; getClockDateTime(&dt);
+  char buf[24];
+  drawMatrixGlassPanel();
+  int shownHour = use24HourTime ? dt.time.hours : (dt.time.hours % 12 ? dt.time.hours % 12 : 12);
+  snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
+  M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(matrixColor(100)); useUILargeFont();
+  M5.Display.drawString(buf, 160, 112);
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
+  M5.Display.setTextColor(TFT_LIGHTGREY); useUIMediumFont();
+  M5.Display.drawString(buf, 160, 160);
+  M5.Display.setTextDatum(top_left);
 }
 
 void drawMatrixRainFrame(uint32_t nowMs) {
   if (clockFace != ClockFace::Matrix || screenNow != Screen::Clock || alarmActive >= 0 || nowMs - lastMatrixFrame < 70UL) return;
+  uint32_t frameInterval = 60 + (100 - matrixRainSpeed) * 4UL;
+  if (nowMs - lastMatrixFrame < frameInterval) return;
   lastMatrixFrame = nowMs;
+  const int glyphSize = 8 * matrixGlyphScale;
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
-    int x = i * 8;
+    if (!matrixActive[i]) continue;
+    int x = i * glyphSize;
     int y = matrixHead[i];
-    // The central black panel belongs to the clock. Keep rain outside it so
-    // the digits stay readable and never flicker beneath a falling glyph.
-    bool headOnClock = x >= 42 && x <= 278 && y >= 72 && y <= 185;
-    int tailY = y - 72;
-    bool tailOnClock = x >= 42 && x <= 278 && tailY >= 72 && tailY <= 185;
-    if (tailY >= 29 && tailY < 215 && !tailOnClock) M5.Display.fillRect(x, tailY, 8, 8, TFT_BLACK);
-    if (y >= 29 && y < 215 && !headOnClock) {
+    int tailY = y - glyphSize * 8;
+    if (tailY >= 0 && tailY < 240) M5.Display.fillRect(x, tailY, glyphSize, glyphSize, TFT_BLACK);
+    if (y >= 0 && y < 240) {
       static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%+-";
       char glyph = glyphs[esp_random() % (sizeof(glyphs) - 1)];
-      uint16_t green = (i % 7 == 0) ? TFT_WHITE : ((i % 3 == 0) ? 0x07E0 : 0x03C0);
-      M5.Display.setTextDatum(top_left); M5.Display.setTextColor(green, TFT_BLACK); useUIFont(1);
+      uint16_t rain = (i % 11 == 0) ? TFT_WHITE : matrixColor(i % 3 == 0 ? 100 : 55);
+      M5.Display.setTextDatum(top_left); M5.Display.setTextColor(rain); useUIFont(matrixGlyphScale);
       M5.Display.drawChar(glyph, x, y);
     }
-    matrixHead[i] += matrixSpeed[i] * 4;
-    if (matrixHead[i] > 286) {
-      matrixHead[i] = -((int)(esp_random() % 18) * 8);
+    matrixHead[i] += matrixSpeed[i] * max(1, (int)matrixGlyphScale);
+    if (matrixHead[i] > 240 + glyphSize) {
+      matrixHead[i] = -((int)(esp_random() % 28) * glyphSize);
       matrixSpeed[i] = 1 + (esp_random() % 3);
+      matrixActive[i] = (esp_random() % 100) < matrixRainDensity;
     }
   }
+  // Repaint UI overlays after rain so both the status and navigation regions
+  // retain their normal functionality while rain remains behind them.
+  drawMatrixClockPanel();
+  drawClockStatus(TFT_BLACK);
+  drawClockNavigationIcons();
 }
 
 void drawMeditationNavigationIcons() {
@@ -636,18 +702,7 @@ void drawClock(bool full = false) {
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
     M5.Display.drawString(buf, 120, 174);
   } else if (clockFace == ClockFace::Matrix) {
-    // A stable dark panel lets the animated green rain surround, rather than
-    // overwrite, the time and date.
-    M5.Display.fillRoundRect(42, 72, 236, 113, 10, TFT_BLACK);
-    M5.Display.drawRoundRect(42, 72, 236, 113, 10, 0x03E0);
-    int shownHour = use24HourTime ? dt.time.hours : (dt.time.hours % 12 ? dt.time.hours % 12 : 12);
-    snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
-    M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x07E0, TFT_BLACK); useUILargeFont();
-    M5.Display.drawString(buf, 160, 112);
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
-    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK); useUIMediumFont();
-    M5.Display.drawString(buf, 160, 160);
-    M5.Display.setTextDatum(top_left);
+    drawMatrixClockPanel();
   } else {
     static int shownMinute = -1, shownHour = -1, shownDay = -1;
     if (full) shownMinute = shownHour = shownDay = -1;
@@ -2053,6 +2108,10 @@ void publishMqttSettings() {
   doc["timezone_index"] = timeZoneIndex;
   doc["timezone_city"] = TIME_ZONES[timeZoneIndex].city;
   doc["clock_face"] = static_cast<uint8_t>(clockFace);
+  JsonObject matrix = doc["matrix"].to<JsonObject>();
+  matrix["speed"] = matrixRainSpeed; matrix["density"] = matrixRainDensity;
+  matrix["glyph_scale"] = matrixGlyphScale; matrix["color"] = colorHex(matrixRainColor);
+  matrix["glass_opacity"] = matrixGlassOpacity;
   doc["time_format"] = use24HourTime ? 24 : 12;
   doc["flat_virtual_buttons"] = flatVirtualButtonsEnabled;
   doc["adaptive_brightness"] = adaptiveBrightness;
@@ -2100,6 +2159,15 @@ bool applyMqttSettings(const String& payload, String& error) {
   JsonObjectConst root = doc.as<JsonObjectConst>();
   if (root["timezone_index"].is<int>()) timeZoneIndex = constrain(root["timezone_index"].as<int>(), 0, (int)TIME_ZONE_COUNT - 1);
   if (root["clock_face"].is<int>()) clockFace = static_cast<ClockFace>(constrain(root["clock_face"].as<int>(), 0, 2));
+  JsonObjectConst matrix = root["matrix"];
+  if (!matrix.isNull()) {
+    if (matrix["speed"].is<int>()) matrixRainSpeed = constrain(matrix["speed"].as<int>(), 10, 100);
+    if (matrix["density"].is<int>()) matrixRainDensity = constrain(matrix["density"].as<int>(), 10, 100);
+    if (matrix["glyph_scale"].is<int>()) matrixGlyphScale = constrain(matrix["glyph_scale"].as<int>(), 1, 2);
+    if (!matrix["color"].isNull()) matrixRainColor = parseJsonColor(matrix["color"], matrixRainColor);
+    if (matrix["glass_opacity"].is<int>()) matrixGlassOpacity = constrain(matrix["glass_opacity"].as<int>(), 15, 90);
+    resetMatrixRain();
+  }
   if (root["time_format"].is<int>()) use24HourTime = root["time_format"].as<int>() != 12;
   if (root["flat_virtual_buttons"].is<bool>()) flatVirtualButtonsEnabled = root["flat_virtual_buttons"].as<bool>();
   if (root["adaptive_brightness"].is<bool>()) adaptiveBrightness = root["adaptive_brightness"].as<bool>();
@@ -2249,7 +2317,7 @@ void maintainMqtt(uint32_t nowMs) {
 
 void sendSettingsPage(const String& message = "") {
   String page;
-  page.reserve(24000);
+  page.reserve(28000);
   page = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<title>Space Clock</title><style>body{font-family:system-ui;background:#08111f;color:#eef4ff;max-width:620px;margin:auto;padding:20px}"
          "h1{color:#65b9ff}h2{margin-top:30px}.field{display:block;margin-top:14px}.field input,.field select{box-sizing:border-box;width:100%;padding:11px;border-radius:8px;border:1px solid #52657a;background:#142236;color:white}"
@@ -2275,6 +2343,12 @@ void sendSettingsPage(const String& message = "") {
   const char* faceNames[] = {"Space", "Flip clock", "Matrix rain"};
   for (int i = 0; i < 3; ++i) page += "<option value='" + String(i) + "'" + (i == (int)clockFace ? " selected" : "") + ">" + faceNames[i] + "</option>";
   page += "</select></label>";
+  page += "<h2>Matrix rain appearance</h2><p>Applies when Matrix rain is selected. Lower speed and density create a calmer background. Glass opacity controls how much code is visible behind the clock.</p>";
+  page += "<label class='field'>Rain speed: <output id='matrixSpeedOut'>" + String(matrixRainSpeed) + "</output><input type='range' min='10' max='100' step='5' name='matrixSpeed' value='" + String(matrixRainSpeed) + "' oninput='matrixSpeedOut.value=this.value'></label>";
+  page += "<label class='field'>Rain density: <output id='matrixDensityOut'>" + String(matrixRainDensity) + "%</output><input type='range' min='10' max='100' step='5' name='matrixDensity' value='" + String(matrixRainDensity) + "' oninput='matrixDensityOut.value=this.value+\"%\"'></label>";
+  page += "<label class='field'>Glyph size<select name='matrixSize'><option value='1'" + String(matrixGlyphScale == 1 ? " selected" : "") + ">Small</option><option value='2'" + String(matrixGlyphScale == 2 ? " selected" : "") + ">Large</option></select></label>";
+  page += "<label class='field'>Rain color<input type='color' name='matrixColor' value='" + colorHex(matrixRainColor) + "'></label>";
+  page += "<label class='field'>Clock glass opacity: <output id='matrixGlassOut'>" + String(matrixGlassOpacity) + "%</output><input type='range' min='15' max='90' step='5' name='matrixGlass' value='" + String(matrixGlassOpacity) + "' oninput='matrixGlassOut.value=this.value+\"%\"'></label>";
   page += "<label class='field'>Time format<select name='time24'><option value='1'"+String(use24HourTime?" selected":"")+">24-hour</option><option value='0'"+String(!use24HourTime?" selected":"")+">12-hour</option></select></label>";
   page += "<label class='field'><input type='checkbox' name='flatButtons'"+String(flatVirtualButtonsEnabled?" checked":"")+"> Enable the three virtual buttons while device is lying flat</label>";
   page += "<label class='field'><input type='checkbox' name='autoBrightness'" + String(adaptiveBrightness ? " checked" : "") + "> Automatic brightness (day 07:00–20:59)</label>";
@@ -2432,6 +2506,12 @@ void setupSettingsServer() {
     }
     timeZoneIndex = constrain(settingsServer.arg("timeZone").toInt(), 0, (int)TIME_ZONE_COUNT - 1);
     clockFace = static_cast<ClockFace>(constrain(settingsServer.arg("face").toInt(), 0, 2));
+    matrixRainSpeed = constrain(settingsServer.arg("matrixSpeed").toInt(), 10, 100);
+    matrixRainDensity = constrain(settingsServer.arg("matrixDensity").toInt(), 10, 100);
+    matrixGlyphScale = constrain(settingsServer.arg("matrixSize").toInt(), 1, 2);
+    matrixRainColor = parseWebColor(settingsServer.arg("matrixColor"), matrixRainColor);
+    matrixGlassOpacity = constrain(settingsServer.arg("matrixGlass").toInt(), 15, 90);
+    resetMatrixRain();
     use24HourTime = settingsServer.arg("time24").toInt() != 0;
     flatVirtualButtonsEnabled = settingsServer.hasArg("flatButtons");
     adaptiveBrightness = settingsServer.hasArg("autoBrightness");
@@ -2615,7 +2695,7 @@ void loop() {
   static uint32_t lastPowerStatusDraw = 0;
   if (screenNow == Screen::Clock && alarmActive < 0 && nowMs - lastPowerStatusDraw >= 5000UL) {
     lastPowerStatusDraw = nowMs;
-    drawClockStatus(BG);
+    drawClockStatus(clockFace == ClockFace::Matrix ? TFT_BLACK : BG);
   }
   uint32_t astronautFrameMs = M5.Power.isCharging() ? 120UL : 220UL;
   if (screenNow == Screen::Clock && clockFace == ClockFace::Space && alarmActive < 0 && nowMs - lastAnim >= astronautFrameMs) {
