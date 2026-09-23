@@ -161,7 +161,18 @@ bool companionRegistered = false;
 static constexpr uint8_t SAVED_WIFI_COUNT = 10;
 String savedWifiSsids[SAVED_WIFI_COUNT];
 String savedWifiPasswords[SAVED_WIFI_COUNT];
-uint32_t lastWifiReconnectAttempt = 0;
+enum class WifiRecoveryPhase : uint8_t { Primary, ScanningProfiles, ConnectingProfiles, ConnectingFallback };
+WifiRecoveryPhase wifiRecoveryPhase = WifiRecoveryPhase::Primary;
+uint32_t wifiRecoveryPhaseStartedAt = 0;
+int wifiRecoverySlots[SAVED_WIFI_COUNT];
+int wifiRecoveryRssi[SAVED_WIFI_COUNT];
+int wifiRecoveryCount = 0;
+int wifiRecoveryIndex = 0;
+bool wifiWasConnected = false;
+bool wifiDefaultFallbackAttempted = false;
+static constexpr uint32_t WIFI_PRIMARY_TIMEOUT_MS = 12000;
+static constexpr uint32_t WIFI_SCAN_TIMEOUT_MS = 15000;
+static constexpr uint32_t WIFI_PROFILE_TIMEOUT_MS = 12000;
 String companionDeviceId = "core2";
 static constexpr uint8_t COMPANION_COLS = 3;
 static constexpr uint8_t COMPANION_ROWS = 2;
@@ -396,37 +407,154 @@ void loadSettings() {
   }
 }
 
-bool connectSavedWifi(uint32_t perNetworkTimeoutMs = 6000) {
-  struct Candidate { int slot; int rssi; } candidates[SAVED_WIFI_COUNT];
-  int candidateCount = 0;
-  int found = WiFi.scanNetworks(false, true);
+void drawClock(bool full);
+void drawAstronaut();
+
+bool hasSavedWifiProfiles() {
   for (int slot = 0; slot < SAVED_WIFI_COUNT; ++slot) {
-    if (!savedWifiSsids[slot].length()) continue;
-    int bestRssi = -1000;
-    for (int network = 0; network < found; ++network) {
-      if (WiFi.SSID(network) == savedWifiSsids[slot]) bestRssi = max(bestRssi, (int)WiFi.RSSI(network));
-    }
-    if (bestRssi > -1000) candidates[candidateCount++] = {slot, bestRssi};
-  }
-  WiFi.scanDelete();
-  for (int i = 0; i < candidateCount; ++i) {
-    for (int j = i + 1; j < candidateCount; ++j) {
-      if (candidates[j].rssi > candidates[i].rssi) { Candidate swap = candidates[i]; candidates[i] = candidates[j]; candidates[j] = swap; }
-    }
-  }
-  for (int i = 0; i < candidateCount; ++i) {
-    int slot = candidates[i].slot;
-    WiFi.begin(savedWifiSsids[slot].c_str(), savedWifiPasswords[slot].c_str());
-    if (WiFi.waitForConnectResult(perNetworkTimeoutMs) == WL_CONNECTED) return true;
+    if (savedWifiSsids[slot].length()) return true;
   }
   return false;
 }
 
+void prepareSavedWifiCandidates(int found) {
+  wifiRecoveryCount = 0;
+  for (int slot = 0; slot < SAVED_WIFI_COUNT; ++slot) {
+    if (!savedWifiSsids[slot].length()) continue;
+    int bestRssi = -1000;
+    if (found >= 0) {
+      for (int network = 0; network < found; ++network) {
+        if (WiFi.SSID(network) == savedWifiSsids[slot]) bestRssi = max(bestRssi, (int)WiFi.RSSI(network));
+      }
+    }
+    // Keep configured networks even when a scan misses them (hidden SSIDs,
+    // scan failures, or an access point that is still starting up).
+    wifiRecoverySlots[wifiRecoveryCount] = slot;
+    wifiRecoveryRssi[wifiRecoveryCount++] = bestRssi;
+  }
+
+  for (int i = 0; i < wifiRecoveryCount; ++i) {
+    for (int j = i + 1; j < wifiRecoveryCount; ++j) {
+      if (wifiRecoveryRssi[j] > wifiRecoveryRssi[i]) {
+        int slot = wifiRecoverySlots[i]; wifiRecoverySlots[i] = wifiRecoverySlots[j]; wifiRecoverySlots[j] = slot;
+        int rssi = wifiRecoveryRssi[i]; wifiRecoveryRssi[i] = wifiRecoveryRssi[j]; wifiRecoveryRssi[j] = rssi;
+      }
+    }
+  }
+}
+
+void beginSavedWifiAttempt(uint32_t nowMs) {
+  int slot = wifiRecoverySlots[wifiRecoveryIndex];
+  // The ten user-managed profiles already live in Preferences. Do not let a
+  // fallback attempt overwrite the legacy ESP32 Wi-Fi credentials used by
+  // WiFi.begin() with no arguments.
+  WiFi.persistent(false);
+  WiFi.disconnect(false, false);
+  WiFi.begin(savedWifiSsids[slot].c_str(), savedWifiPasswords[slot].c_str());
+  WiFi.persistent(true);
+  wifiRecoveryPhase = WifiRecoveryPhase::ConnectingProfiles;
+  wifiRecoveryPhaseStartedAt = nowMs;
+}
+
+void beginBuildWifiFallback(uint32_t nowMs) {
+  wifiDefaultFallbackAttempted = true;
+  WiFi.persistent(false);
+  WiFi.disconnect(false, false);
+  WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
+  WiFi.persistent(true);
+  wifiRecoveryPhase = WifiRecoveryPhase::ConnectingFallback;
+  wifiRecoveryPhaseStartedAt = nowMs;
+}
+
+void beginLegacyWifiRetry(uint32_t nowMs) {
+  WiFi.persistent(false);
+  WiFi.disconnect(false, false);
+  WiFi.begin();
+  WiFi.persistent(true);
+  wifiRecoveryPhase = WifiRecoveryPhase::Primary;
+  wifiRecoveryPhaseStartedAt = nowMs;
+}
+
+void startWifiProfileScan(uint32_t nowMs) {
+  WiFi.disconnect(false, false);
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true, true);
+  wifiRecoveryPhase = WifiRecoveryPhase::ScanningProfiles;
+  wifiRecoveryPhaseStartedAt = nowMs;
+}
+
 void maintainSavedWifi(uint32_t nowMs) {
-  if (WiFi.status() == WL_CONNECTED || nowMs - lastWifiReconnectAttempt < 20000UL) return;
-  lastWifiReconnectAttempt = nowMs;
-  connectSavedWifi(3500);
-  if (WiFi.status() == WL_CONNECTED && !settingsServerReady) { setupSettingsServer(); syncTime(); }
+  if (WiFi.status() == WL_CONNECTED) {
+    bool justConnected = !wifiWasConnected;
+    wifiWasConnected = true;
+    wifiDefaultFallbackAttempted = false;
+    wifiRecoveryPhase = WifiRecoveryPhase::Primary;
+    wifiRecoveryPhaseStartedAt = nowMs;
+    if (!settingsServerReady) setupSettingsServer();
+    if (justConnected) {
+      syncTime();
+      if (screenNow == Screen::Clock) { drawClock(true); drawAstronaut(); }
+    }
+    return;
+  }
+  wifiWasConnected = false;
+
+  if (wifiRecoveryPhase == WifiRecoveryPhase::Primary) {
+    if (nowMs - wifiRecoveryPhaseStartedAt < WIFI_PRIMARY_TIMEOUT_MS) return;
+    if (!hasSavedWifiProfiles()) {
+      if (strlen(DEFAULT_WIFI_SSID) && !wifiDefaultFallbackAttempted) {
+        beginBuildWifiFallback(nowMs);
+      } else {
+        // Retry the credentials saved by the ESP32 Wi-Fi stack. This is the
+        // fast path used by earlier firmware and remains active even when
+        // the newer multi-profile list is empty.
+        WiFi.reconnect();
+        wifiRecoveryPhaseStartedAt = nowMs;
+      }
+      return;
+    }
+    // Let the original association finish before scanning; an active scan can
+    // interrupt a connection that is merely taking longer than expected.
+    startWifiProfileScan(nowMs);
+    return;
+  }
+
+  if (wifiRecoveryPhase == WifiRecoveryPhase::ScanningProfiles) {
+    int found = WiFi.scanComplete();
+    if (found == WIFI_SCAN_RUNNING && nowMs - wifiRecoveryPhaseStartedAt < WIFI_SCAN_TIMEOUT_MS) return;
+    if (found == WIFI_SCAN_RUNNING) { WiFi.scanDelete(); found = -1; }
+    prepareSavedWifiCandidates(found);
+    WiFi.scanDelete();
+    if (wifiRecoveryCount == 0) {
+      wifiRecoveryPhase = WifiRecoveryPhase::Primary;
+      wifiRecoveryPhaseStartedAt = nowMs;
+      WiFi.reconnect();
+      return;
+    }
+    wifiRecoveryIndex = 0;
+    beginSavedWifiAttempt(nowMs);
+    return;
+  }
+
+  if (wifiRecoveryPhase == WifiRecoveryPhase::ConnectingProfiles &&
+      nowMs - wifiRecoveryPhaseStartedAt >= WIFI_PROFILE_TIMEOUT_MS) {
+    ++wifiRecoveryIndex;
+    if (wifiRecoveryIndex < wifiRecoveryCount) {
+      beginSavedWifiAttempt(nowMs);
+    } else if (strlen(DEFAULT_WIFI_SSID) && !wifiDefaultFallbackAttempted) {
+      beginBuildWifiFallback(nowMs);
+    } else {
+      // Re-arm the legacy saved connection, then give it a full window before
+      // beginning another profile scan cycle.
+      beginLegacyWifiRetry(nowMs);
+    }
+  }
+
+  if (wifiRecoveryPhase == WifiRecoveryPhase::ConnectingFallback &&
+      nowMs - wifiRecoveryPhaseStartedAt >= WIFI_PROFILE_TIMEOUT_MS) {
+    wifiDefaultFallbackAttempted = false;
+    beginLegacyWifiRetry(nowMs);
+  }
 }
 
 void syncTime() {
@@ -2755,7 +2883,10 @@ void setupSettingsServer() {
     saveSettings();
     sendSettingsPage("Settings saved. The clock will apply them now.");
     if (wifiChanged) {
-      delay(300); WiFi.disconnect(false); connectSavedWifi();
+      wifiWasConnected = false;
+      wifiDefaultFallbackAttempted = false;
+      if (hasSavedWifiProfiles()) startWifiProfileScan(millis());
+      else beginLegacyWifiRetry(millis());
     } else {
       syncTime();
       m5::rtc_datetime_t brightnessNow; getClockDateTime(&brightnessNow); applyDisplayBrightness(brightnessNow);
@@ -2791,15 +2922,10 @@ void setup() {
   loadSettings();
   lastUserActivity = millis();
   m5::rtc_datetime_t startupTime; getClockDateTime(&startupTime); applyDisplayBrightness(startupTime);
-  WiFi.mode(WIFI_STA); WiFi.setSleep(true); WiFi.begin();
+  WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true); WiFi.setSleep(true); WiFi.begin();
+  wifiRecoveryPhase = WifiRecoveryPhase::Primary;
+  wifiRecoveryPhaseStartedAt = millis();
   drawClock(true); drawAstronaut();
-  if (WiFi.waitForConnectResult(4000) != WL_CONNECTED) {
-    if (!connectSavedWifi() && strlen(DEFAULT_WIFI_SSID)) {
-      WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
-      WiFi.waitForConnectResult(10000);
-    }
-  }
-  if (WiFi.status() == WL_CONNECTED) { setupSettingsServer(); syncTime(); drawClock(true); drawAstronaut(); }
 }
 
 void loop() {

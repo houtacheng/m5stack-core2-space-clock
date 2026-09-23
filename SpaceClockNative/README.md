@@ -12,7 +12,7 @@ touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 - Meditation timer with two presets, reminders, ambience and Bottom2 lighting
 - NTP time, major-city time zones, 12/24-hour display and automatic brightness
 - Screen timeout with touch and motion wake
-- Ten private saved Wi-Fi profiles with automatic strongest-network reconnect
+- Ten private saved Wi-Fi profiles with non-blocking automatic reconnect; legacy Wi-Fi credentials remain the first connection path
 - Browser configuration, alarms, MQTT guide and manual OTA upload
 - MQTT state publishing and remote modification of settings
 - GitHub firmware checks plus optional scheduled automatic update

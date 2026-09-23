@@ -1,7 +1,7 @@
 {
-  "version": "2.9.2",
+  "version": "2.9.3",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "12347e782a4d55167066ca209733cc12319adb781aaca87ed5f1565cb28c14d0",
-  "size": 4372080,
-  "notes": "Matrix rain glyphs now have clear horizontal and vertical spacing to avoid touching or forming continuous lines. Falling drops retain their white tips, colour fades, and sparse glow."
+  "sha256": "abbc891a9716eae9b10ce75ddc888c72fb8aa259f1efb6969cdf0b6deee63a0c",
+  "size": 4372656,
+  "notes": "Improved Wi-Fi recovery: gives saved credentials time to connect before scanning, reconnects automatically, attempts every saved network including scan misses, and keeps the display responsive during retries."
 }
