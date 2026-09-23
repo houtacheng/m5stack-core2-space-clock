@@ -197,9 +197,8 @@ uint32_t matrixRainColor = 0x00E86B;
 uint8_t matrixGlassOpacity = 58;    // dithered black veil over the time card
 static const char* const MATRIX_GLYPH_SET[] = {
   "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-  "ｱ", "ｲ", "ｳ", "ｴ", "ｵ", "ｶ", "ｷ", "ｸ", "ｹ", "ｺ", "ｻ", "ｼ", "ｽ", "ｾ", "ｿ",
-  "ﾀ", "ﾁ", "ﾂ", "ﾃ", "ﾄ", "ﾅ", "ﾆ", "ﾇ", "ﾈ", "ﾉ", "ﾊ", "ﾋ", "ﾌ", "ﾍ", "ﾎ",
-  "ﾏ", "ﾐ", "ﾑ", "ﾒ", "ﾓ", "ﾔ", "ﾕ", "ﾖ", "ﾗ", "ﾘ", "ﾙ", "ﾚ", "ﾛ", "ﾜ"
+  "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "X", "Y", "Z",
+  "@", "#", "$", "%", "&", "*", "+", "-", "=", "!", "?", "/", "\\", "<", ">", "[", "]", "{", "}", "~", "^", "|", ":", ";"
 };
 static constexpr uint8_t MATRIX_GLYPH_COUNT = sizeof(MATRIX_GLYPH_SET) / sizeof(MATRIX_GLYPH_SET[0]);
 
@@ -581,15 +580,29 @@ uint16_t matrixColor(uint8_t strength) {
   return M5.Display.color565(r, g, b);
 }
 
+uint16_t blendMatrixGlass(uint16_t base, uint8_t opacity) {
+  // Blend each 565 component with a very dark, cool phosphor glass colour.
+  // Unlike the old binary dither, every slider position is visibly distinct.
+  uint8_t r = (base >> 11) & 0x1F;
+  uint8_t g = (base >> 5) & 0x3F;
+  uint8_t b = base & 0x1F;
+  uint8_t keep = 100 - opacity;
+  r = (r * keep + 2 * opacity) / 100;
+  g = (g * keep + 8 * opacity) / 100;
+  b = (b * keep + 5 * opacity) / 100;
+  return (r << 11) | (g << 5) | b;
+}
+
 void drawMatrixGlassPanel(M5Canvas& canvas) {
   const int x0 = 42, y0 = 72, width = 236, height = 113;
-  // Core2's TFT has no alpha channel. This fine ordered dither is stable on
-  // camera and resembles frosted glass while exposing the rain beneath.
-  uint8_t coveredTiles = (matrixGlassOpacity * 16 + 99) / 100;
-  for (int y = y0 + 4; y < y0 + height - 4; y += 4) {
-    for (int x = x0 + 4; x < x0 + width - 4; x += 4) {
-      uint8_t pattern = ((x >> 2) * 5 + (y >> 2) * 3 + ((x >> 3) ^ (y >> 3))) & 15;
-      if (pattern < coveredTiles) canvas.fillRect(x, y, 4, 4, TFT_BLACK);
+  // Blend the actual already-drawn rain, in coarse 2x2 samples. Sampling a
+  // neighbouring pixel gives the surface its diffuse/frosted texture; the
+  // opacity slider therefore directly controls how much rain is visible.
+  for (int y = y0 + 5; y < y0 + height - 5; y += 2) {
+    for (int x = x0 + 5; x < x0 + width - 5; x += 2) {
+      int sx = min(x0 + width - 6, x + (((x + y) & 2) ? 2 : 0));
+      int sy = min(y0 + height - 6, y + (((x ^ y) & 2) ? 2 : 0));
+      canvas.fillRect(x, y, 2, 2, blendMatrixGlass(canvas.readPixel(sx, sy), matrixGlassOpacity));
     }
   }
   canvas.drawRoundRect(x0, y0, width, height, 10, matrixColor(72));

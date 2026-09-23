@@ -1,7 +1,7 @@
 {
-  "version": "2.7.0",
+  "version": "2.8.0",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "af60136ba0a2eba33f7d5e40bb0ef524fe6c84f714a2db3a2611883263d723a9",
-  "size": 4592112,
-  "notes": "Fixes Matrix rain streams so they continuously respawn instead of ending on a black screen. Uses sparse katakana-style trails, white time with phosphor shadow, theme-color date, and single-frame status/navigation rendering to remove flicker."
+  "sha256": "d6fbdf86a027882400216efb0e1ad9ddf60ba7dfffbbd20acd7b3b84dcc5bcdb",
+  "size": 4592096,
+  "notes": "Matrix rain now uses random ASCII glyphs at both sizes rather than unsupported square characters. Clock-glass opacity is a real pixel blend over the animated rain, so every setting visibly changes transparency."
 }
