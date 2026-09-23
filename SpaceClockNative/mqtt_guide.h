@@ -110,7 +110,7 @@ $(mqtt:remaining_text)</pre>
   "enabled":true,"host":"10.41.10.10","port":1883,
   "username":"core2","password":"密碼","base_topic":"spaceclock/core2"
 }}</pre><p>修改 Broker 或 Base Topic 後，Core2 會使用新設定重新連線。</p>
-<pre>{"wifi":{"ssid":"174","password":"Wi-Fi密碼"}}</pre><p class="note">修改 Wi-Fi 後舊 IP 可能失效，MQTT 也會暫時離線。建議 Wi-Fi 優先從設定網頁修改。</p>
+<pre>{"wifi":{"ssid":"your-ssid","password":"Wi-Fi密碼"}}</pre><p class="note">修改 Wi-Fi 後舊 IP 可能失效，MQTT 也會暫時離線。建議 Wi-Fi 優先從設定網頁修改。</p>
 
 <h2>12. 即時控制</h2><table><tr><th>Topic</th><th>Payload</th><th>功能</th></tr>
 <tr><td>command/screen</td><td>on、wake、off</td><td>喚醒／關閉螢幕</td></tr>

@@ -1,7 +1,7 @@
 {
-  "version": "2.8.0",
+  "version": "2.9.0",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "d6fbdf86a027882400216efb0e1ad9ddf60ba7dfffbbd20acd7b3b84dcc5bcdb",
-  "size": 4592096,
-  "notes": "Matrix rain now uses random ASCII glyphs at both sizes rather than unsupported square characters. Clock-glass opacity is a real pixel blend over the animated rain, so every setting visibly changes transparency."
+  "sha256": "e3d0c7c5a02d6978e0b74b00daae9590a626611064ab19ecdcb2814e663dfc09",
+  "size": 4371504,
+  "notes": "Matrix rain now uses stationary glyphs illuminated by independent flowing waves, with random soft glints and local glow. Wi-Fi examples are sanitized; no saved network credentials are included."
 }
