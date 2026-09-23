@@ -1,7 +1,7 @@
 {
-  "version": "2.3.0",
+  "version": "2.4.0",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "f28530e75a8e1c0da4dc47fd18fbd6d161049e86cd59b1eac2b1d3f3eccce18c",
-  "size": 4565120,
-  "notes": "Adds ten saved Wi-Fi networks with automatic strongest-network reconnect, plus names for Companion hosts displayed between graphical page arrows."
+  "sha256": "e8f2a56e8e177fe7e8d3738fc91a2b165f419cf6066db495dc1dae674b680a6c",
+  "size": 4579936,
+  "notes": "Adds Matrix code-rain clock face, smooth alarm astronaut dragging, and Home Assistant MQTT Discovery with device controls. Ambient-light status is explicitly unavailable until an external light sensor is fitted."
 }

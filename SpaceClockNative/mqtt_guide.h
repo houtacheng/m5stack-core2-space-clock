@@ -19,6 +19,9 @@ static const char MQTT_GUIDE_HTML[] PROGMEM = R"MQTTGUIDE(
 <tr><td><code>spaceclock/core2/ack</code></td><td>Core2 → Broker</td><td>設定成功或錯誤回報</td></tr>
 <tr><td><code>spaceclock/core2/command/#</code></td><td>Broker → Core2</td><td>即時操作指令</td></tr></table>
 
+<h2>Home Assistant 自動加入</h2><p>啟用 MQTT 後，Core2 會自動發布 <a href="https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery">Home Assistant MQTT Discovery</a> 設定。Home Assistant 的 MQTT 整合啟用 Discovery 後，會自動出現 Space Clock Core2 裝置，以及電池、充電、螢幕、亮度、鬧鐘音量、小夜燈、鬧鐘燈、表盤、靜心開始與停止鬧鐘等實體。</p>
+<p>Core2 本身沒有內建環境光感測器；因此「Ambient light」照度實體會被正確標示為不可用，而不是回報虛假的 lux 值。日後接上外接光感測器時可啟用該欄位。</p>
+
 <h2>3. 即時狀態</h2><pre>{
   "time":"2026-09-13T08:35:42",
   "date":"2026-09-13",
@@ -70,7 +73,7 @@ $(mqtt:remaining_text)</pre>
   "night_brightness":20,
   "screen_off_seconds":300
 }</pre>
-<table><tr><th>欄位</th><th>有效值</th></tr><tr><td>clock_face</td><td>0 太空表盤；1 翻頁表盤</td></tr><tr><td>time_format</td><td>12 或 24</td></tr><tr><td>day_brightness</td><td>10–100</td></tr><tr><td>night_brightness</td><td>5–100</td></tr><tr><td>screen_off_seconds</td><td>0–1800；0 表示永不關閉</td></tr></table>
+<table><tr><th>欄位</th><th>有效值</th></tr><tr><td>clock_face</td><td>0 太空表盤；1 翻頁表盤；2 Matrix code rain</td></tr><tr><td>time_format</td><td>12 或 24</td></tr><tr><td>day_brightness</td><td>10–100</td></tr><tr><td>night_brightness</td><td>5–100</td></tr><tr><td>screen_off_seconds</td><td>0–1800；0 表示永不關閉</td></tr></table>
 <h3>時區 Index</h3><p>0 UTC、1 New York、2 Chicago、3 Denver、4 Los Angeles、5 Honolulu、6 Mexico City、7 Toronto、8 São Paulo、9 London、10 Paris、11 Berlin、12 Johannesburg、13 Dubai、14 Delhi、15 Bangkok、16 Singapore、17 Hong Kong、18 Taipei、19 Tokyo、20 Sydney、21 Auckland。</p>
 
 <h2>6. 鬧鐘與音效</h2><pre>{"alarm_volume":80,"alarm_sound":1}</pre><p>音效代碼：0 打版、1 磬聲、2 流水聲、3 水滴聲。alarm_volume 範圍 10–100。</p>

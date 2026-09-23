@@ -27,7 +27,7 @@
 #include "mqtt_guide.h"
 
 enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, FirmwareUpdate, About };
-enum class ClockFace : uint8_t { Space, Minimal };
+enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
 
 struct Alarm {
@@ -53,6 +53,7 @@ uint32_t snoozeStarted = 0;
 bool astronautDragging = false;
 int astronautX = 6, astronautY = 112;
 int astronautDX = 1, astronautDY = 1;
+uint32_t lastAlarmDragDraw = 0;
 bool satelliteTop = true;
 struct TimeZoneChoice { const char* city; const char* rule; };
 static constexpr TimeZoneChoice TIME_ZONES[] = {
@@ -153,6 +154,7 @@ uint32_t lastMqttReconnect = 0;
 uint32_t lastMqttPublish = 0;
 bool mqttSettingsDirty = true;
 bool mqttReconnectRequested = false;
+bool mqttDiscoveryDirty = true;
 WebServer settingsServer(80);
 bool settingsServerReady = false;
 bool companionRegistered = false;
@@ -179,6 +181,10 @@ uint32_t alarmLightEventStarted = 0;
 bool alarmLedsOn = false;
 uint32_t lastClockDraw = 0, lastAnim = 0;
 int lastMinute = -1;
+static constexpr uint8_t MATRIX_COLUMNS = 40;
+int16_t matrixHead[MATRIX_COLUMNS];
+uint8_t matrixSpeed[MATRIX_COLUMNS];
+uint32_t lastMatrixFrame = 0;
 
 static constexpr uint16_t BG = 0x0000;
 static constexpr uint16_t FG = 0xF79E;
@@ -283,6 +289,7 @@ void saveSettings() {
   prefs.putUChar("alarmRev", ALARM_SCHEMA_VERSION);
   prefs.end();
   mqttSettingsDirty = true;
+  mqttDiscoveryDirty = true;
 }
 
 void loadSettings() {
@@ -290,7 +297,7 @@ void loadSettings() {
   timeZoneIndex = prefs.getUChar("tzCity", 18);
   if (timeZoneIndex >= TIME_ZONE_COUNT) timeZoneIndex = 18;
   uint8_t savedFace = prefs.getUChar("face", 0);
-  clockFace = savedFace <= static_cast<uint8_t>(ClockFace::Minimal) ? static_cast<ClockFace>(savedFace) : ClockFace::Minimal;
+  clockFace = savedFace <= static_cast<uint8_t>(ClockFace::Matrix) ? static_cast<ClockFace>(savedFace) : ClockFace::Space;
   adaptiveBrightness = prefs.getBool("autoBright", true);
   dayBrightness = constrain((int)prefs.getUChar("dayBright", 80), 10, 100);
   nightBrightness = constrain((int)prefs.getUChar("nightBright", 20), 5, 100);
@@ -517,6 +524,41 @@ void drawClockNavigationIcons() {
   drawGearNavigationIcon(267, 227);
 }
 
+void resetMatrixRain() {
+  for (int i = 0; i < MATRIX_COLUMNS; ++i) {
+    matrixHead[i] = -((int)(esp_random() % 24) * 8);
+    matrixSpeed[i] = 1 + (esp_random() % 3);
+  }
+  lastMatrixFrame = 0;
+}
+
+void drawMatrixRainFrame(uint32_t nowMs) {
+  if (clockFace != ClockFace::Matrix || screenNow != Screen::Clock || alarmActive >= 0 || nowMs - lastMatrixFrame < 70UL) return;
+  lastMatrixFrame = nowMs;
+  for (int i = 0; i < MATRIX_COLUMNS; ++i) {
+    int x = i * 8;
+    int y = matrixHead[i];
+    // The central black panel belongs to the clock. Keep rain outside it so
+    // the digits stay readable and never flicker beneath a falling glyph.
+    bool headOnClock = x >= 42 && x <= 278 && y >= 72 && y <= 185;
+    int tailY = y - 72;
+    bool tailOnClock = x >= 42 && x <= 278 && tailY >= 72 && tailY <= 185;
+    if (tailY >= 29 && tailY < 215 && !tailOnClock) M5.Display.fillRect(x, tailY, 8, 8, TFT_BLACK);
+    if (y >= 29 && y < 215 && !headOnClock) {
+      static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%+-";
+      char glyph = glyphs[esp_random() % (sizeof(glyphs) - 1)];
+      uint16_t green = (i % 7 == 0) ? TFT_WHITE : ((i % 3 == 0) ? 0x07E0 : 0x03C0);
+      M5.Display.setTextDatum(top_left); M5.Display.setTextColor(green, TFT_BLACK); useUIFont(1);
+      M5.Display.drawChar(glyph, x, y);
+    }
+    matrixHead[i] += matrixSpeed[i] * 4;
+    if (matrixHead[i] > 286) {
+      matrixHead[i] = -((int)(esp_random() % 18) * 8);
+      matrixSpeed[i] = 1 + (esp_random() % 3);
+    }
+  }
+}
+
 void drawMeditationNavigationIcons() {
   M5.Display.fillRect(0, 215, 320, 25, BG);
   M5.Display.drawPng(nav_companion_png, nav_companion_png_len, 41, 215);
@@ -538,6 +580,7 @@ void drawClockStatic() {
   } else {
     M5.Display.fillRect(0, 0, 320, 215, TFT_BLACK);
     drawClockStatus(TFT_BLACK);
+    if (clockFace == ClockFace::Matrix) resetMatrixRain();
   }
   drawClockNavigationIcons();
 }
@@ -592,6 +635,19 @@ void drawClock(bool full = false) {
     useUIMediumFont();
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
     M5.Display.drawString(buf, 120, 174);
+  } else if (clockFace == ClockFace::Matrix) {
+    // A stable dark panel lets the animated green rain surround, rather than
+    // overwrite, the time and date.
+    M5.Display.fillRoundRect(42, 72, 236, 113, 10, TFT_BLACK);
+    M5.Display.drawRoundRect(42, 72, 236, 113, 10, 0x03E0);
+    int shownHour = use24HourTime ? dt.time.hours : (dt.time.hours % 12 ? dt.time.hours % 12 : 12);
+    snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
+    M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x07E0, TFT_BLACK); useUILargeFont();
+    M5.Display.drawString(buf, 160, 112);
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
+    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK); useUIMediumFont();
+    M5.Display.drawString(buf, 160, 160);
+    M5.Display.setTextDatum(top_left);
   } else {
     static int shownMinute = -1, shownHour = -1, shownDay = -1;
     if (full) shownMinute = shownHour = shownDay = -1;
@@ -1262,9 +1318,9 @@ void showAgentDeck() {
 void showFaces() {
   screenNow = Screen::Faces;
   title("Clock faces");
-  const char* names[] = {"Space", "Flip clock"};
+  const char* names[] = {"Space", "Flip clock", "Matrix rain"};
   useUIFont(1);
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < 3; ++i) {
     bool selected = i == static_cast<int>(clockFace);
     M5.Display.fillRoundRect(18, 52 + i * 48, 284, 36, 7, selected ? UI_BLUE : 0xE71C);
     M5.Display.setTextColor(selected ? TFT_WHITE : TFT_BLACK);
@@ -1596,10 +1652,25 @@ void checkAlarms(const m5::rtc_datetime_t& dt) {
 void handleClockTouch(const m5::touch_detail_t& t) {
   if (alarmActive >= 0) {
     if (t.wasReleased() && t.y >= 215 && t.x >= 107 && t.x < 214) { snoozeAlarm(); return; }
-    if (t.wasPressed() && t.x >= astronautX - 5 && t.x <= astronautX + 50 && t.y >= astronautY - 5 && t.y <= astronautY + 50) astronautDragging = true;
-    if (astronautDragging && t.isPressed()) { astronautX = constrain(t.x - 21, 2, 276); astronautY = constrain(t.y - 21, 2, 195); drawAstronaut(); }
+    if (t.wasPressed() && t.x >= astronautX - 8 && t.x <= astronautX + 52 && t.y >= astronautY - 8 && t.y <= astronautY + 52) {
+      astronautDragging = true;
+      lastAlarmDragDraw = 0;
+    }
+    if (astronautDragging && t.isPressed()) {
+      int nextX = constrain(t.x - 21, 2, 276), nextY = constrain(t.y - 21, 2, 195);
+      // PNG decoding the full alarm scene on every touch sample starves the
+      // touch controller. Limit visual repainting to a smooth 25 fps while
+      // keeping the final hit-test at the user's latest finger position.
+      bool moved = abs(nextX - astronautX) >= 3 || abs(nextY - astronautY) >= 3;
+      astronautX = nextX; astronautY = nextY;
+      if (moved && millis() - lastAlarmDragDraw >= 40UL) {
+        lastAlarmDragDraw = millis();
+        drawAstronaut();
+      }
+    }
     if (astronautDragging && t.wasReleased()) {
       astronautDragging = false;
+      drawAstronaut();
       if (astronautX < 55 && ((satelliteTop && astronautY < 65) || (!satelliteTop && astronautY > 135))) dismissAlarm();
     }
     return;
@@ -1723,7 +1794,7 @@ void handleTouch() {
   } else if (screenNow == Screen::Faces) {
     if (t.y >= 52 && t.y < 196) {
       int selected = (t.y - 52) / 48;
-      if (selected >= 0 && selected <= 1) {
+      if (selected >= 0 && selected <= 2) {
         clockFace = static_cast<ClockFace>(selected);
         saveSettings(); showFaces();
       }
@@ -1826,6 +1897,108 @@ const char* meditationStateName() {
   }
 }
 
+String homeAssistantDeviceId() {
+  return "spaceclock_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+}
+
+void addHomeAssistantDevice(JsonDocument& doc) {
+  JsonObject device = doc["device"].to<JsonObject>();
+  JsonArray identifiers = device["identifiers"].to<JsonArray>();
+  identifiers.add(homeAssistantDeviceId());
+  device["name"] = "Space Clock Core2";
+  device["manufacturer"] = "M5Stack";
+  device["model"] = "Core2";
+  device["sw_version"] = SPACE_CLOCK_VERSION;
+}
+
+void publishHomeAssistantConfig(const char* component, const char* objectId, JsonDocument& doc) {
+  if (!mqttClient.connected()) return;
+  addHomeAssistantDevice(doc);
+  String topic = "homeassistant/" + String(component) + "/" + homeAssistantDeviceId() + "/" + objectId + "/config";
+  String payload; serializeJson(doc, payload);
+  mqttClient.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void publishHomeAssistantDiscovery() {
+  if (!mqttClient.connected()) return;
+  const String stateTopic = mqttBaseTopic + "/state";
+  const String settingsTopic = mqttBaseTopic + "/settings";
+  const String setTopic = mqttBaseTopic + "/set";
+  const String commandTopic = mqttBaseTopic + "/command/";
+  JsonDocument doc;
+
+  doc["name"] = "Battery"; doc["unique_id"] = homeAssistantDeviceId() + "_battery";
+  doc["state_topic"] = stateTopic; doc["value_template"] = "{{ value_json.device.battery_percent }}";
+  doc["unit_of_measurement"] = "%"; doc["device_class"] = "battery"; doc["state_class"] = "measurement";
+  publishHomeAssistantConfig("sensor", "battery", doc); doc.clear();
+
+  doc["name"] = "Ambient light"; doc["unique_id"] = homeAssistantDeviceId() + "_ambient_light";
+  doc["state_topic"] = stateTopic; doc["value_template"] = "{{ value_json.device.ambient_light_lux }}";
+  doc["availability_topic"] = stateTopic; doc["availability_template"] = "{{ value_json.device.ambient_light_available }}";
+  doc["payload_available"] = "true"; doc["payload_not_available"] = "false";
+  doc["unit_of_measurement"] = "lx"; doc["device_class"] = "illuminance"; doc["state_class"] = "measurement";
+  publishHomeAssistantConfig("sensor", "ambient_light", doc); doc.clear();
+
+  doc["name"] = "Meditation remaining"; doc["unique_id"] = homeAssistantDeviceId() + "_meditation_remaining";
+  doc["state_topic"] = stateTopic; doc["value_template"] = "{{ value_json.meditation.remaining_seconds }}";
+  doc["unit_of_measurement"] = "s"; doc["device_class"] = "duration"; doc["state_class"] = "measurement";
+  publishHomeAssistantConfig("sensor", "meditation_remaining", doc); doc.clear();
+
+  doc["name"] = "Charging"; doc["unique_id"] = homeAssistantDeviceId() + "_charging";
+  doc["state_topic"] = stateTopic; doc["value_template"] = "{{ value_json.device.charging }}";
+  doc["payload_on"] = "true"; doc["payload_off"] = "false"; doc["device_class"] = "battery_charging";
+  publishHomeAssistantConfig("binary_sensor", "charging", doc); doc.clear();
+
+  doc["name"] = "Screen"; doc["unique_id"] = homeAssistantDeviceId() + "_screen";
+  doc["state_topic"] = stateTopic; doc["value_template"] = "{{ value_json.device.screen_on }}";
+  doc["command_topic"] = commandTopic + "screen"; doc["payload_on"] = "wake"; doc["payload_off"] = "off";
+  publishHomeAssistantConfig("switch", "screen", doc); doc.clear();
+
+  doc["name"] = "Adaptive brightness"; doc["unique_id"] = homeAssistantDeviceId() + "_adaptive_brightness";
+  doc["state_topic"] = settingsTopic; doc["value_template"] = "{{ value_json.adaptive_brightness }}";
+  doc["command_topic"] = setTopic; doc["payload_on"] = "{\"adaptive_brightness\":true}"; doc["payload_off"] = "{\"adaptive_brightness\":false}";
+  publishHomeAssistantConfig("switch", "adaptive_brightness", doc); doc.clear();
+
+  doc["name"] = "Night light"; doc["unique_id"] = homeAssistantDeviceId() + "_night_light";
+  doc["state_topic"] = settingsTopic; doc["value_template"] = "{{ value_json.night_light.enabled }}";
+  doc["command_topic"] = setTopic; doc["payload_on"] = "{\"night_light\":{\"enabled\":true}}"; doc["payload_off"] = "{\"night_light\":{\"enabled\":false}}";
+  publishHomeAssistantConfig("switch", "night_light", doc); doc.clear();
+
+  doc["name"] = "Alarm light"; doc["unique_id"] = homeAssistantDeviceId() + "_alarm_light";
+  doc["state_topic"] = settingsTopic; doc["value_template"] = "{{ value_json.alarm_light.enabled }}";
+  doc["command_topic"] = setTopic; doc["payload_on"] = "{\"alarm_light\":{\"enabled\":true}}"; doc["payload_off"] = "{\"alarm_light\":{\"enabled\":false}}";
+  publishHomeAssistantConfig("switch", "alarm_light", doc); doc.clear();
+
+  doc["name"] = "Day brightness"; doc["unique_id"] = homeAssistantDeviceId() + "_day_brightness";
+  doc["state_topic"] = settingsTopic; doc["value_template"] = "{{ value_json.day_brightness }}"; doc["command_topic"] = setTopic;
+  doc["command_template"] = "{\"day_brightness\":{{ value | int }}}"; doc["min"] = 10; doc["max"] = 100; doc["step"] = 5; doc["unit_of_measurement"] = "%";
+  publishHomeAssistantConfig("number", "day_brightness", doc); doc.clear();
+
+  doc["name"] = "Alarm volume"; doc["unique_id"] = homeAssistantDeviceId() + "_alarm_volume";
+  doc["state_topic"] = settingsTopic; doc["value_template"] = "{{ value_json.alarm_volume }}"; doc["command_topic"] = setTopic;
+  doc["command_template"] = "{\"alarm_volume\":{{ value | int }}}"; doc["min"] = 10; doc["max"] = 100; doc["step"] = 5; doc["unit_of_measurement"] = "%";
+  publishHomeAssistantConfig("number", "alarm_volume", doc); doc.clear();
+
+  doc["name"] = "Screen timeout"; doc["unique_id"] = homeAssistantDeviceId() + "_screen_timeout";
+  doc["state_topic"] = settingsTopic; doc["value_template"] = "{{ value_json.screen_off_seconds }}"; doc["command_topic"] = setTopic;
+  doc["command_template"] = "{\"screen_off_seconds\":{{ value | int }}}"; doc["min"] = 0; doc["max"] = 1800; doc["step"] = 5; doc["unit_of_measurement"] = "s";
+  publishHomeAssistantConfig("number", "screen_timeout", doc); doc.clear();
+
+  doc["name"] = "Clock face"; doc["unique_id"] = homeAssistantDeviceId() + "_clock_face";
+  doc["state_topic"] = settingsTopic; doc["value_template"] = "{{ ['Space', 'Flip clock', 'Matrix rain'][value_json.clock_face] }}"; doc["command_topic"] = setTopic;
+  JsonArray faceOptions = doc["options"].to<JsonArray>(); faceOptions.add("Space"); faceOptions.add("Flip clock"); faceOptions.add("Matrix rain");
+  doc["command_template"] = "{\"clock_face\":{{ {'Space':0,'Flip clock':1,'Matrix rain':2}[value] }}}";
+  publishHomeAssistantConfig("select", "clock_face", doc); doc.clear();
+
+  doc["name"] = "Start meditation preset 1"; doc["unique_id"] = homeAssistantDeviceId() + "_meditation_start_1";
+  doc["command_topic"] = commandTopic + "meditation"; doc["payload_press"] = "start1";
+  publishHomeAssistantConfig("button", "meditation_start_1", doc); doc.clear();
+  doc["name"] = "Dismiss alarm"; doc["unique_id"] = homeAssistantDeviceId() + "_dismiss_alarm";
+  doc["command_topic"] = commandTopic + "alarm"; doc["payload_press"] = "dismiss";
+  publishHomeAssistantConfig("button", "dismiss_alarm", doc);
+  mqttDiscoveryDirty = false;
+}
+
 void publishMqttState() {
   if (!mqttClient.connected()) return;
   m5::rtc_datetime_t now; getClockDateTime(&now);
@@ -1864,6 +2037,10 @@ void publishMqttState() {
   device["battery_percent"] = M5.Power.getBatteryLevel();
   device["charging"] = M5.Power.isCharging();
   device["screen_on"] = !screenSleeping;
+  // Core2 has no built-in ambient-light sensor. The Discovery entity is
+  // intentionally marked unavailable until an external light unit is added.
+  device["ambient_light_available"] = false;
+  device["ambient_light_lux"] = 0;
   String payload; serializeJson(doc, payload);
   mqttClient.publish((mqttBaseTopic + "/state").c_str(), payload.c_str(), true);
   // Keep the original topic alive for existing integrations.
@@ -1922,7 +2099,7 @@ bool applyMqttSettings(const String& payload, String& error) {
   if (jsonError || !doc.is<JsonObject>()) { error = jsonError ? jsonError.c_str() : "object required"; return false; }
   JsonObjectConst root = doc.as<JsonObjectConst>();
   if (root["timezone_index"].is<int>()) timeZoneIndex = constrain(root["timezone_index"].as<int>(), 0, (int)TIME_ZONE_COUNT - 1);
-  if (root["clock_face"].is<int>()) clockFace = static_cast<ClockFace>(constrain(root["clock_face"].as<int>(), 0, 1));
+  if (root["clock_face"].is<int>()) clockFace = static_cast<ClockFace>(constrain(root["clock_face"].as<int>(), 0, 2));
   if (root["time_format"].is<int>()) use24HourTime = root["time_format"].as<int>() != 12;
   if (root["flat_virtual_buttons"].is<bool>()) flatVirtualButtonsEnabled = root["flat_virtual_buttons"].as<bool>();
   if (root["adaptive_brightness"].is<bool>()) adaptiveBrightness = root["adaptive_brightness"].as<bool>();
@@ -2057,10 +2234,12 @@ void maintainMqtt(uint32_t nowMs) {
       mqttClient.subscribe((mqttBaseTopic+"/command/#").c_str());
       mqttClient.subscribe((mqttBaseTopic+"/set").c_str());
       mqttSettingsDirty = true;
+      mqttDiscoveryDirty = true;
     }
   }
   if (!mqttClient.connected()) return;
   mqttClient.loop();
+  if (mqttDiscoveryDirty) publishHomeAssistantDiscovery();
   if (mqttSettingsDirty) publishMqttSettings();
   if(nowMs-lastMqttPublish >= 1000UL) {
     lastMqttPublish=nowMs;
@@ -2093,8 +2272,8 @@ void sendSettingsPage(const String& message = "") {
   for (int i = 0; i < TIME_ZONE_COUNT; ++i) page += "<option value='" + String(i) + "'" + (i == timeZoneIndex ? " selected" : "") + ">" + TIME_ZONES[i].city + "</option>";
   page += "</select></label>";
   page += "<label class='field'>Clock face<select name='face'>";
-  const char* faceNames[] = {"Space", "Flip clock"};
-  for (int i = 0; i < 2; ++i) page += "<option value='" + String(i) + "'" + (i == (int)clockFace ? " selected" : "") + ">" + faceNames[i] + "</option>";
+  const char* faceNames[] = {"Space", "Flip clock", "Matrix rain"};
+  for (int i = 0; i < 3; ++i) page += "<option value='" + String(i) + "'" + (i == (int)clockFace ? " selected" : "") + ">" + faceNames[i] + "</option>";
   page += "</select></label>";
   page += "<label class='field'>Time format<select name='time24'><option value='1'"+String(use24HourTime?" selected":"")+">24-hour</option><option value='0'"+String(!use24HourTime?" selected":"")+">12-hour</option></select></label>";
   page += "<label class='field'><input type='checkbox' name='flatButtons'"+String(flatVirtualButtonsEnabled?" checked":"")+"> Enable the three virtual buttons while device is lying flat</label>";
@@ -2252,7 +2431,7 @@ void setupSettingsServer() {
       savedWifiSsids[i] = nextSsid; savedWifiPasswords[i] = nextPassword;
     }
     timeZoneIndex = constrain(settingsServer.arg("timeZone").toInt(), 0, (int)TIME_ZONE_COUNT - 1);
-    clockFace = static_cast<ClockFace>(constrain(settingsServer.arg("face").toInt(), 0, 1));
+    clockFace = static_cast<ClockFace>(constrain(settingsServer.arg("face").toInt(), 0, 2));
     use24HourTime = settingsServer.arg("time24").toInt() != 0;
     flatVirtualButtonsEnabled = settingsServer.hasArg("flatButtons");
     adaptiveBrightness = settingsServer.hasArg("autoBrightness");
@@ -2428,6 +2607,7 @@ void loop() {
     }
     if (alarmActive < 0 && (minuteChanged || clockFace != ClockFace::Space)) drawClock(false);
   }
+  drawMatrixRainFrame(nowMs);
   if (screenNow == Screen::Meditation && nowMs - lastClockDraw >= 1000) {
     lastClockDraw = nowMs;
     drawMeditation(false);
