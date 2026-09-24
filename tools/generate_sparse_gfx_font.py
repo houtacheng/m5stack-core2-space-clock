@@ -24,14 +24,14 @@ def packed_bitmap(image):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--font", required=True)
-    p.add_argument("--source", required=True)
+    p.add_argument("--source", required=True, nargs="+")
     p.add_argument("--output", required=True)
     p.add_argument("--name", required=True)
     p.add_argument("--pixels", type=int, required=True)
     p.add_argument("--ascii-only", action="store_true")
     a = p.parse_args()
 
-    text = Path(a.source).read_text(encoding="utf-8")
+    text = "\n".join(Path(source).read_text(encoding="utf-8") for source in a.source)
     used = set(range(0x20, 0x7F))
     if not a.ascii_only:
         used.update(ord(ch) for ch in text if 0x20 <= ord(ch) <= 0xFFFF)

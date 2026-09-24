@@ -1,7 +1,7 @@
 {
-  "version": "2.9.12",
+  "version": "2.9.13",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "c6568bb93311fc5977f58032535ebc02975b3062c445ac426280e0c5bb39aa1f",
-  "size": 4805248,
-  "notes": "Reverses Page 1 time controls so the upper half moves backward and the lower half moves forward. Page 3 sweating is now a simple unchecked/checked toggle and is submitted to PocketBase as a JSON boolean matching the web journal. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "8825ba75374c8395cc8210ead0c02984368e4a1ef6fbef1edaddda98ec3b7d00",
+  "size": 5402160,
+  "notes": "Adds push-to-talk Home Assistant Assist through the Core2 microphone and speaker, configured from a new bilingual HASS Assist settings page. Emotion observation Page 4 now uses a single consistent Source Han Sans TC size and fixed selector layout for every category and emotion value. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }

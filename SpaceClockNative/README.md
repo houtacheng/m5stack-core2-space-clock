@@ -3,6 +3,11 @@
 Fast native C++ firmware for the M5Stack Core2, with original artwork and a
 touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 
+Version 2.9.13 adds push-to-talk Home Assistant Assist through the Core2
+microphone and speaker. It also regenerates the Page 4 Traditional Chinese
+font at a consistent size and separates its navigation arrows from the value,
+fixing mixed sizes and alignment in longer emotion names.
+
 Version 2.9.12 makes the upper half of each time field move backward and the
 lower half move forward. Sweating is now a two-state checkbox and is submitted
 to PocketBase as a JSON boolean, matching the web journal.
@@ -32,6 +37,7 @@ the blue pill until it dissolves on Matrix. Snooze remains available.
 - Ten private saved Wi-Fi profiles with non-blocking automatic reconnect; legacy Wi-Fi credentials remain the first connection path
 - Bilingual (Traditional Chinese/English), categorized browser configuration with independent per-page saving, alarms, MQTT guide and manual OTA upload
 - MQTT state publishing and remote modification of settings
+- Push-to-talk Home Assistant Assist using the built-in microphone and speaker
 - GitHub firmware checks plus optional scheduled automatic update
 
 ## First setup
@@ -62,7 +68,8 @@ It captures the device's local time and guides you through trigger, body
 reaction, emotion, intensity, observation duration and grounding. Short-press
 **Cancel** to return to the clock, or long-press it for on-device reminder
 settings. Pages 1–7 have a graphical reset control in the upper-right corner;
-the five date/time fields on page 1 change by swiping up or down. On the final
+on page 1, tap the upper half of a date/time field to move backward and its
+lower half to move forward. On the final
 review page, tap **Send** and then **Confirm send** to create the PocketBase
 `entries` record over HTTPS. After submission, **Withdraw** deletes that record,
 while **Sent** starts a fresh form. The API base URL defaults to
@@ -76,6 +83,25 @@ uses a daily start/end window and intervals of 10, 15, 30, 60, 120, 180 or 240
 minutes, anchored at the start time. Fixed mode supports three daily times; each
 can be enabled separately. The **Later** device action snoozes a reminder for ten
 minutes.
+
+## Home Assistant Assist
+
+In Home Assistant, open the user profile and create a long-lived access token.
+Then open the Core2 browser settings and choose **HASS Assist / HASS 語音助理**:
+
+1. Enable HASS Assist and enter the Home Assistant base URL, for example
+   `http://homeassistant.local:8123` or the HTTPS URL used outside the LAN.
+2. Paste the long-lived token. A pipeline ID is optional; leaving it blank uses
+   Home Assistant's preferred Assist pipeline.
+3. Set the reply volume and save this page.
+4. On the clock, long-press the middle Meditation icon. Hold the on-screen
+   microphone while speaking, then release it to send. The spoken reply plays
+   through the Core2 speaker.
+
+The feature sends 16 kHz mono speech through Home Assistant's Assist WebSocket
+pipeline and supports MP3 or WAV TTS replies. The token stays in this Core2's
+Preferences and is not included in public firmware, GitHub or MQTT. Because the
+Core2 settings page itself is local HTTP, enter the token only on trusted Wi-Fi.
 
 ## Firmware update
 

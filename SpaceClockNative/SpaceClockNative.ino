@@ -10,7 +10,9 @@
 #include <PubSubClient.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <mp3dec.h>
 #include <mbedtls/base64.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 #include <time.h>
 #include "config.h"
@@ -35,7 +37,7 @@
 #endif
 #include "mqtt_guide.h"
 
-enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionSettings, EmotionReminder, FirmwareUpdate, About };
+enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
 
@@ -157,12 +159,55 @@ uint8_t companionPage = 0;
 uint32_t companionCenterPressedAt = 0;
 uint32_t clockSettingsPressedAt = 0;
 bool clockSettingsPressValid = false;
+uint32_t clockMiddlePressedAt = 0;
+bool clockMiddlePressValid = false;
 WiFiClient companionClient;
 WebSocketsClient companionWebSocket;
 bool companionWebSocketMode = false;
 bool companionWebSocketConnected = false;
 bool companionUsingInternet = false;
 uint32_t lastCompanionLocalProbe = 0;
+// Home Assistant Assist uses the official WebSocket pipeline API. The token
+// stays in Preferences and is never emitted to MQTT, the UI, or public builds.
+bool hassAssistEnabled = false;
+String hassAssistBaseUrl;
+String hassAssistToken;
+String hassAssistPipeline;
+uint8_t hassAssistVolume = 70;
+enum class HassAssistState : uint8_t { Disabled, Disconnected, Connecting, Authenticating, Ready, Starting, Listening, Processing, Downloading, Speaking, Error };
+HassAssistState hassAssistState = HassAssistState::Disabled;
+WebSocketsClient hassAssistWebSocket;
+bool hassAssistSocketStarted = false;
+bool hassAssistSocketConnected = false;
+bool hassAssistAuthenticated = false;
+uint32_t hassAssistCommandId = 400;
+uint32_t hassAssistActiveCommandId = 0;
+int hassAssistAudioHandlerId = -1;
+bool hassAssistHolding = false;
+bool hassAssistStopRequested = false;
+bool hassAssistMicRunning = false;
+static constexpr size_t HASS_MIC_SAMPLES = 512;
+int16_t hassAssistMicBuffers[4][HASS_MIC_SAMPLES] = {};
+uint8_t hassAssistMicQueueIndex = 0;
+uint8_t hassAssistMicSendIndex = 0;
+uint8_t hassAssistMicOutstanding = 0;
+uint32_t hassAssistListenStarted = 0;
+String hassAssistTranscript;
+String hassAssistReply;
+String hassAssistError;
+String hassAssistTtsUrl;
+String hassAssistTtsMime;
+bool hassAssistTtsPending = false;
+uint8_t* hassAssistAudioData = nullptr;
+size_t hassAssistAudioLength = 0;
+HMP3Decoder hassAssistMp3Decoder = nullptr;
+size_t hassAssistMp3Position = 0;
+static constexpr size_t HASS_MP3_FRAME_SAMPLES = 1152;
+int16_t hassAssistMp3DecodeBuffer[HASS_MP3_FRAME_SAMPLES * 2] = {};
+int16_t hassAssistMp3Buffers[3][HASS_MP3_FRAME_SAMPLES] = {};
+uint8_t hassAssistMp3BufferIndex = 0;
+bool hassAssistAudioDecodeDone = false;
+bool hassAssistTouchActive = false;
 WiFiClient mqttNetworkClient;
 PubSubClient mqttClient(mqttNetworkClient);
 bool mqttEnabled = false;
@@ -420,6 +465,11 @@ void saveSettings() {
   prefs.putString("mqttPass", mqttPassword);
   prefs.putString("mqttTopic", mqttBaseTopic);
   prefs.putString("deviceName", deviceName);
+  prefs.putBool("hassOn", hassAssistEnabled);
+  prefs.putString("hassUrl", hassAssistBaseUrl);
+  prefs.putString("hassToken", hassAssistToken);
+  prefs.putString("hassPipe", hassAssistPipeline);
+  prefs.putUChar("hassVol", hassAssistVolume);
   prefs.putUChar("emoMode", emotionReminderMode);
   prefs.putUShort("emoInterval", emotionReminderIntervalMinutes);
   prefs.putUShort("emoWinStart", emotionReminderWindowStart);
@@ -505,6 +555,15 @@ void loadSettings() {
   deviceName = prefs.getString("deviceName", "Space Clock");
   deviceName.trim();
   if (!deviceName.length()) deviceName = "Space Clock";
+  hassAssistEnabled = prefs.getBool("hassOn", false);
+  hassAssistBaseUrl = prefs.getString("hassUrl", "");
+  hassAssistBaseUrl.trim();
+  while (hassAssistBaseUrl.endsWith("/")) hassAssistBaseUrl.remove(hassAssistBaseUrl.length() - 1);
+  hassAssistToken = prefs.getString("hassToken", "");
+  hassAssistPipeline = prefs.getString("hassPipe", "");
+  hassAssistPipeline.trim();
+  hassAssistVolume = constrain((int)prefs.getUChar("hassVol", 70), 5, 100);
+  hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
   emotionReminderMode = constrain((int)prefs.getUChar("emoMode", 0), 0, 2);
   emotionReminderIntervalMinutes = prefs.getUShort("emoInterval", 60);
   const uint16_t validEmotionIntervals[] = {10, 15, 30, 60, 120, 180, 240};
@@ -1666,6 +1725,488 @@ void changeCompanionPage(int direction) {
   connectCompanion();
 }
 
+const char* hassAssistStateText() {
+  switch (hassAssistState) {
+    case HassAssistState::Disabled: return "Not configured";
+    case HassAssistState::Disconnected: return "Disconnected";
+    case HassAssistState::Connecting: return "Connecting...";
+    case HassAssistState::Authenticating: return "Authenticating...";
+    case HassAssistState::Ready: return "Hold to talk";
+    case HassAssistState::Starting: return "Starting Assist...";
+    case HassAssistState::Listening: return "Listening... release to send";
+    case HassAssistState::Processing: return "Thinking...";
+    case HassAssistState::Downloading: return "Loading voice reply...";
+    case HassAssistState::Speaking: return "Speaking...";
+    case HassAssistState::Error: return "Assist error";
+  }
+  return "Assist";
+}
+
+uint16_t hassAssistStateColor() {
+  if (hassAssistState == HassAssistState::Ready) return 0x07E0;
+  if (hassAssistState == HassAssistState::Listening) return TFT_CYAN;
+  if (hassAssistState == HassAssistState::Speaking) return 0xFD20;
+  if (hassAssistState == HassAssistState::Error || hassAssistState == HassAssistState::Disabled) return 0xF986;
+  return 0xFFE0;
+}
+
+void drawHassAssist() {
+  if (screenNow != Screen::HassAssist) return;
+  M5.Display.fillScreen(TFT_BLACK);
+  uint16_t stateColor = hassAssistStateColor();
+  M5.Display.fillCircle(16, 16, 5, stateColor);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(0x07E0, TFT_BLACK);
+  useUIFont(1);
+  M5.Display.drawString("HASS ASSIST", 28, 8);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  useUIFont(1);
+  M5.Display.drawString(hassAssistStateText(), 160, 45);
+
+  uint16_t buttonColor = hassAssistState == HassAssistState::Listening ? 0x04BF : (hassAssistState == HassAssistState::Speaking ? 0xFBE0 : 0x03E0);
+  M5.Display.fillCircle(160, 117, 48, 0x1082);
+  M5.Display.drawCircle(160, 117, 48, buttonColor);
+  M5.Display.drawCircle(160, 117, 47, buttonColor);
+  // Microphone icon.
+  M5.Display.fillRoundRect(151, 88, 18, 38, 9, TFT_WHITE);
+  M5.Display.drawRoundRect(143, 101, 34, 34, 14, TFT_WHITE);
+  M5.Display.fillRect(158, 133, 4, 12, TFT_WHITE);
+  M5.Display.fillRoundRect(149, 143, 22, 4, 2, TFT_WHITE);
+
+  M5.Display.setClipRect(12, 166, 296, 42);
+  M5.Display.setTextDatum(top_left);
+  useUIFont(1);
+  if (hassAssistError.length()) {
+    M5.Display.setTextColor(0xF986, TFT_BLACK);
+    M5.Display.drawString(hassAssistError, 14, 168);
+  } else if (hassAssistReply.length()) {
+    M5.Display.setTextColor(0xBDF7, TFT_BLACK);
+    M5.Display.drawString(hassAssistReply, 14, 168);
+  } else if (hassAssistTranscript.length()) {
+    M5.Display.setTextColor(0x7DFF, TFT_BLACK);
+    M5.Display.drawString(hassAssistTranscript, 14, 168);
+  } else {
+    M5.Display.setTextColor(0x7BEF, TFT_BLACK);
+    M5.Display.drawString("Press and hold the microphone", 43, 174);
+  }
+  M5.Display.clearClipRect();
+  drawBottomBar("", "", "Close");
+}
+
+void cleanupHassAssistAudio(bool stopSpeaker = false) {
+  if (hassAssistMp3Decoder) { MP3FreeDecoder(hassAssistMp3Decoder); hassAssistMp3Decoder = nullptr; }
+  if (hassAssistAudioData) { heap_caps_free(hassAssistAudioData); hassAssistAudioData = nullptr; }
+  hassAssistAudioLength = 0;
+  hassAssistMp3Position = 0;
+  hassAssistAudioDecodeDone = false;
+  if (stopSpeaker) M5.Speaker.stop(2);
+}
+
+void abortHassAssistMic() {
+  hassAssistHolding = false;
+  hassAssistStopRequested = false;
+  hassAssistMicOutstanding = 0;
+  if (hassAssistMicRunning || M5.Mic.isRunning()) M5.Mic.end();
+  hassAssistMicRunning = false;
+  M5.Speaker.begin();
+}
+
+void stopHassAssist() {
+  abortHassAssistMic();
+  cleanupHassAssistAudio(true);
+  hassAssistTtsPending = false;
+  hassAssistTtsUrl = "";
+  hassAssistWebSocket.disconnect();
+  hassAssistSocketStarted = false;
+  hassAssistSocketConnected = false;
+  hassAssistAuthenticated = false;
+  hassAssistAudioHandlerId = -1;
+  hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
+}
+
+void beginHassAssistMic() {
+  if (hassAssistMicRunning || hassAssistAudioHandlerId < 0 || !hassAssistSocketConnected) return;
+  M5.Speaker.stop();
+  M5.Speaker.end();
+  if (!M5.Mic.begin()) {
+    hassAssistError = "Microphone could not start";
+    hassAssistState = HassAssistState::Error;
+    drawHassAssist();
+    return;
+  }
+  hassAssistMicQueueIndex = 0;
+  hassAssistMicSendIndex = 0;
+  hassAssistMicOutstanding = 0;
+  for (int i = 0; i < 2; ++i) {
+    if (M5.Mic.record(hassAssistMicBuffers[hassAssistMicQueueIndex], HASS_MIC_SAMPLES, 16000, false)) {
+      hassAssistMicQueueIndex = (hassAssistMicQueueIndex + 1) % 4;
+      ++hassAssistMicOutstanding;
+    }
+  }
+  hassAssistMicRunning = true;
+  hassAssistListenStarted = millis();
+  hassAssistState = HassAssistState::Listening;
+  drawHassAssist();
+}
+
+void sendHassAssistAudioBuffer(const int16_t* samples, size_t sampleCount) {
+  if (!hassAssistSocketConnected || hassAssistAudioHandlerId < 0 || !sampleCount) return;
+  uint8_t packet[1 + HASS_MIC_SAMPLES * sizeof(int16_t)];
+  packet[0] = (uint8_t)hassAssistAudioHandlerId;
+  memcpy(packet + 1, samples, sampleCount * sizeof(int16_t));
+  hassAssistWebSocket.sendBIN(packet, 1 + sampleCount * sizeof(int16_t));
+}
+
+void finishHassAssistMic() {
+  if (hassAssistMicRunning) M5.Mic.end();
+  hassAssistMicRunning = false;
+  hassAssistMicOutstanding = 0;
+  M5.Speaker.begin();
+  if (hassAssistSocketConnected && hassAssistAudioHandlerId >= 0) {
+    uint8_t endMarker = (uint8_t)hassAssistAudioHandlerId;
+    hassAssistWebSocket.sendBIN(&endMarker, 1);
+  }
+  hassAssistAudioHandlerId = -1;
+  hassAssistStopRequested = false;
+  hassAssistState = HassAssistState::Processing;
+  drawHassAssist();
+}
+
+void maintainHassAssistMic(uint32_t nowMs) {
+  if (!hassAssistMicRunning) return;
+  if (nowMs - hassAssistListenStarted >= 15000UL) { hassAssistHolding = false; hassAssistStopRequested = true; }
+  uint8_t active = min<size_t>(M5.Mic.isRecording(), hassAssistMicOutstanding);
+  uint8_t completed = hassAssistMicOutstanding - active;
+  while (completed--) {
+    sendHassAssistAudioBuffer(hassAssistMicBuffers[hassAssistMicSendIndex], HASS_MIC_SAMPLES);
+    hassAssistMicSendIndex = (hassAssistMicSendIndex + 1) % 4;
+    --hassAssistMicOutstanding;
+  }
+  if (hassAssistStopRequested) {
+    if (!hassAssistMicOutstanding && !M5.Mic.isRecording()) finishHassAssistMic();
+    return;
+  }
+  while (hassAssistMicOutstanding < 2) {
+    if (!M5.Mic.record(hassAssistMicBuffers[hassAssistMicQueueIndex], HASS_MIC_SAMPLES, 16000, false)) break;
+    hassAssistMicQueueIndex = (hassAssistMicQueueIndex + 1) % 4;
+    ++hassAssistMicOutstanding;
+  }
+}
+
+void startHassAssistPipeline() {
+  if (!hassAssistEnabled || !hassAssistAuthenticated || !hassAssistSocketConnected) {
+    hassAssistError = hassAssistEnabled ? "Home Assistant is not connected" : "Configure HASS Assist in the web settings";
+    hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
+    drawHassAssist();
+    return;
+  }
+  if (hassAssistMicRunning || hassAssistMp3Decoder || hassAssistAudioData || hassAssistTtsPending) return;
+  hassAssistError = "";
+  hassAssistTranscript = "";
+  hassAssistReply = "";
+  hassAssistAudioHandlerId = -1;
+  hassAssistStopRequested = false;
+  hassAssistActiveCommandId = ++hassAssistCommandId;
+  JsonDocument command;
+  command["id"] = hassAssistActiveCommandId;
+  command["type"] = "assist_pipeline/run";
+  command["start_stage"] = "stt";
+  command["end_stage"] = "tts";
+  command["input"]["sample_rate"] = 16000;
+  if (hassAssistPipeline.length()) command["pipeline"] = hassAssistPipeline;
+  String payload;
+  serializeJson(command, payload);
+  hassAssistWebSocket.sendTXT(payload);
+  hassAssistState = HassAssistState::Starting;
+  drawHassAssist();
+}
+
+void processHassAssistEvent(JsonObject event) {
+  String eventType = event["type"] | "";
+  JsonVariant data = event["data"];
+  if (eventType == "run-start") {
+    hassAssistAudioHandlerId = data["runner_data"]["stt_binary_handler_id"] | -1;
+  } else if (eventType == "stt-start") {
+    if (hassAssistHolding) beginHassAssistMic();
+    else {
+      uint8_t endMarker = (uint8_t)max(hassAssistAudioHandlerId, 0);
+      if (hassAssistAudioHandlerId >= 0) hassAssistWebSocket.sendBIN(&endMarker, 1);
+      hassAssistState = HassAssistState::Processing;
+    }
+  } else if (eventType == "stt-end") {
+    hassAssistTranscript = data["stt_output"]["text"] | "";
+    hassAssistState = HassAssistState::Processing;
+  } else if (eventType == "intent-end") {
+    hassAssistReply = data["intent_output"]["response"]["speech"]["plain"]["speech"] | "";
+  } else if (eventType == "tts-end") {
+    JsonVariant output;
+    if (data["tts_output"].isNull()) output = data;
+    else output = data["tts_output"].as<JsonVariant>();
+    hassAssistTtsUrl = output["url"] | "";
+    hassAssistTtsMime = output["mime_type"] | "";
+    hassAssistTtsPending = hassAssistTtsUrl.length();
+    if (hassAssistTtsPending) hassAssistState = HassAssistState::Downloading;
+  } else if (eventType == "error") {
+    hassAssistError = data["message"] | "Assist pipeline failed";
+    hassAssistState = HassAssistState::Error;
+    abortHassAssistMic();
+  } else if (eventType == "run-end" && !hassAssistTtsPending && !hassAssistMp3Decoder && !hassAssistAudioData) {
+    hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
+  }
+  drawHassAssist();
+}
+
+void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    hassAssistSocketConnected = true;
+    hassAssistAuthenticated = false;
+    hassAssistState = HassAssistState::Authenticating;
+    drawHassAssist();
+    return;
+  }
+  if (type == WStype_DISCONNECTED) {
+    hassAssistSocketConnected = false;
+    hassAssistAuthenticated = false;
+    if (hassAssistMicRunning) abortHassAssistMic();
+    hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
+    drawHassAssist();
+    return;
+  }
+  if (type != WStype_TEXT || !payload || !length) return;
+  JsonDocument message;
+  if (deserializeJson(message, payload, length)) return;
+  String messageType = message["type"] | "";
+  if (messageType == "auth_required") {
+    JsonDocument auth;
+    auth["type"] = "auth";
+    auth["access_token"] = hassAssistToken;
+    String authPayload;
+    serializeJson(auth, authPayload);
+    hassAssistWebSocket.sendTXT(authPayload);
+  } else if (messageType == "auth_ok") {
+    hassAssistAuthenticated = true;
+    hassAssistState = HassAssistState::Ready;
+    hassAssistError = "";
+    drawHassAssist();
+  } else if (messageType == "auth_invalid") {
+    hassAssistAuthenticated = false;
+    hassAssistError = "Home Assistant token was rejected";
+    hassAssistState = HassAssistState::Error;
+    drawHassAssist();
+  } else if (messageType == "event" && (uint32_t)(message["id"] | 0) == hassAssistActiveCommandId) {
+    processHassAssistEvent(message["event"].as<JsonObject>());
+  } else if (messageType == "result" && !message["success"].as<bool>() && (uint32_t)(message["id"] | 0) == hassAssistActiveCommandId) {
+    hassAssistError = message["error"]["message"] | "Assist request was rejected";
+    hassAssistState = HassAssistState::Error;
+    drawHassAssist();
+  }
+}
+
+bool parseHassAssistUrl(String& host, uint16_t& port, String& websocketPath, bool& secure) {
+  String url = hassAssistBaseUrl;
+  url.trim();
+  secure = url.startsWith("https://");
+  if (!secure && !url.startsWith("http://")) return false;
+  url.remove(0, secure ? 8 : 7);
+  int slash = url.indexOf('/');
+  String hostPort = slash >= 0 ? url.substring(0, slash) : url;
+  String prefix = slash >= 0 ? url.substring(slash) : "";
+  while (prefix.endsWith("/")) prefix.remove(prefix.length() - 1);
+  int colon = hostPort.lastIndexOf(':');
+  port = secure ? 443 : 8123;
+  if (colon > 0) {
+    port = constrain(hostPort.substring(colon + 1).toInt(), 1, 65535);
+    hostPort = hostPort.substring(0, colon);
+  }
+  host = hostPort;
+  websocketPath = prefix + "/api/websocket";
+  return host.length();
+}
+
+void connectHassAssist() {
+  if (hassAssistSocketStarted || WiFi.status() != WL_CONNECTED || !hassAssistEnabled) return;
+  if (!hassAssistBaseUrl.length() || !hassAssistToken.length()) {
+    hassAssistState = HassAssistState::Disabled;
+    hassAssistError = "Set the Home Assistant URL and token on the web page";
+    drawHassAssist();
+    return;
+  }
+  String host, path;
+  uint16_t port;
+  bool secure;
+  if (!parseHassAssistUrl(host, port, path, secure)) {
+    hassAssistState = HassAssistState::Error;
+    hassAssistError = "Invalid Home Assistant URL";
+    drawHassAssist();
+    return;
+  }
+  hassAssistWebSocket.onEvent(onHassAssistWebSocketEvent);
+  hassAssistWebSocket.setReconnectInterval(4000);
+  hassAssistWebSocket.enableHeartbeat(10000, 3000, 2);
+  if (secure) hassAssistWebSocket.beginSSL(host.c_str(), port, path.c_str(), "", "");
+  else hassAssistWebSocket.begin(host.c_str(), port, path.c_str(), "");
+  hassAssistSocketStarted = true;
+  hassAssistState = HassAssistState::Connecting;
+  drawHassAssist();
+}
+
+void showHassAssist() {
+  screenNow = Screen::HassAssist;
+  hassAssistTranscript = "";
+  hassAssistReply = "";
+  hassAssistError = "";
+  hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
+  drawHassAssist();
+  connectHassAssist();
+}
+
+String absoluteHassAssistTtsUrl(String url) {
+  url.trim();
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+  if (!url.startsWith("/")) url = "/" + url;
+  return hassAssistBaseUrl + url;
+}
+
+bool downloadHassAssistAudio() {
+  String url = absoluteHassAssistTtsUrl(hassAssistTtsUrl);
+  if (!url.length()) return false;
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  bool https = url.startsWith("https://");
+  if (https) { secure.setInsecure(); if (!http.begin(secure, url)) return false; }
+  else if (!http.begin(plain, url)) return false;
+  if (hassAssistToken.length()) http.addHeader("Authorization", "Bearer " + hassAssistToken);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); hassAssistError = "Voice download HTTP " + String(code); return false; }
+  int declared = http.getSize();
+  static constexpr size_t MAX_ASSIST_AUDIO = 2 * 1024 * 1024;
+  if (declared > (int)MAX_ASSIST_AUDIO) { http.end(); hassAssistError = "Voice reply is too large"; return false; }
+  size_t capacity = declared > 0 ? (size_t)declared : 131072;
+  capacity = max<size_t>(capacity, 4096);
+  hassAssistAudioData = (uint8_t*)heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!hassAssistAudioData) { http.end(); hassAssistError = "Not enough memory for voice reply"; return false; }
+  WiFiClient* stream = http.getStreamPtr();
+  hassAssistAudioLength = 0;
+  uint32_t lastDataAt = millis();
+  while (http.connected() && (declared < 0 || hassAssistAudioLength < (size_t)declared)) {
+    size_t available = stream->available();
+    if (!available) {
+      if (millis() - lastDataAt > 8000UL) break;
+      delay(1);
+      continue;
+    }
+    if (hassAssistAudioLength + available > capacity) {
+      size_t nextCapacity = min(MAX_ASSIST_AUDIO, max(capacity * 2, hassAssistAudioLength + available));
+      if (nextCapacity <= capacity) break;
+      uint8_t* grown = (uint8_t*)heap_caps_realloc(hassAssistAudioData, nextCapacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!grown) break;
+      hassAssistAudioData = grown;
+      capacity = nextCapacity;
+    }
+    size_t readNow = stream->readBytes(hassAssistAudioData + hassAssistAudioLength, min(available, capacity - hassAssistAudioLength));
+    if (!readNow) break;
+    hassAssistAudioLength += readNow;
+    lastDataAt = millis();
+  }
+  http.end();
+  if (hassAssistAudioLength < 16) {
+    cleanupHassAssistAudio();
+    hassAssistError = "Voice reply was empty";
+    return false;
+  }
+  return true;
+}
+
+bool beginHassAssistPlayback() {
+  bool isWav = hassAssistAudioLength >= 4 && !memcmp(hassAssistAudioData, "RIFF", 4);
+  bool isMp3 = hassAssistTtsMime.indexOf("mpeg") >= 0 || hassAssistTtsMime.indexOf("mp3") >= 0
+    || (hassAssistAudioLength >= 3 && !memcmp(hassAssistAudioData, "ID3", 3))
+    || (hassAssistAudioLength >= 2 && hassAssistAudioData[0] == 0xFF && (hassAssistAudioData[1] & 0xE0) == 0xE0);
+  if (!isWav && !isMp3) {
+    hassAssistError = "TTS must return MP3 or WAV audio";
+    cleanupHassAssistAudio();
+    return false;
+  }
+  M5.Mic.end();
+  M5.Speaker.begin();
+  M5.Speaker.stop();
+  M5.Speaker.setVolume((uint8_t)(hassAssistVolume * 255 / 100));
+  hassAssistAudioDecodeDone = false;
+  if (isWav) {
+    if (!M5.Speaker.playWav(hassAssistAudioData, hassAssistAudioLength, 1, 2, true)) {
+      hassAssistError = "WAV reply could not be played";
+      cleanupHassAssistAudio();
+      return false;
+    }
+    hassAssistAudioDecodeDone = true;
+  } else {
+    hassAssistMp3Decoder = MP3InitDecoder();
+    if (!hassAssistMp3Decoder) {
+      hassAssistError = "MP3 decoder could not start";
+      cleanupHassAssistAudio();
+      return false;
+    }
+    hassAssistMp3Position = 0;
+    hassAssistMp3BufferIndex = 0;
+  }
+  hassAssistState = HassAssistState::Speaking;
+  drawHassAssist();
+  return true;
+}
+
+void decodeNextHassAssistMp3Frame() {
+  if (!hassAssistMp3Decoder || hassAssistAudioDecodeDone) return;
+  if (hassAssistMp3Position >= hassAssistAudioLength) { hassAssistAudioDecodeDone = true; return; }
+  unsigned char* search = hassAssistAudioData + hassAssistMp3Position;
+  int remaining = min<size_t>(INT_MAX, hassAssistAudioLength - hassAssistMp3Position);
+  int syncOffset = MP3FindSyncWord(search, remaining);
+  if (syncOffset < 0) { hassAssistAudioDecodeDone = true; return; }
+  hassAssistMp3Position += syncOffset;
+  unsigned char* frame = hassAssistAudioData + hassAssistMp3Position;
+  int bytesLeft = min<size_t>(INT_MAX, hassAssistAudioLength - hassAssistMp3Position);
+  int before = bytesLeft;
+  int result = MP3Decode(hassAssistMp3Decoder, &frame, &bytesLeft, hassAssistMp3DecodeBuffer, 0);
+  size_t consumed = before - bytesLeft;
+  hassAssistMp3Position += consumed ? consumed : 1;
+  if (result != ERR_MP3_NONE) return;
+  MP3FrameInfo info;
+  MP3GetLastFrameInfo(hassAssistMp3Decoder, &info);
+  int channels = max(1, info.nChans);
+  size_t samples = min<size_t>(HASS_MP3_FRAME_SAMPLES, info.outputSamps / channels);
+  int16_t* output = hassAssistMp3Buffers[hassAssistMp3BufferIndex];
+  for (size_t i = 0; i < samples; ++i) {
+    output[i] = channels > 1 ? (int16_t)(((int32_t)hassAssistMp3DecodeBuffer[i * channels] + hassAssistMp3DecodeBuffer[i * channels + 1]) / 2) : hassAssistMp3DecodeBuffer[i];
+  }
+  M5.Speaker.playRaw(output, samples, info.samprate ? info.samprate : 16000, false, 1, 2, false);
+  hassAssistMp3BufferIndex = (hassAssistMp3BufferIndex + 1) % 3;
+}
+
+void maintainHassAssist(uint32_t nowMs) {
+  if (!hassAssistEnabled || screenNow != Screen::HassAssist) return;
+  if (!hassAssistSocketStarted) connectHassAssist();
+  if (hassAssistSocketStarted) hassAssistWebSocket.loop();
+  maintainHassAssistMic(nowMs);
+  if (hassAssistTtsPending && !hassAssistMicRunning && !hassAssistAudioData) {
+    hassAssistTtsPending = false;
+    hassAssistState = HassAssistState::Downloading;
+    drawHassAssist();
+    if (!downloadHassAssistAudio() || !beginHassAssistPlayback()) {
+      hassAssistState = HassAssistState::Error;
+      drawHassAssist();
+    }
+  }
+  if (hassAssistMp3Decoder && !hassAssistAudioDecodeDone) decodeNextHassAssistMp3Frame();
+  if (hassAssistAudioData && hassAssistAudioDecodeDone && !M5.Speaker.isPlaying(2)) {
+    cleanupHassAssistAudio();
+    hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
+    drawHassAssist();
+  }
+}
+
 const char* meditationSoundName(uint8_t choice) {
   static const char* names[] = {"Da Ban", "Chime", "Stream", "Water drop"};
   return names[min((int)choice, 3)];
@@ -2433,6 +2974,27 @@ void drawEmotionRow(int y, const String& label, const String& value, bool select
   M5.Display.drawString(value, 302, y + 14);
 }
 
+void drawEmotionChoicePanel(int y, const char* label, const String& value, uint16_t fill, uint16_t accent) {
+  M5.Display.fillRoundRect(12, y, 296, 61, 10, fill);
+  M5.Display.drawRoundRect(12, y, 296, 61, 10, accent);
+
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(emotionTheme(70), fill);
+  M5.Display.drawString(label, 160, y + 13);
+
+  // Keep navigation separate from the value so every category and emotion is
+  // rendered on exactly the same baseline and with exactly the same font.
+  M5.Display.fillTriangle(28, y + 43, 37, y + 35, 37, y + 51, accent);
+  M5.Display.fillTriangle(292, y + 43, 283, y + 35, 283, y + 51, accent);
+  M5.Display.setClipRect(44, y + 22, 232, 36);
+  useUIMediumFont();
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(TFT_WHITE, fill);
+  M5.Display.drawString(value, 160, y + 43);
+  M5.Display.clearClipRect();
+}
+
 void drawEmotionObservation() {
   if (screenNow != Screen::EmotionObservation) return;
   drawEmotionMatrixBackground();
@@ -2504,17 +3066,9 @@ void drawEmotionObservation() {
       M5.Display.drawString(values[i], x + 50, y + 47);
     }
   } else if (emotionFormPage == 3) {
-    M5.Display.fillRoundRect(12, 46, 296, 61, 10, selected);
-    M5.Display.drawRoundRect(12, 46, 296, 61, 10, accent);
-    useUIMediumFont(); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString("類別　◀ / ▶", 160, 61);
-    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected);
-    M5.Display.drawString(EMOTION_CATEGORIES[emotionCategory], 160, 87);
     String choiceText = emotionChoice < 0 ? "未選" : EMOTION_CHOICES[emotionCategory][emotionChoice];
-    M5.Display.fillRoundRect(12, 118, 296, 61, 10, selected);
-    M5.Display.drawRoundRect(12, 118, 296, 61, 10, accent);
-    useUIMediumFont(); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.drawString("情緒　◀ / ▶", 160, 133);
-    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected); M5.Display.drawString(choiceText, 160, 159);
+    drawEmotionChoicePanel(46, "類別", EMOTION_CATEGORIES[emotionCategory], selected, accent);
+    drawEmotionChoicePanel(118, "情緒", choiceText, selected, accent);
     if (emotionSubmitMessage.length()) {
       useUIFont(1); M5.Display.setTextColor(TFT_RED, TFT_BLACK);
       M5.Display.drawString(emotionSubmitMessage, 160, 198);
@@ -3306,9 +3860,12 @@ void handleClockTouch(const m5::touch_detail_t& t) {
   }
   const bool inNavigation = t.y >= 210;
   const bool inSettings = inNavigation && t.x >= 214;
+  const bool inMiddle = inNavigation && t.x >= 107 && t.x < 214;
   if (t.wasPressed()) {
     clockSettingsPressValid = inSettings;
     clockSettingsPressedAt = inSettings ? millis() : 0;
+    clockMiddlePressValid = inMiddle;
+    clockMiddlePressedAt = inMiddle ? millis() : 0;
     companionNavPressValid = t.y >= 210 && t.x < 107;
     companionNavPressStarted = companionNavPressValid ? millis() : 0;
   }
@@ -3316,6 +3873,8 @@ void handleClockTouch(const m5::touch_detail_t& t) {
   if (t.y < 210) {
     clockSettingsPressValid = false;
     clockSettingsPressedAt = 0;
+    clockMiddlePressValid = false;
+    clockMiddlePressedAt = 0;
     companionNavPressValid = false;
     companionNavPressStarted = 0;
     return;
@@ -3325,15 +3884,20 @@ void handleClockTouch(const m5::touch_detail_t& t) {
     const bool longPress = companionNavPressValid && companionNavPressStarted && millis() - companionNavPressStarted >= 700UL;
     companionNavPressValid = false; companionNavPressStarted = 0;
     clockSettingsPressValid = false;
+    clockMiddlePressValid = false; clockMiddlePressedAt = 0;
     if (longPress) showEmotionObservation(true); else showCompanion();
   } else if (t.x < 214) {
+    const bool longPress = clockMiddlePressValid && clockMiddlePressedAt && millis() - clockMiddlePressedAt >= 700UL;
     companionNavPressValid = false; companionNavPressStarted = 0;
     clockSettingsPressValid = false;
-    showMeditation();
+    clockMiddlePressValid = false; clockMiddlePressedAt = 0;
+    if (longPress) showHassAssist(); else showMeditation();
   } else {
     const bool longPress = clockSettingsPressValid && clockSettingsPressedAt && millis() - clockSettingsPressedAt >= 700UL;
     clockSettingsPressValid = false;
     clockSettingsPressedAt = 0;
+    clockMiddlePressValid = false;
+    clockMiddlePressedAt = 0;
     if (longPress) {
       manualNightLightOverride = true;
       manualNightLightActive = !manualNightLightActive;
@@ -3368,6 +3932,26 @@ void handleTouch() {
   if (!flatVirtualButtonsEnabled && t.y >= 210 && (t.wasPressed() || t.isPressed() || t.wasReleased()) && deviceIsFlat()) return;
   if (t.wasPressed() || t.isPressed() || t.wasReleased()) lastUserActivity = millis();
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionSettings || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
+  if (screenNow == Screen::HassAssist) {
+    if (t.wasPressed() && t.y < 210 && sq((int)t.x - 160) + sq((int)t.y - 117) <= 60 * 60) {
+      hassAssistTouchActive = true;
+      hassAssistHolding = true;
+      haptic(12);
+      startHassAssistPipeline();
+    }
+    if (t.wasReleased() && hassAssistTouchActive) {
+      hassAssistTouchActive = false;
+      hassAssistHolding = false;
+      hassAssistStopRequested = true;
+      if (hassAssistState == HassAssistState::Listening) drawHassAssist();
+    } else if (t.wasReleased() && t.y >= 210 && t.x >= 214) {
+      haptic(15);
+      stopHassAssist();
+      screenNow = Screen::Clock;
+      drawClock(true); drawAstronaut();
+    }
+    return;
+  }
   if (screenNow == Screen::Clock) { handleClockTouch(t); return; }
   if (screenNow == Screen::Companion && t.y >= 210) {
     if (t.wasPressed() && t.x >= 107 && t.x < 214) companionCenterPressedAt = millis();
@@ -3960,7 +4544,7 @@ void maintainMqtt(uint32_t nowMs) {
 void sendSettingsPage(const String& message = "", const String& requestedPage = "", const String& requestedLanguage = "") {
   String pageId = requestedPage.length() ? requestedPage : settingsServer.arg("page");
   String language = requestedLanguage.length() ? requestedLanguage : settingsServer.arg("lang");
-  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "companion" && pageId != "firmware") pageId = "clock";
+  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "firmware") pageId = "clock";
   bool zh = language == "zh" || (!language.length());
   auto tr = [zh](const char* en, const char* zhText) -> String { return zh ? String(zhText) : String(en); };
   String page;
@@ -3972,11 +4556,11 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   char webTime[24]; snprintf(webTime, sizeof(webTime), "%04d-%02d-%02d %02d:%02d:%02d", webNow.date.year, webNow.date.month, webNow.date.date, webNow.time.hours, webNow.time.minutes, webNow.time.seconds);
   page += "<header><div><h1>" + tr("Space Clock settings", "太空時鐘設定") + "</h1><div class='muted'>" + tr("Device", "設備") + ": <b>" + htmlEscape(deviceName) + "</b> · " + tr("Network name", "網路名稱") + ": <b>" + networkHostname() + "</b><br>" + tr("IP", "設備 IP") + ": <b>" + WiFi.localIP().toString() + "</b> · " + tr("Device time", "裝置時間") + ": <b>" + webTime + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</div></div>";
   page += "<a class='lang' href='/?page=" + pageId + "&lang=" + String(zh ? "en" : "zh") + "'>" + tr("中文", "English") + "</a></header>";
-  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "companion", "firmware"};
-  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "Companion", "Firmware"};
-  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "Companion", "韌體更新"};
+  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "hass", "companion", "firmware"};
+  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "HASS Assist", "Companion", "Firmware"};
+  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "韌體更新"};
   page += "<nav class='tabs'>";
-  for (int i = 0; i < 8; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
+  for (int i = 0; i < 9; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
   page += "</nav>";
   if (message.length()) page += "<p class='ok'>" + htmlEscape(message) + "</p>";
   if (pageId == "emotion") {
@@ -4105,6 +4689,15 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<label class='check'><input type='checkbox' name='mqttEnabled'" + String(mqttEnabled ? " checked" : "") + ">" + tr("Enable MQTT", "啟用 MQTT") + "</label><label class='field'>" + tr("Broker host/IP", "Broker 主機／IP") + "<input name='mqttHost' value='" + htmlEscape(mqttHost) + "'></label>";
     page += "<div class='grid'><label class='field'>" + tr("Port", "連接埠") + "<input type='number' min='1' max='65535' name='mqttPort' value='" + String(mqttPort) + "'></label><label class='field'>" + tr("Base topic", "基礎 Topic") + "<input name='mqttBaseTopic' value='" + htmlEscape(mqttBaseTopic) + "'></label></div>";
     page += "<label class='field'>" + tr("Username", "使用者名稱") + "<input name='mqttUsername' value='" + htmlEscape(mqttUsername) + "'></label><label class='field'>" + tr("Password", "密碼") + "<input type='password' name='mqttPassword' placeholder='" + tr("Leave blank to keep current", "留白以保留目前密碼") + "'></label>";
+  } else if (pageId == "hass") {
+    page += "<h2>Home Assistant Assist</h2><p class='muted'>" + tr("Use this Core2's microphone and speaker as a push-to-talk Home Assistant voice terminal. On the clock, long-press the middle Meditation icon, then hold the microphone while speaking and release it to send.", "使用 Core2 的麥克風與喇叭作為 Home Assistant 按住說話語音終端。在時鐘首頁長按中間的靜心圖示進入；按住麥克風說話，放開後送出。") + "</p>";
+    page += "<label class='check'><input type='checkbox' name='hassEnabled'" + String(hassAssistEnabled ? " checked" : "") + ">" + tr("Enable HASS Assist", "啟用 HASS Assist") + "</label>";
+    page += "<label class='field'>" + tr("Home Assistant base URL", "Home Assistant 基礎網址") + "<input name='hassBaseUrl' inputmode='url' placeholder='http://homeassistant.local:8123' value='" + htmlEscape(hassAssistBaseUrl) + "'></label>";
+    page += "<label class='field'>" + tr("Long-lived access token", "長期存取權杖") + "<input type='password' name='hassToken' autocomplete='new-password' placeholder='" + tr(hassAssistToken.length() ? "Saved — leave blank to keep current" : "Paste a Home Assistant long-lived token", hassAssistToken.length() ? "已儲存—留白即可保留目前權杖" : "貼上 Home Assistant 長期存取權杖") + "'></label>";
+    page += "<label class='check'><input type='checkbox' name='hassClearToken'>" + tr("Forget the saved token", "清除已儲存的權杖") + "</label>";
+    page += "<label class='field'>" + tr("Assist pipeline ID (optional)", "Assist Pipeline ID（選填）") + "<input name='hassPipeline' placeholder='" + tr("Blank uses Home Assistant's preferred pipeline", "留白則使用 Home Assistant 的偏好 Pipeline") + "' value='" + htmlEscape(hassAssistPipeline) + "'></label>";
+    page += "<label class='field'>" + tr("Voice reply volume", "語音回覆音量") + ": <output id='hassVolumeOut'>" + String(hassAssistVolume) + "%</output><input type='range' min='5' max='100' step='5' name='hassVolume' value='" + String(hassAssistVolume) + "' oninput='hassVolumeOut.value=this.value+\"%\"'></label>";
+    page += "<p class='muted'>" + tr("The token is stored only in this Core2's Preferences and is never published to GitHub or MQTT. Because this settings page is local HTTP, configure it only on a trusted Wi-Fi network. MP3 and WAV voice replies are supported.", "權杖只會保存在這台 Core2 的偏好設定，不會上傳 GitHub 或 MQTT。因本設定頁是區域網路 HTTP，請只在可信任的 Wi-Fi 設定。支援 MP3 與 WAV 語音回覆。") + "</p>";
   } else if (pageId == "companion") {
     page += "<h2>Companion</h2><p class='muted'>" + tr("Local host is preferred automatically; the Internet URL is used when the local connection is unavailable. You may fill either or both.", "優先連接區域網路主機；連不上時改用網際網路網址。可填其中一種，也可兩者都填。") + "</p>";
     for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
@@ -4217,10 +4810,12 @@ void setupSettingsServer() {
   settingsServer.on("/save", HTTP_POST, []() {
     String pageId = settingsServer.arg("page");
     String language = settingsServer.arg("lang");
-    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "companion" && pageId != "firmware") pageId = "clock";
+    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "firmware") pageId = "clock";
     bool wifiChanged = false;
     bool deviceNameChanged = false;
     bool emotionBaseRejected = false;
+    bool hassBaseRejected = false;
+    bool reconnectHassAssist = false;
     bool reconnectCompanion = false;
     if (pageId == "wifi") {
       String nextDeviceName = settingsServer.arg("deviceName"); nextDeviceName.trim();
@@ -4331,6 +4926,28 @@ void setupSettingsServer() {
       mqttBaseTopic = settingsServer.arg("mqttBaseTopic"); mqttBaseTopic.trim();
       while (mqttBaseTopic.endsWith("/")) mqttBaseTopic.remove(mqttBaseTopic.length() - 1);
       mqttClient.disconnect();
+    } else if (pageId == "hass") {
+      bool nextEnabled = settingsServer.hasArg("hassEnabled");
+      String nextBase = settingsServer.arg("hassBaseUrl"); nextBase.trim();
+      while (nextBase.endsWith("/")) nextBase.remove(nextBase.length() - 1);
+      if (nextBase.length() && !nextBase.startsWith("http://") && !nextBase.startsWith("https://")) {
+        hassBaseRejected = true;
+        nextBase = hassAssistBaseUrl;
+      }
+      String nextPipeline = settingsServer.arg("hassPipeline"); nextPipeline.trim();
+      reconnectHassAssist = nextEnabled != hassAssistEnabled || nextBase != hassAssistBaseUrl || nextPipeline != hassAssistPipeline;
+      hassAssistEnabled = nextEnabled;
+      hassAssistBaseUrl = nextBase;
+      hassAssistPipeline = nextPipeline;
+      hassAssistVolume = constrain(settingsServer.arg("hassVolume").toInt(), 5, 100);
+      if (settingsServer.hasArg("hassClearToken")) {
+        reconnectHassAssist |= hassAssistToken.length();
+        hassAssistToken = "";
+      } else if (settingsServer.arg("hassToken").length()) {
+        reconnectHassAssist = true;
+        hassAssistToken = settingsServer.arg("hassToken");
+        hassAssistToken.trim();
+      }
     } else if (pageId == "companion") {
       for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
         String nextHost = settingsServer.arg("compHost" + String(i));
@@ -4351,9 +4968,11 @@ void setupSettingsServer() {
       stopCompanion();
       clearCompanionPageData();
     }
+    if (reconnectHassAssist) stopHassAssist();
     saveSettings();
     String savedMessage = language == "zh" ? "本頁設定已儲存並套用。" : "This page was saved and applied.";
     if (emotionBaseRejected) savedMessage = language == "zh" ? "API 網址無效；必須以 https:// 開頭，原網址已保留。其餘設定已儲存。" : "Invalid API URL; HTTPS is required. The previous URL was kept, and other settings were saved.";
+    if (hassBaseRejected) savedMessage = language == "zh" ? "Home Assistant 網址無效；必須以 http:// 或 https:// 開頭，原網址已保留。其餘設定已儲存。" : "Invalid Home Assistant URL; it must begin with http:// or https://. The previous URL was kept, and other settings were saved.";
     if (deviceNameChanged) savedMessage = language == "zh" ? "設備名稱已儲存，設備即將重新連線以套用新的網路名稱。" : "Device name saved. The device is restarting Wi-Fi to apply its new network name.";
     sendSettingsPage(savedMessage, pageId, language);
     if (deviceNameChanged) {
@@ -4381,7 +5000,7 @@ void setupSettingsServer() {
 
 void setup() {
   auto cfg = M5.config();
-  cfg.internal_spk = true; cfg.internal_rtc = true; cfg.internal_imu = true;
+  cfg.internal_spk = true; cfg.internal_mic = true; cfg.internal_rtc = true; cfg.internal_imu = true;
   M5.begin(cfg);
   setCpuFrequencyMhz(160);
   Serial.begin(115200);
@@ -4429,6 +5048,7 @@ void loop() {
   handleTouch();
   handleSerialConfig();
   uint32_t nowMs = millis();
+  maintainHassAssist(nowMs);
   if (alarmActive >= 0 && screenNow == Screen::Clock && clockFace == ClockFace::Matrix
       && nowMs - lastAlarmChallengeDraw >= 65UL) {
     lastAlarmChallengeDraw = nowMs;
