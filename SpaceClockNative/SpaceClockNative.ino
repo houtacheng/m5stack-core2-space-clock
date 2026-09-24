@@ -2275,26 +2275,85 @@ String normalizeEmotionApiBase(String base) {
   return base;
 }
 
+String emotionApiHost(const String& base) {
+  int start = base.indexOf("://");
+  if (start < 0) return "";
+  start += 3;
+  int end = base.indexOf('/', start);
+  String authority = end < 0 ? base.substring(start) : base.substring(start, end);
+  if (authority.startsWith("[")) {
+    int close = authority.indexOf(']');
+    return close > 0 ? authority.substring(1, close) : "";
+  }
+  int colon = authority.indexOf(':');
+  if (colon >= 0) authority.remove(colon);
+  return authority;
+}
+
 bool emotionApiLogin(const String& identity, const String& password, String& message) {
   if (WiFi.status() != WL_CONNECTED) { message = "請先連接 Wi-Fi，再登入 API。"; return false; }
   String base = normalizeEmotionApiBase(emotionApiBase);
   if (!base.length()) { message = "API 網址必須使用 https://，請先儲存有效網址。"; return false; }
+
+  String host = emotionApiHost(base);
+  IPAddress resolvedAddress;
+  if (!host.length() || WiFi.hostByName(host.c_str(), resolvedAddress) != 1) {
+    message = "找不到 API 主機（DNS 解析失敗）：" + host + "。請確認設備 Wi-Fi 可連上網際網路及 DNS。";
+    return false;
+  }
+  if (time(nullptr) < 1700000000) {
+    syncTime();
+    if (time(nullptr) < 1700000000) {
+      message = "設備時間尚未同步，無法安全驗證 HTTPS 憑證。請確認網路可連外後重試。";
+      return false;
+    }
+  }
+
   DynamicJsonDocument requestDoc(512);
   requestDoc["identity"] = identity;
   requestDoc["password"] = password;
   String body; serializeJson(requestDoc, body);
   WiFiClientSecure secure;
   secure.setCACert(EMOTION_API_ROOT_CA);
+  secure.setHandshakeTimeout(15);
+  secure.setTimeout(15);
   HTTPClient http;
   http.setTimeout(12000);
   if (!http.begin(secure, base + "/api/collections/users/auth-with-password")) { message = "無法建立 HTTPS 連線。"; return false; }
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   String response = code > 0 ? http.getString() : "";
+  char tlsError[128] = {};
+  int tlsErrorCode = code < 0 ? secure.lastError(tlsError, sizeof(tlsError)) : 0;
+  uint32_t freeHeap = ESP.getFreeHeap();
   http.end(); secure.stop();
   body = "";
   if (code != 200) {
-    message = code < 0 ? "HTTPS／網路連線失敗（" + String(code) + "）。" : "登入失敗，請確認 API 帳號、密碼與伺服器網址（HTTP " + String(code) + "）。";
+    if (code < 0 && tlsErrorCode != 0) {
+      String detail = String(tlsError);
+      if (detail.indexOf("certificate verification failed") >= 0 || tlsErrorCode == -9984) {
+        message = "TLS 憑證驗證失敗；請確認設備日期時間正確，或伺服器憑證鏈是否完整。";
+      } else if (detail.indexOf("alloc") >= 0 || detail.indexOf("memory") >= 0) {
+        message = "TLS 記憶體不足，請先返回時鐘頁、重開設備後再試（可用 RAM " + String(freeHeap) + " bytes）。";
+      } else {
+        message = "TLS 握手失敗：" + detail + "（" + String(tlsErrorCode) + "；可用 RAM " + String(freeHeap) + " bytes）。";
+      }
+    } else if (code == -1) {
+      message = "DNS 已解析為 " + resolvedAddress.toString() + "，但 HTTPS 連線失敗（-1）。請確認網路允許連出 TCP 443；可用 RAM " + String(freeHeap) + " bytes。";
+    } else if (code < 0) {
+      message = "HTTPS 請求失敗（" + String(code) + "），資料未送出。";
+    } else {
+      DynamicJsonDocument errorDoc(512);
+      String serverMessage;
+      if (!deserializeJson(errorDoc, response) && errorDoc["message"].is<const char*>()) {
+        serverMessage = errorDoc["message"].as<String>();
+      }
+      if (code == 400 || code == 401) {
+        message = "API 拒絕登入（HTTP " + String(code) + "），請檢查 Email 與密碼。";
+      } else {
+        message = "API 回應 HTTP " + String(code) + (serverMessage.length() ? "：" + serverMessage : "。請確認 API 網址及服務狀態。");
+      }
+    }
     return false;
   }
   DynamicJsonDocument responseDoc(4096);
