@@ -64,6 +64,12 @@ int astronautX = 6, astronautY = 112;
 int astronautDX = 1, astronautDY = 1;
 uint32_t lastAlarmDragDraw = 0;
 bool satelliteTop = true;
+bool alarmGearDragging = false;
+float alarmGearProgress = 0.0f;
+float alarmGearLastAngle = 0.0f;
+bool alarmPillHolding = false;
+uint32_t alarmPillHoldStarted = 0;
+uint32_t lastAlarmChallengeDraw = 0;
 struct TimeZoneChoice { const char* city; const char* rule; };
 static constexpr TimeZoneChoice TIME_ZONES[] = {
   {"UTC", "UTC0"},
@@ -196,6 +202,7 @@ bool emotionSubmitArmed = false;
 bool emotionSubmitCompleted = false;
 String emotionSubmitMessage;
 String emotionLastSubmittedId;
+String emotionLastSubmittedPayload;
 m5::rtc_datetime_t emotionFormTime;
 bool emotionTriggers[8] = {};
 uint8_t emotionHeartRate = 4, emotionBreathRate = 4, emotionSweating = 0;
@@ -1219,8 +1226,153 @@ void drawClock(bool full = false) {
   }
 }
 
+void drawAlarmCanvasBottomBar(M5Canvas& canvas) {
+  canvas.fillRect(0, 214, 320, 26, TFT_BLACK);
+  canvas.drawFastHLine(0, 214, 320, 0x2945);
+  canvas.setFont(&SourceHanSansTC_UI8pt8b);
+  canvas.setTextSize(1);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  canvas.drawString("貪睡 5 分鐘", 160, 228);
+}
+
+void drawAlarmGear(M5Canvas& canvas, int cx, int cy, int rootRadius, int toothRadius,
+                   int teeth, float rotation, int hubRadius, bool knob) {
+  canvas.fillCircle(cx, cy, rootRadius - 2, 0x0841);
+  float step = PI / teeth;
+  int previousX = cx + lroundf(cosf(rotation) * toothRadius);
+  int previousY = cy + lroundf(sinf(rotation) * toothRadius);
+  for (int i = 1; i <= teeth * 2; ++i) {
+    float angle = rotation + step * i;
+    int radius = (i & 1) ? rootRadius : toothRadius;
+    int x = cx + lroundf(cosf(angle) * radius);
+    int y = cy + lroundf(sinf(angle) * radius);
+    canvas.drawLine(previousX, previousY, x, y, TFT_WHITE);
+    previousX = x; previousY = y;
+  }
+  canvas.fillCircle(cx, cy, hubRadius, 0xBDF7);
+  canvas.drawCircle(cx, cy, hubRadius, TFT_WHITE);
+  canvas.drawCircle(cx, cy, hubRadius - 1, 0x7BEF);
+  if (knob) {
+    float knobAngle = -2.15f + rotation;
+    int knobX = cx + lroundf(cosf(knobAngle) * (hubRadius - 11));
+    int knobY = cy + lroundf(sinf(knobAngle) * (hubRadius - 11));
+    canvas.fillCircle(knobX, knobY, 8, TFT_WHITE);
+    canvas.drawCircle(knobX, knobY, 9, 0xCE79);
+  }
+}
+
+void drawFlipAlarmChallenge() {
+  if (!matrixCanvasReady) {
+    M5.Display.fillScreen(TFT_BLACK);
+    useUIFont(1); M5.Display.setTextColor(TFT_WHITE, TFT_BLACK); M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString("按住白點，順時鐘轉一圈", 160, 110);
+    drawBottomBar("", "貪睡 5 分鐘", "");
+    return;
+  }
+  matrixCanvas.fillSprite(TFT_BLACK);
+  matrixCanvas.setFont(&SourceHanSansTC_UI8pt8b);
+  matrixCanvas.setTextSize(1);
+  matrixCanvas.setTextDatum(middle_center);
+  matrixCanvas.setTextColor(0xFBAE, TFT_BLACK);
+  matrixCanvas.drawString("按住白點，順時鐘轉一圈", 160, 13);
+
+  float rotation = alarmGearProgress;
+  drawAlarmGear(matrixCanvas, 88, 114, 54, 63, 18, rotation, 40, true);
+  drawAlarmGear(matrixCanvas, 232, 75, 43, 51, 16, -rotation * 1.20f, 31, false);
+  drawAlarmGear(matrixCanvas, 195, 165, 25, 31, 12, -rotation * 1.85f, 17, false);
+
+  uint16_t progressColor = 0x2E5F;
+  int progressSegments = constrain((int)(alarmGearProgress / (2.0f * PI) * 44.0f), 0, 44);
+  for (int i = 0; i < progressSegments; ++i) {
+    float a = -PI / 2.0f + i * (2.0f * PI / 44.0f);
+    int x1 = 88 + lroundf(cosf(a) * 68), y1 = 114 + lroundf(sinf(a) * 68);
+    int x2 = 88 + lroundf(cosf(a) * 72), y2 = 114 + lroundf(sinf(a) * 72);
+    matrixCanvas.drawLine(x1, y1, x2, y2, progressColor);
+  }
+  drawAlarmCanvasBottomBar(matrixCanvas);
+  matrixCanvas.pushSprite(0, 0);
+}
+
+void drawMatrixAlarmChallenge(uint32_t nowMs) {
+  if (!matrixCanvasReady) {
+    M5.Display.fillScreen(TFT_BLACK);
+    useUIFont(1); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK); M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString("長按藍色藥丸直到消失", 160, 110);
+    drawBottomBar("", "貪睡 5 分鐘", "");
+    return;
+  }
+  matrixCanvas.fillSprite(TFT_BLACK);
+  matrixCanvas.setFont(&SourceHanSansTC_UI8pt8b);
+  matrixCanvas.setTextSize(1);
+  matrixCanvas.setTextDatum(middle_center);
+  const int rainTick = nowMs / 95UL;
+  for (int column = 0; column < 20; ++column) {
+    int x = 6 + column * 16;
+    int head = ((rainTick * (1 + column % 3) + column * 29) % 280) - 28;
+    for (int tail = 0; tail < 6; ++tail) {
+      int y = head - tail * 14;
+      if (y < 0 || y >= 214) continue;
+      uint8_t strength = max(8, 65 - tail * 10);
+      matrixCanvas.setTextColor(matrixColor(strength), TFT_BLACK);
+      int glyph = (column * 13 + rainTick + tail * 7) % MATRIX_GLYPH_COUNT;
+      matrixCanvas.drawString(MATRIX_GLYPH_SET[glyph], x, y);
+    }
+  }
+  matrixCanvas.fillRoundRect(30, 9, 260, 25, 8, TFT_BLACK);
+  matrixCanvas.drawRoundRect(30, 9, 260, 25, 8, matrixColor(45));
+  matrixCanvas.setTextColor(matrixColor(100), TFT_BLACK);
+  matrixCanvas.drawString("長按藍色藥丸直到消失", 160, 22);
+
+  float progress = alarmPillHolding
+    ? constrain((nowMs - alarmPillHoldStarted) / 2400.0f, 0.0f, 1.0f) : 0.0f;
+  int pillWidth = max<int>(0, (int)lroundf(112.0f * (1.0f - progress)));
+  int pillHeight = max<int>(0, (int)lroundf(46.0f * (1.0f - progress * 0.72f)));
+  if (pillWidth > 4 && pillHeight > 4) {
+    int x = 160 - pillWidth / 2, y = 121 - pillHeight / 2;
+    uint8_t blue = max(15, 255 - (int)(progress * 170.0f));
+    uint16_t pillColor = M5.Display.color565(0, blue / 2, blue);
+    uint16_t glowColor = M5.Display.color565(0, blue / 4, blue / 2);
+    matrixCanvas.drawRoundRect(x - 4, y - 4, pillWidth + 8, pillHeight + 8, pillHeight / 2 + 4, glowColor);
+    matrixCanvas.fillRoundRect(x, y, pillWidth, pillHeight, pillHeight / 2, pillColor);
+    matrixCanvas.drawRoundRect(x, y, pillWidth, pillHeight, pillHeight / 2, TFT_CYAN);
+    if (pillWidth > 26) matrixCanvas.drawFastVLine(160, y + 3, pillHeight - 6, 0xBFFF);
+    int shineWidth = max(2, pillWidth / 3);
+    matrixCanvas.drawFastHLine(x + pillWidth / 6, y + max(2, pillHeight / 4), shineWidth, 0xBFFF);
+  }
+  if (progress > 0.25f) {
+    for (int i = 0; i < 12; ++i) {
+      float a = i * (2.0f * PI / 12.0f) + progress * 2.0f;
+      int radius = 36 + lroundf(progress * 38.0f) + (i % 3) * 4;
+      int px = 160 + lroundf(cosf(a) * radius);
+      int py = 121 + lroundf(sinf(a) * radius * 0.45f);
+      matrixCanvas.fillCircle(px, py, progress > 0.75f ? 1 : 2, i & 1 ? TFT_CYAN : 0x04FF);
+    }
+  }
+  matrixCanvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  matrixCanvas.drawString(alarmPillHolding ? String(lroundf(progress * 100.0f)) + "%" : "按住藥丸", 160, 181);
+  drawAlarmCanvasBottomBar(matrixCanvas);
+  matrixCanvas.pushSprite(0, 0);
+}
+
+void resetAlarmChallengeState() {
+  astronautDragging = false;
+  alarmGearDragging = false;
+  alarmGearProgress = 0.0f;
+  alarmGearLastAngle = 0.0f;
+  alarmPillHolding = false;
+  alarmPillHoldStarted = 0;
+  lastAlarmChallengeDraw = 0;
+}
+
+void drawAlarmChallenge() {
+  if (clockFace == ClockFace::Space) drawAstronaut();
+  else if (clockFace == ClockFace::Minimal) drawFlipAlarmChallenge();
+  else drawMatrixAlarmChallenge(millis());
+}
+
 void drawAstronaut() {
-  if (alarmActive >= 0) {
+  if (alarmActive >= 0 && clockFace == ClockFace::Space) {
     M5.Display.fillRect(0, 0, 320, 215, BG);
     int sx = 0, sy = satelliteTop ? 0 : 143;
     const Asset& sat = satelliteAssets[satelliteTop ? 0 : 1];
@@ -1228,8 +1380,8 @@ void drawAstronaut() {
     M5.Display.drawPng(cosmonaut_1_png, cosmonaut_1_png_len, astronautX, astronautY);
     M5.Display.setTextColor(TFT_RED, BG);
     useUIFont(1);
-    M5.Display.drawCentreString("Drag astronaut to satellite to dismiss", 160, 196, 1);
-    drawBottomBar("", "Snooze 5m", "");
+    M5.Display.drawCentreString("拖曳太空人到太空艙以關閉鬧鐘", 160, 196, 1);
+    drawBottomBar("", "貪睡 5 分鐘", "");
   } else if (clockFace == ClockFace::Space) {
     // Compose the complete moving region off-screen, then transfer it in one
     // operation. This removes the visible clear/draw flash seen in the video.
@@ -2101,7 +2253,7 @@ void dismissAlarm() {
   alarms[alarmActive].lastDay = now.date.year * 512 + now.date.month * 32 + now.date.date;
   if (!alarms[alarmActive].weekdays) alarms[alarmActive].enabled = false;
   alarmActive = -1;
-  astronautDragging = false;
+  resetAlarmChallengeState();
   M5.Speaker.stop();
   astronautX = 6; astronautY = 105;
   astronautDX = 1; astronautDY = 1;
@@ -2168,9 +2320,9 @@ void startAlarm(int index) {
   screenNow = Screen::Clock;
   satelliteTop = esp_random() & 1;
   astronautX = 260; astronautY = 100;
-  astronautDragging = false;
+  resetAlarmChallengeState();
   playSoundChoice(alarmSound, alarmVolume, UINT32_MAX);
-  drawAstronaut();
+  drawAlarmChallenge();
 }
 
 void snoozeAlarm() {
@@ -2180,7 +2332,7 @@ void snoozeAlarm() {
   snoozedAlarm = alarmActive;
   snoozeStarted = millis();
   alarmActive = -1;
-  astronautDragging = false;
+  resetAlarmChallengeState();
   M5.Speaker.stop();
   astronautX = 6; astronautY = 105;
   saveSettings();
@@ -2472,6 +2624,7 @@ void showEmotionObservation(bool newEntry = false) {
     emotionSubmitCompleted = false;
     emotionSubmitMessage = "";
     emotionLastSubmittedId = "";
+    emotionLastSubmittedPayload = "";
     for (uint8_t page = 0; page < 7; ++page) resetEmotionPage(page);
   }
   drawEmotionObservation();
@@ -2749,6 +2902,7 @@ bool submitEmotionObservation() {
     emotionLastSubmittedId = "";
     if (!deserializeJson(reply, response) && reply["id"].is<const char*>()) {
       emotionLastSubmittedId = reply["id"].as<String>();
+      emotionLastSubmittedPayload = body;
       emotionSubmitMessage = "已成功送出，可按左鍵撤回。";
     }
     drawEmotionObservation();
@@ -2775,27 +2929,46 @@ bool withdrawEmotionObservation() {
   }
   emotionSubmitMessage = "正在撤回…";
   drawEmotionObservation();
+  DynamicJsonDocument withdrawDoc(6144);
+  if (!emotionLastSubmittedPayload.length() || deserializeJson(withdrawDoc, emotionLastSubmittedPayload)) {
+    emotionSubmitMessage = "找不到原始紀錄內容，無法安全撤回。";
+    drawEmotionObservation();
+    return false;
+  }
+  time_t now = time(nullptr); struct tm utcNow;
+  if (now < 1700000000 || !gmtime_r(&now, &utcNow)) {
+    emotionSubmitMessage = "設備時間尚未同步，暫時無法撤回。";
+    drawEmotionObservation();
+    return false;
+  }
+  char updatedAt[32]; strftime(updatedAt, sizeof(updatedAt), "%Y-%m-%dT%H:%M:%S.000Z", &utcNow);
+  withdrawDoc["deleted"] = true;
+  withdrawDoc["client_updated_at"] = updatedAt;
+  String withdrawBody; serializeJson(withdrawDoc, withdrawBody);
   String base = normalizeEmotionApiBase(emotionApiBase);
   String endpoint = base + "/api/collections/entries/records/" + emotionLastSubmittedId;
   WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
   HTTPClient http; http.setTimeout(15000);
   int code = -1;
   if (base.length() && http.begin(secure, endpoint)) {
+    http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", "Bearer " + emotionApiToken);
-    code = http.sendRequest("DELETE");
+    code = http.sendRequest("PATCH", withdrawBody);
     http.end(); secure.stop();
   }
   if (code == 401 && refreshEmotionApiToken()) {
     WiFiClientSecure retrySecure; retrySecure.setCACert(EMOTION_API_ROOT_CA);
     HTTPClient retry; retry.setTimeout(15000);
     if (retry.begin(retrySecure, endpoint)) {
+      retry.addHeader("Content-Type", "application/json");
       retry.addHeader("Authorization", "Bearer " + emotionApiToken);
-      code = retry.sendRequest("DELETE");
+      code = retry.sendRequest("PATCH", withdrawBody);
       retry.end(); retrySecure.stop();
     }
   }
   if (code == 200 || code == 204) {
     emotionLastSubmittedId = "";
+    emotionLastSubmittedPayload = "";
     emotionSubmitCompleted = false;
     emotionSubmitArmed = false;
     emotionSubmitMessage = "已撤回，可修改後重新送出。";
@@ -3060,26 +3233,70 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
 void handleClockTouch(const m5::touch_detail_t& t) {
   if (alarmActive >= 0) {
     if (t.wasReleased() && t.y >= 215 && t.x >= 107 && t.x < 214) { snoozeAlarm(); return; }
-    if (t.wasPressed() && t.x >= astronautX - 8 && t.x <= astronautX + 52 && t.y >= astronautY - 8 && t.y <= astronautY + 52) {
-      astronautDragging = true;
-      lastAlarmDragDraw = 0;
-    }
-    if (astronautDragging && t.isPressed()) {
-      int nextX = constrain(t.x - 21, 2, 276), nextY = constrain(t.y - 21, 2, 195);
-      // PNG decoding the full alarm scene on every touch sample starves the
-      // touch controller. Limit visual repainting to a smooth 25 fps while
-      // keeping the final hit-test at the user's latest finger position.
-      bool moved = abs(nextX - astronautX) >= 3 || abs(nextY - astronautY) >= 3;
-      astronautX = nextX; astronautY = nextY;
-      if (moved && millis() - lastAlarmDragDraw >= 40UL) {
-        lastAlarmDragDraw = millis();
-        drawAstronaut();
+    if (clockFace == ClockFace::Space) {
+      if (t.wasPressed() && t.x >= astronautX - 8 && t.x <= astronautX + 52 && t.y >= astronautY - 8 && t.y <= astronautY + 52) {
+        astronautDragging = true;
+        lastAlarmDragDraw = 0;
       }
-    }
-    if (astronautDragging && t.wasReleased()) {
-      astronautDragging = false;
-      drawAstronaut();
-      if (astronautX < 55 && ((satelliteTop && astronautY < 65) || (!satelliteTop && astronautY > 135))) dismissAlarm();
+      if (astronautDragging && t.isPressed()) {
+        int nextX = constrain(t.x - 21, 2, 276), nextY = constrain(t.y - 21, 2, 195);
+        // PNG decoding the full alarm scene on every touch sample starves the
+        // touch controller. Limit visual repainting to a smooth 25 fps while
+        // keeping the final hit-test at the user's latest finger position.
+        bool moved = abs(nextX - astronautX) >= 3 || abs(nextY - astronautY) >= 3;
+        astronautX = nextX; astronautY = nextY;
+        if (moved && millis() - lastAlarmDragDraw >= 40UL) {
+          lastAlarmDragDraw = millis();
+          drawAstronaut();
+        }
+      }
+      if (astronautDragging && t.wasReleased()) {
+        astronautDragging = false;
+        drawAstronaut();
+        if (astronautX < 55 && ((satelliteTop && astronautY < 65) || (!satelliteTop && astronautY > 135))) dismissAlarm();
+      }
+    } else if (clockFace == ClockFace::Minimal) {
+      float knobAngle = -2.15f + alarmGearProgress;
+      int knobX = 88 + lroundf(cosf(knobAngle) * 29.0f);
+      int knobY = 114 + lroundf(sinf(knobAngle) * 29.0f);
+      if (t.wasPressed() && sq((int)t.x - knobX) + sq((int)t.y - knobY) <= 20 * 20) {
+        alarmGearDragging = true;
+        alarmGearLastAngle = atan2f((float)t.y - 114.0f, (float)t.x - 88.0f);
+      }
+      if (alarmGearDragging && t.isPressed()) {
+        int dx = (int)t.x - 88, dy = (int)t.y - 114;
+        int radiusSquared = dx * dx + dy * dy;
+        if (radiusSquared >= 18 * 18 && radiusSquared <= 86 * 86) {
+          float angle = atan2f((float)dy, (float)dx);
+          float delta = angle - alarmGearLastAngle;
+          while (delta > PI) delta -= 2.0f * PI;
+          while (delta < -PI) delta += 2.0f * PI;
+          alarmGearLastAngle = angle;
+          if (delta > 0.0f && delta < 0.8f) {
+            alarmGearProgress = min<float>(6.2831853f, alarmGearProgress + delta);
+            if (millis() - lastAlarmChallengeDraw >= 28UL) {
+              lastAlarmChallengeDraw = millis();
+              drawFlipAlarmChallenge();
+            }
+            if (alarmGearProgress >= 6.2631853f) {
+              haptic(45);
+              dismissAlarm();
+            }
+          }
+        }
+      }
+      if (t.wasReleased()) alarmGearDragging = false;
+    } else {
+      if (t.wasPressed() && t.x >= 100 && t.x <= 220 && t.y >= 90 && t.y <= 151) {
+        alarmPillHolding = true;
+        alarmPillHoldStarted = millis();
+        lastAlarmChallengeDraw = 0;
+      }
+      if (alarmPillHolding && t.wasReleased()) {
+        alarmPillHolding = false;
+        alarmPillHoldStarted = 0;
+        drawMatrixAlarmChallenge(millis());
+      }
     }
     return;
   }
@@ -4208,6 +4425,15 @@ void loop() {
   handleTouch();
   handleSerialConfig();
   uint32_t nowMs = millis();
+  if (alarmActive >= 0 && screenNow == Screen::Clock && clockFace == ClockFace::Matrix
+      && nowMs - lastAlarmChallengeDraw >= 65UL) {
+    lastAlarmChallengeDraw = nowMs;
+    drawMatrixAlarmChallenge(nowMs);
+    if (alarmPillHolding && nowMs - alarmPillHoldStarted >= 2400UL) {
+      haptic(45);
+      dismissAlarm();
+    }
+  }
   maintainSavedWifi(nowMs);
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionSettings) {
     bool redrawConnection = false;

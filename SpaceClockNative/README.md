@@ -3,6 +3,12 @@
 Fast native C++ firmware for the M5Stack Core2, with original artwork and a
 touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 
+Version 2.9.10 changes emotion-entry withdrawal to the PocketBase-compatible
+soft-delete flow (`PATCH` with `deleted: true`), matching the journal API rules.
+It also gives each clock face its own animated alarm-dismissal challenge: drag
+the astronaut on Space, rotate the large gear clockwise once on Flip, or hold
+the blue pill until it dissolves on Matrix. Snooze remains available.
+
 ## Main features
 
 - Original animated space clock and large split-flap clock face
