@@ -37,7 +37,7 @@
 #endif
 #include "mqtt_guide.h"
 
-enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About };
+enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
 
@@ -248,6 +248,16 @@ bool emotionSubmitCompleted = false;
 String emotionSubmitMessage;
 String emotionLastSubmittedId;
 String emotionLastSubmittedPayload;
+enum class EmotionRecordsState : uint8_t { Loading, Ready, Error };
+EmotionRecordsState emotionRecordsState = EmotionRecordsState::Loading;
+uint16_t emotionRecordsLearningDays = 0;
+uint32_t emotionRecordsSheetCount = 0;
+String emotionRecordsAverage = "0.0";
+String emotionRecordsTopBody = "-";
+String emotionRecordsTopEmotion = "-";
+String emotionRecordsStrongest = "-";
+String emotionRecordsTopGrounding = "-";
+String emotionRecordsError;
 m5::rtc_datetime_t emotionFormTime;
 bool emotionTriggers[8] = {};
 uint8_t emotionHeartRate = 4, emotionBreathRate = 4, emotionSweating = 0;
@@ -2995,6 +3005,62 @@ void drawEmotionChoicePanel(int y, const char* label, const String& value, uint1
   M5.Display.clearClipRect();
 }
 
+void drawEmotionRecordsRow(int y, const char* label, const String& value) {
+  uint16_t fill = emotionPanel((y / 23 & 1) ? 10 : 14);
+  M5.Display.fillRoundRect(8, y, 304, 21, 5, fill);
+  M5.Display.drawRoundRect(8, y, 304, 21, 5, emotionTheme(30));
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.setTextColor(emotionTheme(72), fill);
+  M5.Display.drawString(label, 15, y + 11);
+  M5.Display.setClipRect(136, y + 1, 168, 19);
+  M5.Display.setTextDatum(middle_right);
+  M5.Display.setTextColor(TFT_WHITE, fill);
+  M5.Display.drawString(value, 303, y + 11);
+  M5.Display.clearClipRect();
+}
+
+void drawEmotionRecords() {
+  if (screenNow != Screen::EmotionRecords) return;
+  drawEmotionMatrixBackground();
+  drawEmotionConnectionIndicator();
+  useUIFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(emotionTheme(100), TFT_BLACK);
+  M5.Display.drawString("我的紀錄", 20, 5);
+
+  if (emotionRecordsState == EmotionRecordsState::Loading) {
+    useUIMediumFont();
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString("讀取統計中…", 160, 101);
+    useUIFont(1);
+    M5.Display.setTextColor(emotionTheme(62), TFT_BLACK);
+    M5.Display.drawString("正在同步資料庫紀錄", 160, 139);
+  } else if (emotionRecordsState == EmotionRecordsState::Error) {
+    M5.Display.fillRoundRect(14, 55, 292, 114, 12, emotionPanel(12));
+    M5.Display.drawRoundRect(14, 55, 292, 114, 12, TFT_RED);
+    useUIMediumFont();
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(TFT_WHITE, emotionPanel(12));
+    M5.Display.drawString("無法讀取紀錄", 160, 88);
+    useUIFont(1);
+    M5.Display.setTextColor(0xF986, emotionPanel(12));
+    M5.Display.setClipRect(24, 111, 272, 45);
+    M5.Display.drawString(emotionRecordsError, 160, 132);
+    M5.Display.clearClipRect();
+  } else {
+    drawEmotionRecordsRow(38,  "學習天數", String(emotionRecordsLearningDays) + " 天");
+    drawEmotionRecordsRow(62,  "填寫張數", String(emotionRecordsSheetCount) + " 張");
+    drawEmotionRecordsRow(86,  "平均一天", emotionRecordsAverage + " 張");
+    drawEmotionRecordsRow(110, "最常身體反應", emotionRecordsTopBody);
+    drawEmotionRecordsRow(134, "最常出現情緒", emotionRecordsTopEmotion);
+    drawEmotionRecordsRow(158, "最強烈的情緒", emotionRecordsStrongest);
+    drawEmotionRecordsRow(182, "最常情緒落地", emotionRecordsTopGrounding);
+  }
+  drawEmotionBottomBar("重新整理", "", "返回");
+}
+
 void drawEmotionObservation() {
   if (screenNow != Screen::EmotionObservation) return;
   drawEmotionMatrixBackground();
@@ -3018,7 +3084,7 @@ void drawEmotionObservation() {
     M5.Display.drawString(WiFi.status() != WL_CONNECTED ? "請先連接 Wi-Fi" : "請先從網頁設定登入 API", 160, 126);
     M5.Display.setTextColor(emotionTheme(55), panel);
     M5.Display.drawString("連線成功後才可開始填寫", 160, 156);
-    drawEmotionBottomBar("", "", "取消");
+    drawEmotionBottomBar(emotionFormPage == 0 ? "我的紀錄" : "", "", "取消");
     return;
   }
 
@@ -3120,7 +3186,7 @@ void drawEmotionObservation() {
       (emotionSubmitArmed ? "請再次確認送出；左鍵可取消" : "檢查內容後按中鍵送出");
     M5.Display.drawString(prompt, 13, 184);
   }
-  if (emotionFormPage == 0) drawEmotionBottomBar("", "下一頁", "取消");
+  if (emotionFormPage == 0) drawEmotionBottomBar("我的紀錄", "下一頁", "取消");
   else if (emotionFormPage < 7) drawEmotionBottomBar("上一頁", "下一頁", "取消");
   else if (emotionSubmitCompleted) drawEmotionBottomBar("撤回", "已送出", "取消");
   else if (emotionSubmitArmed) drawEmotionBottomBar("取消送出", "確認送出", "取消");
@@ -3380,10 +3446,129 @@ bool verifyEmotionApiConnection(bool force) {
   }
   emotionApiState = EmotionApiState::Checking;
   if (screenNow == Screen::EmotionObservation) drawEmotionObservation();
+  else if (screenNow == Screen::EmotionRecords) drawEmotionRecords();
   bool connected = refreshEmotionApiToken();
   emotionApiState = connected ? EmotionApiState::Connected : EmotionApiState::Disconnected;
   emotionApiLastChecked = millis();
   return connected;
+}
+
+int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
+  String base = normalizeEmotionApiBase(emotionApiBase);
+  if (!base.length()) return -10001;
+
+  WiFiClientSecure secure;
+  secure.setCACert(EMOTION_API_ROOT_CA);
+  HTTPClient http;
+  http.setTimeout(15000);
+  if (!http.begin(secure, base + "/api/statistics?period=all&includeDeleted=false")) return -10001;
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Authorization", "Bearer " + emotionApiToken);
+  int code = http.GET();
+  if (code == 200) {
+    // The statistics endpoint also returns charts and daily history. Filter the
+    // response while streaming so the Core2 only retains the seven summary
+    // values used by this screen.
+    DynamicJsonDocument filter(768);
+    JsonObject data = filter.createNestedObject("data");
+    data["count"] = true;
+    data["days"] = true;
+    data["mostCommonEmotion"]["name"] = true;
+    data["bodySignals"]["mostCommon"]["name"] = true;
+    data["strongestEmotion"]["emotion"] = true;
+    data["strongestEmotion"]["index"] = true;
+    data["grounding"]["mostUsed"]["name"] = true;
+    DeserializationError parseError = deserializeJson(
+      result, http.getStream(), DeserializationOption::Filter(filter));
+    if (parseError) {
+      errorBody = parseError.c_str();
+      code = -10002;
+    }
+  } else if (code > 0) {
+    errorBody = http.getString();
+  }
+  http.end();
+  secure.stop();
+  return code;
+}
+
+bool loadEmotionRecordStats() {
+  emotionRecordsState = EmotionRecordsState::Loading;
+  emotionRecordsError = "";
+  if (WiFi.status() != WL_CONNECTED) {
+    emotionRecordsError = "目前沒有 Wi-Fi 連線";
+    emotionRecordsState = EmotionRecordsState::Error;
+    return false;
+  }
+  if (!emotionApiToken.length() || !emotionApiUserId.length()) {
+    emotionRecordsError = "請先從網頁登入情緒觀察 API";
+    emotionRecordsState = EmotionRecordsState::Error;
+    return false;
+  }
+  if (!emotionApiConnected() && !verifyEmotionApiConnection(true)) {
+    emotionRecordsError = "資料庫未連線，請重新登入";
+    emotionRecordsState = EmotionRecordsState::Error;
+    return false;
+  }
+
+  DynamicJsonDocument stats(3072);
+  String errorBody;
+  int code = fetchEmotionStatistics(stats, errorBody);
+  if (code == 401 && refreshEmotionApiToken()) {
+    stats.clear();
+    errorBody = "";
+    code = fetchEmotionStatistics(stats, errorBody);
+  }
+  if (code != 200) {
+    if (code == 401) emotionRecordsError = "登入已過期，請從網頁重新登入";
+    else if (code == -10002) emotionRecordsError = "統計資料格式解析失敗";
+    else if (code < 0) emotionRecordsError = "HTTPS／網路連線失敗";
+    else emotionRecordsError = "統計 API 回應 HTTP " + String(code);
+    emotionRecordsState = EmotionRecordsState::Error;
+    if (code == 401) emotionApiState = EmotionApiState::Disconnected;
+    return false;
+  }
+
+  JsonObject data = stats["data"].as<JsonObject>();
+  if (data.isNull()) {
+    emotionRecordsError = "統計 API 缺少 data 欄位";
+    emotionRecordsState = EmotionRecordsState::Error;
+    return false;
+  }
+  emotionRecordsSheetCount = data["count"] | 0UL;
+  emotionRecordsLearningDays = data["days"] | 0;
+  char average[16];
+  snprintf(average, sizeof(average), "%.1f",
+    emotionRecordsLearningDays ? (double)emotionRecordsSheetCount / emotionRecordsLearningDays : 0.0);
+  emotionRecordsAverage = average;
+
+  const char* topBody = data["bodySignals"]["mostCommon"]["name"] | "-";
+  const char* topEmotion = data["mostCommonEmotion"]["name"] | "-";
+  const char* strongest = data["strongestEmotion"]["emotion"] | "-";
+  const char* topGrounding = data["grounding"]["mostUsed"]["name"] | "-";
+  emotionRecordsTopBody = topBody && topBody[0] ? topBody : "-";
+  emotionRecordsTopEmotion = topEmotion && topEmotion[0] ? topEmotion : "-";
+  emotionRecordsTopGrounding = topGrounding && topGrounding[0] ? topGrounding : "-";
+  emotionRecordsStrongest = strongest && strongest[0] ? strongest : "-";
+  int strongestIndex = data["strongestEmotion"]["index"] | -1;
+  if (emotionRecordsStrongest != "-" && strongestIndex >= 0) {
+    emotionRecordsStrongest += " " + String(strongestIndex) + "%";
+  }
+
+  emotionApiState = EmotionApiState::Connected;
+  emotionApiLastChecked = millis();
+  emotionRecordsState = EmotionRecordsState::Ready;
+  return true;
+}
+
+void showEmotionRecords(bool refresh = true) {
+  screenNow = Screen::EmotionRecords;
+  if (refresh) emotionRecordsState = EmotionRecordsState::Loading;
+  drawEmotionRecords();
+  if (refresh) {
+    loadEmotionRecordStats();
+    drawEmotionRecords();
+  }
 }
 
 bool submitEmotionObservation() {
@@ -3619,6 +3804,15 @@ void checkEmotionReminder(uint32_t nowMs, const m5::rtc_datetime_t& dt) {
 }
 
 void handleEmotionTouch(const m5::touch_detail_t& t) {
+  if (screenNow == Screen::EmotionRecords) {
+    if (!t.wasReleased()) return;
+    if (t.y >= 210) {
+      haptic(12);
+      if (t.x < 107) showEmotionRecords(true);
+      else if (t.x >= 214) showEmotionObservation(false);
+    }
+    return;
+  }
   if (screenNow == Screen::EmotionReminder) {
     if (!t.wasReleased()) return;
     haptic(12);
@@ -3706,6 +3900,8 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
       withdrawEmotionObservation();
     } else if (t.x < 107 && emotionFormPage == 7 && emotionSubmitArmed) {
       emotionSubmitArmed = false; emotionSubmitMessage = ""; drawEmotionObservation();
+    } else if (t.x < 107 && emotionFormPage == 0) {
+      showEmotionRecords(true);
     } else if (!emotionApiConnected()) {
       return;
     } else if (t.x < 107 && emotionFormPage > 0) {
@@ -3931,7 +4127,7 @@ void handleTouch() {
   }
   if (!flatVirtualButtonsEnabled && t.y >= 210 && (t.wasPressed() || t.isPressed() || t.wasReleased()) && deviceIsFlat()) return;
   if (t.wasPressed() || t.isPressed() || t.wasReleased()) lastUserActivity = millis();
-  if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionSettings || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
+  if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
   if (screenNow == Screen::HassAssist) {
     if (t.wasPressed() && t.y < 210 && sq((int)t.x - 160) + sq((int)t.y - 117) <= 60 * 60) {
       hassAssistTouchActive = true;
@@ -5059,7 +5255,7 @@ void loop() {
     }
   }
   maintainSavedWifi(nowMs);
-  if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionSettings) {
+  if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings) {
     bool redrawConnection = false;
     if (WiFi.status() != WL_CONNECTED && emotionApiState != EmotionApiState::Disconnected) {
       emotionApiState = EmotionApiState::Disconnected;
@@ -5075,6 +5271,7 @@ void loop() {
     }
     if (redrawConnection) {
       if (screenNow == Screen::EmotionObservation) drawEmotionObservation();
+      else if (screenNow == Screen::EmotionRecords) drawEmotionRecords();
       else showEmotionSettings();
     }
   }

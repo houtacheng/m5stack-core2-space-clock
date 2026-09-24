@@ -3,6 +3,11 @@
 Fast native C++ firmware for the M5Stack Core2, with original artwork and a
 touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 
+Version 2.9.14 adds a **My Records** button to emotion observation Page 1 and a
+Matrix-styled database statistics screen. The device reads the authenticated
+`/api/statistics` endpoint for the full history while excluding deleted records,
+with token refresh and explicit offline/login error states.
+
 Version 2.9.13 adds push-to-talk Home Assistant Assist through the Core2
 microphone and speaker. It also regenerates the Page 4 Traditional Chinese
 font at a consistent size and separates its navigation arrows from the value,

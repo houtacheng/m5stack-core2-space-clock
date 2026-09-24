@@ -2,7 +2,11 @@
 
 Native firmware that turns an M5Stack Core2 into a smooth animated clock,
 20-alarm clock, meditation timer, emotion-observation logger, MQTT device and
-four-page Bitfocus Companion Satellite control panel. Version 2.9.13 adds a
+four-page Bitfocus Companion Satellite control panel. Version 2.9.14 adds a
+database-backed **My Records** page to emotion observation Page 1. It reads the
+authenticated `/api/statistics` summary for all non-deleted records and shows
+learning days, entry count, daily average, most common body response and
+emotion, strongest emotion, and most-used grounding method. Version 2.9.13 adds a
 push-to-talk Home Assistant Assist terminal using the Core2 microphone and
 speaker, and rebuilds the medium Traditional Chinese font at one consistent
 size so the Page 4 emotion/category selector no longer mixes glyph sizes or

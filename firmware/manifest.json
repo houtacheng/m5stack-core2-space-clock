@@ -1,7 +1,7 @@
 {
-  "version": "2.9.13",
+  "version": "2.9.14",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "8825ba75374c8395cc8210ead0c02984368e4a1ef6fbef1edaddda98ec3b7d00",
-  "size": 5402160,
-  "notes": "Adds push-to-talk Home Assistant Assist through the Core2 microphone and speaker, configured from a new bilingual HASS Assist settings page. Emotion observation Page 4 now uses a single consistent Source Han Sans TC size and fixed selector layout for every category and emotion value. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "5426f303ee87ae2b77769ee907d8a1b6ee6e2da09f7445d209dc04983da123dd",
+  "size": 5411888,
+  "notes": "Adds a Matrix-styled My Records page to emotion observation Page 1. It reads the authenticated /api/statistics endpoint for all non-deleted records and displays learning days, entry count, daily average, common body response and emotion, strongest emotion, and most-used grounding method. Includes token refresh, retry, and clear offline/login errors. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }
