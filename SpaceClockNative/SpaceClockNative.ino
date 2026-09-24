@@ -920,13 +920,27 @@ void drawClockNavigationIcon(int cx, int cy) {
   M5.Display.fillCircle(cx, cy, 2, ACCENT);
 }
 
+void drawPairedGearNavigationIcon(int cx, int cy, uint16_t color) {
+  M5.Display.drawCircle(cx, cy, 6, color);
+  M5.Display.fillCircle(cx, cy, 2, color);
+  for (int i = 0; i < 8; ++i) {
+    float a = i * PI / 4.0f;
+    int x1 = cx + lroundf(cosf(a) * 6), y1 = cy + lroundf(sinf(a) * 6);
+    int x2 = cx + lroundf(cosf(a) * 8), y2 = cy + lroundf(sinf(a) * 8);
+    M5.Display.drawLine(x1, y1, x2, y2, color);
+  }
+}
+
 void drawClockNavigationIcons() {
   if (clockFace != ClockFace::Matrix) M5.Display.fillRect(0, 215, 320, 25, BG);
-  // Both supplied bitmaps are normalized to a 24 × 24 visible canvas.
-  M5.Display.drawPng(nav_companion_png, nav_companion_png_len, 41, 215);
-  M5.Display.drawPng(nav_meditation_png, nav_meditation_png_len, 148, 215);
-  // Vector icons remain crisp at this small size and match the 22 px visual weight.
-  drawGearNavigationIcon(267, 227);
+  // Each virtual button shows short press / long press actions from left to
+  // right: Companion / Emotion, Meditation / HASS, Settings / Night light.
+  M5.Display.drawPng(nav_companion_png, nav_companion_png_len, 29, 218);
+  M5.Display.drawPng(nav_emotion_png, nav_emotion_png_len, 57, 218);
+  M5.Display.drawPng(nav_meditation_png, nav_meditation_png_len, 136, 218);
+  M5.Display.drawPng(nav_hass_png, nav_hass_png_len, 164, 218);
+  drawPairedGearNavigationIcon(253, 228, ACCENT);
+  M5.Display.drawPng(nav_nightlight_png, nav_nightlight_png_len, 271, 218);
 }
 
 void resetMatrixRain() {
@@ -1079,10 +1093,25 @@ void drawMatrixGearNavigationIcon(M5Canvas& canvas, int cx, int cy) {
   }
 }
 
+void drawMatrixPairedGearNavigationIcon(M5Canvas& canvas, int cx, int cy) {
+  uint16_t theme = matrixColor(100);
+  canvas.drawCircle(cx, cy, 6, theme);
+  canvas.fillCircle(cx, cy, 2, theme);
+  for (int i = 0; i < 8; ++i) {
+    float a = i * PI / 4.0f;
+    int x1 = cx + lroundf(cosf(a) * 6), y1 = cy + lroundf(sinf(a) * 6);
+    int x2 = cx + lroundf(cosf(a) * 8), y2 = cy + lroundf(sinf(a) * 8);
+    canvas.drawLine(x1, y1, x2, y2, theme);
+  }
+}
+
 void drawMatrixNavigationIcons(M5Canvas& canvas) {
-  canvas.drawPng(nav_companion_png, nav_companion_png_len, 41, 215);
-  canvas.drawPng(nav_meditation_png, nav_meditation_png_len, 148, 215);
-  drawMatrixGearNavigationIcon(canvas, 267, 227);
+  canvas.drawPng(nav_companion_png, nav_companion_png_len, 29, 218);
+  canvas.drawPng(nav_emotion_png, nav_emotion_png_len, 57, 218);
+  canvas.drawPng(nav_meditation_png, nav_meditation_png_len, 136, 218);
+  canvas.drawPng(nav_hass_png, nav_hass_png_len, 164, 218);
+  drawMatrixPairedGearNavigationIcon(canvas, 253, 228);
+  canvas.drawPng(nav_nightlight_png, nav_nightlight_png_len, 271, 218);
 }
 
 void drawMatrixRainFrame(uint32_t nowMs) {

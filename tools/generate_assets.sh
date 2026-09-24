@@ -9,7 +9,7 @@ TMP="$(mktemp)"
   echo '#pragma once'
   echo '#include <Arduino.h>'
   echo 'struct Asset { const uint8_t* data; size_t size; };'
-  for file in "$SOURCE_DIR"/background.png "$SOURCE_DIR"/cosmonaut_0.png "$SOURCE_DIR"/cosmonaut_1.png "$SOURCE_DIR"/satellite_0.png "$SOURCE_DIR"/satellite_1.png "$SOURCE_DIR"/nav_companion.png "$SOURCE_DIR"/nav_meditation.png; do
+  for file in "$SOURCE_DIR"/background.png "$SOURCE_DIR"/cosmonaut_0.png "$SOURCE_DIR"/cosmonaut_1.png "$SOURCE_DIR"/satellite_0.png "$SOURCE_DIR"/satellite_1.png "$SOURCE_DIR"/nav_companion.png "$SOURCE_DIR"/nav_meditation.png "$SOURCE_DIR"/nav_emotion.png "$SOURCE_DIR"/nav_hass.png "$SOURCE_DIR"/nav_nightlight.png; do
     name="$(basename "$file" .png)_png"
     xxd -i -n "$name" "$file" | \
       sed 's/^unsigned char /const unsigned char /; s/\[\] =/[] PROGMEM =/; s/^unsigned int /const unsigned int /'

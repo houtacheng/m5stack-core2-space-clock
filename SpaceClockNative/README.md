@@ -3,6 +3,10 @@
 Fast native C++ firmware for the M5Stack Core2, with original artwork and a
 touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 
+Version 2.9.16 displays both actions on every clock navigation button with
+normalized icon pairs: Companion / Emotion, Meditation / Home Assistant, and
+Settings / Night Light. Short-press and long-press behavior is unchanged.
+
 Version 2.9.15 fixes the My Records parser for statistics responses delivered
 through Caddy/Cloudflare. HTTP transfer framing is now decoded before the
 low-memory JSON field filter runs, preventing false “missing data” errors.

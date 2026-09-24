@@ -2,7 +2,10 @@
 
 Native firmware that turns an M5Stack Core2 into a smooth animated clock,
 20-alarm clock, meditation timer, emotion-observation logger, MQTT device and
-four-page Bitfocus Companion Satellite control panel. Version 2.9.15 fixes
+four-page Bitfocus Companion Satellite control panel. Version 2.9.16 gives each
+clock navigation button a matched short-press / long-press icon pair:
+Companion / Emotion, Meditation / Home Assistant, and Settings / Night Light.
+Version 2.9.15 fixes
 statistics API parsing behind Caddy/Cloudflare by decoding HTTP transfer framing
 before applying the low-memory JSON field filter. Version 2.9.14 adds a
 database-backed **My Records** page to emotion observation Page 1. It reads the
