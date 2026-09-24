@@ -42,6 +42,22 @@ for source_name, output_name in (
     ("emotion-nav-source.png", "nav_emotion.png"),
     ("hass-nav-source.png", "nav_hass.png"),
     ("nightlight-nav-source.png", "nav_nightlight.png"),
+    ("settings-nav-source.png", "nav_settings.png"),
+):
+    source_path = SOURCE / source_name
+    if source_path.exists():
+        fit(Image.open(source_path).convert("RGBA"), (20, 20), 1).save(OUTPUT / output_name, optimize=True)
+
+# Shared bottom-bar actions. Keeping these in one normalized 20 px system
+# makes their apparent size consistent even though the supplied source art has
+# very different transparent margins and silhouettes.
+for source_name, output_name in (
+    ("action-close-source.png", "action_close.png"),
+    ("action-install-source.png", "action_install.png"),
+    ("action-check-source.png", "action_check.png"),
+    ("action-next-source.png", "action_next.png"),
+    ("action-previous-source.png", "action_previous.png"),
+    ("action-clock-source.png", "action_clock.png"),
 ):
     source_path = SOURCE / source_name
     if source_path.exists():

@@ -342,6 +342,9 @@ static constexpr uint16_t FG = 0xF79E;
 static constexpr uint16_t ACCENT = 0xD229;
 static constexpr uint16_t UI_BLUE = 0x2310;
 static constexpr uint16_t PANEL = 0x2124;
+static constexpr uint16_t UI_PANEL_ALT = 0x18E3;
+static constexpr uint16_t UI_BORDER = 0x3A2C;
+static constexpr uint16_t UI_MUTED = 0xA534;
 
 static const char* const EMOTION_PAGE_TITLES[] = {
   "時間", "觸發點", "身體反應", "情緒類別", "情緒指數", "觀察次數", "情緒落地", "本筆總覽"
@@ -411,22 +414,47 @@ void haptic(uint8_t ms = 25) {
   M5.Power.setVibration(0);
 }
 
+bool drawBottomActionIcon(const char* label, int centerX, int top = 218) {
+  if (!label || !label[0]) return false;
+  const uint8_t* data = nullptr;
+  size_t length = 0;
+  if (!strcmp(label, "Previous") || !strcmp(label, "< Previous") || !strcmp(label, "上一頁")) {
+    data = action_previous_png; length = action_previous_png_len;
+  } else if (!strcmp(label, "Next") || !strcmp(label, "Next >") || !strcmp(label, "下一頁")) {
+    data = action_next_png; length = action_next_png_len;
+  } else if (!strcmp(label, "Close") || !strcmp(label, "取消") || !strcmp(label, "關閉") ||
+             !strcmp(label, "取消送出")) {
+    data = action_close_png; length = action_close_png_len;
+  } else if (!strcmp(label, "Check") || !strcmp(label, "Save") || !strcmp(label, "完成") ||
+             !strcmp(label, "送出") || !strcmp(label, "確認送出") || !strcmp(label, "已送出")) {
+    data = action_check_png; length = action_check_png_len;
+  } else if (!strcmp(label, "Install")) {
+    data = action_install_png; length = action_install_png_len;
+  } else if (!strcmp(label, "Clock") || !strcmp(label, "時鐘")) {
+    data = action_clock_png; length = action_clock_png_len;
+  }
+  if (!data) return false;
+  M5.Display.drawPng(data, length, centerX - 10, top);
+  return true;
+}
+
 void drawBottomBar(const char* left, const char* middle, const char* right) {
   M5.Display.fillRect(0, 215, 320, 25, BG);
   useUIFont(1);
   M5.Display.setTextColor(ACCENT, BG);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(left, 53, 228);
-  M5.Display.drawString(middle, 160, 228);
-  M5.Display.drawString(right, 267, 228);
+  if (!drawBottomActionIcon(left, 53)) M5.Display.drawString(left, 53, 228);
+  if (!drawBottomActionIcon(middle, 160)) M5.Display.drawString(middle, 160, 228);
+  if (!drawBottomActionIcon(right, 267)) M5.Display.drawString(right, 267, 228);
 }
 
 void title(const char* text) {
-  M5.Display.fillScreen(TFT_WHITE);
-  M5.Display.setTextColor(UI_BLUE, TFT_WHITE);
+  M5.Display.fillScreen(BG);
+  M5.Display.setTextColor(0x65DF, BG);
   useUIMediumFont();
   M5.Display.setTextDatum(top_left);
   M5.Display.drawString(text, 10, 8);
+  M5.Display.drawFastHLine(10, 34, 300, UI_BORDER);
 }
 
 void saveSettings() {
@@ -939,7 +967,7 @@ void drawClockNavigationIcons() {
   M5.Display.drawPng(nav_emotion_png, nav_emotion_png_len, 57, 218);
   M5.Display.drawPng(nav_meditation_png, nav_meditation_png_len, 136, 218);
   M5.Display.drawPng(nav_hass_png, nav_hass_png_len, 164, 218);
-  drawPairedGearNavigationIcon(253, 228, ACCENT);
+  M5.Display.drawPng(nav_settings_png, nav_settings_png_len, 243, 218);
   M5.Display.drawPng(nav_nightlight_png, nav_nightlight_png_len, 271, 218);
 }
 
@@ -1110,7 +1138,7 @@ void drawMatrixNavigationIcons(M5Canvas& canvas) {
   canvas.drawPng(nav_emotion_png, nav_emotion_png_len, 57, 218);
   canvas.drawPng(nav_meditation_png, nav_meditation_png_len, 136, 218);
   canvas.drawPng(nav_hass_png, nav_hass_png_len, 164, 218);
-  drawMatrixPairedGearNavigationIcon(canvas, 253, 228);
+  canvas.drawPng(nav_settings_png, nav_settings_png_len, 243, 218);
   canvas.drawPng(nav_nightlight_png, nav_nightlight_png_len, 271, 218);
 }
 
@@ -1211,9 +1239,9 @@ void drawMatrixRainFrame(uint32_t nowMs) {
 
 void drawMeditationNavigationIcons() {
   M5.Display.fillRect(0, 215, 320, 25, BG);
-  M5.Display.drawPng(nav_companion_png, nav_companion_png_len, 41, 215);
-  drawClockNavigationIcon(160, 227);
-  drawGearNavigationIcon(267, 227);
+  M5.Display.drawPng(nav_companion_png, nav_companion_png_len, 43, 218);
+  M5.Display.drawPng(action_clock_png, action_clock_png_len, 150, 218);
+  M5.Display.drawPng(nav_settings_png, nav_settings_png_len, 257, 218);
 }
 
 void drawClockStatic() {
@@ -1498,10 +1526,12 @@ void showMenu() {
   screenNow = Screen::Menu;
   title("Settings");
   useUIFont(1);
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextColor(TFT_WHITE, BG);
   const char* rows[] = {"Wi-Fi & Companion", "Clock faces", "Clock settings", "Alarms", "Meditation settings", "Firmware update"};
   for (int i = 0; i < 6; ++i) {
-    M5.Display.fillRoundRect(12, 38 + i * 29, 296, 25, 7, i & 1 ? 0xDEFB : 0xEF7D);
+    M5.Display.fillRoundRect(12, 38 + i * 29, 296, 25, 7, i & 1 ? UI_PANEL_ALT : PANEL);
+    M5.Display.drawRoundRect(12, 38 + i * 29, 296, 25, 7, UI_BORDER);
+    M5.Display.setTextColor(TFT_WHITE);
     M5.Display.drawString(rows[i], 25, 42 + i * 29);
   }
   drawBottomBar("", "", "Close");
@@ -2396,7 +2426,7 @@ uint8_t meditationSettingsPage = 0;
 void showMeditationSettings() {
   screenNow = Screen::MeditationSettings;
   title("Meditation settings");
-  useUIFont(1); M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  useUIFont(1); M5.Display.setTextColor(TFT_WHITE, BG);
   String rows[4], values[4];
   if (meditationSettingsPage == 0) {
     rows[0]="Preset time 1"; values[0]=String(meditationPresetMinutes[0])+" min";
@@ -2416,7 +2446,9 @@ void showMeditationSettings() {
     rows[3]="Preview"; values[3]="Play";
   }
   for (int i=0;i<4;++i) {
-    int y=47+i*39; M5.Display.fillRoundRect(10,y,300,32,8,i&1?0xDEFB:0xEF7D);
+    int y=47+i*39; M5.Display.fillRoundRect(10,y,300,32,8,i&1?UI_PANEL_ALT:PANEL);
+    M5.Display.drawRoundRect(10,y,300,32,8,UI_BORDER);
+    M5.Display.setTextColor(TFT_WHITE);
     M5.Display.setTextDatum(middle_left); M5.Display.drawString(rows[i],20,y+16);
     M5.Display.setTextDatum(middle_right); M5.Display.drawString(values[i],300,y+16);
   }
@@ -2594,8 +2626,9 @@ void showFaces() {
   useUIFont(1);
   for (int i = 0; i < 3; ++i) {
     bool selected = i == static_cast<int>(clockFace);
-    M5.Display.fillRoundRect(18, 52 + i * 48, 284, 36, 7, selected ? UI_BLUE : 0xE71C);
-    M5.Display.setTextColor(selected ? TFT_WHITE : TFT_BLACK);
+    M5.Display.fillRoundRect(18, 52 + i * 48, 284, 36, 7, selected ? UI_BLUE : PANEL);
+    M5.Display.drawRoundRect(18, 52 + i * 48, 284, 36, 7, selected ? 0x65DF : UI_BORDER);
+    M5.Display.setTextColor(TFT_WHITE);
     M5.Display.drawString(names[i], 34, 62 + i * 48);
     if (selected) M5.Display.drawString("Selected", 225, 62 + i * 48);
   }
@@ -2615,17 +2648,17 @@ void showAlarms() {
   char heading[24];
   snprintf(heading, sizeof(heading), "Alarms %u/%u", alarmPage + 1, ALARM_PAGE_COUNT);
   title(heading);
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextColor(TFT_WHITE, BG);
   for (int row = 0; row < ALARMS_PER_PAGE; ++row) {
     int i = alarmPage * ALARMS_PER_PAGE + row;
     int y = 43 + row * 42;
-    M5.Display.drawFastHLine(5, y + 37, 310, 0xBDF7);
+    M5.Display.drawFastHLine(5, y + 37, 310, UI_BORDER);
     char b[16]; snprintf(b, sizeof(b), "%02d:%02d", alarms[i].hour, alarms[i].minute);
     useUIMediumFont(); M5.Display.drawString(b, 14, y);
     useUIFont(1); M5.Display.drawString(weekdaysText(alarms[i].weekdays), 160, y + 7);
     M5.Display.fillRoundRect(250, y + 3, 50, 25, 12, alarms[i].enabled ? TFT_GREEN : 0xAD55);
     M5.Display.setTextColor(TFT_WHITE); M5.Display.drawCentreString(alarms[i].enabled ? "ON" : "OFF", 275, y + 10, 1);
-    M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+    M5.Display.setTextColor(TFT_WHITE, BG);
   }
   drawBottomBar(alarmPage ? "< Previous" : "", alarmPage + 1 < ALARM_PAGE_COUNT ? "Next >" : "", "Close");
 }
@@ -2651,7 +2684,7 @@ uint8_t clockSettingsPage = 0;
 void showSettings() {
   screenNow = Screen::Settings;
   title("Settings");
-  useUIFont(1); M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  useUIFont(1); M5.Display.setTextColor(TFT_WHITE, BG);
   if (!clockSettingsPage) {
     M5.Display.drawString("Time zone", 14, 42); M5.Display.drawString(TIME_ZONES[timeZoneIndex].city, 174, 42);
     M5.Display.drawString("Auto brightness", 14, 70); M5.Display.drawString(adaptiveBrightness ? "ON" : "OFF", 244, 70);
@@ -2688,13 +2721,13 @@ int compareFirmwareVersions(const String& left, const String& right) {
 void showFirmwareUpdate() {
   screenNow = Screen::FirmwareUpdate;
   title("Firmware update");
-  useUIFont(1); M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  useUIFont(1); M5.Display.setTextColor(TFT_WHITE, BG);
   M5.Display.drawString("Current", 14, 45); M5.Display.drawString(SPACE_CLOCK_VERSION, 190, 45);
   M5.Display.drawString("Latest", 14, 75); M5.Display.drawString(latestFirmwareVersion.length() ? latestFirmwareVersion : "Not checked", 190, 75);
   M5.Display.drawString("Automatic update", 14, 105); M5.Display.drawString(automaticFirmwareUpdate ? "ON" : "OFF", 250, 105);
   char checkTime[8]; snprintf(checkTime, sizeof(checkTime), "%02u:00", firmwareCheckHour);
   M5.Display.drawString("Daily check", 14, 135); M5.Display.drawString(checkTime, 238, 135);
-  M5.Display.setTextColor(firmwareUpdateAvailable ? 0x0400 : 0x4208, TFT_WHITE);
+  M5.Display.setTextColor(firmwareUpdateAvailable ? TFT_GREEN : UI_MUTED, BG);
   M5.Display.setTextDatum(top_left);
   String line1 = firmwareUpdateMessage, line2;
   if (line1.length() > 43) { int split = line1.lastIndexOf(' ', 43); if (split < 15) split = 43; line2 = line1.substring(split + 1); line1 = line1.substring(0, split); }
@@ -2794,7 +2827,7 @@ void showAbout() {
   screenNow = Screen::About;
   title("Space Clock");
   M5.Display.drawPng(cosmonaut_0_png, cosmonaut_0_png_len, 122, 42);
-  M5.Display.setTextColor(UI_BLUE, TFT_WHITE); useUIFont(1);
+  M5.Display.setTextColor(0x65DF, BG); useUIFont(1);
   M5.Display.drawCentreString(SPACE_CLOCK_VERSION, 160, 150, 2);
   M5.Display.drawCentreString("Native firmware for M5Stack Core2", 160, 177, 2);
   drawBottomBar("", "", "Close");
@@ -2803,7 +2836,7 @@ void showAbout() {
 void runWifiPortal() {
   if (settingsServerReady) settingsServer.stop();
   title("Wi-Fi setup");
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE); useUIFont(1);
+  M5.Display.setTextColor(TFT_WHITE, BG); useUIFont(1);
   M5.Display.drawCentreString("Connect to SpaceClock-Setup", 160, 90, 2);
   M5.Display.drawCentreString("and open the captive portal", 160, 115, 2);
   WiFiManager wm;
@@ -2990,9 +3023,9 @@ void drawEmotionBottomBar(const char* left, const char* middle, const char* righ
   useUIFont(1);
   M5.Display.setTextColor(emotionTheme(100), TFT_BLACK);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(left, 53, 228);
-  M5.Display.drawString(middle, 160, 228);
-  M5.Display.drawString(right, 267, 228);
+  if (!drawBottomActionIcon(left, 53)) M5.Display.drawString(left, 53, 228);
+  if (!drawBottomActionIcon(middle, 160)) M5.Display.drawString(middle, 160, 228);
+  if (!drawBottomActionIcon(right, 267)) M5.Display.drawString(right, 267, 228);
 }
 
 String emotionTitleText() {
@@ -4772,7 +4805,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   String page;
   page.reserve(24000);
   page = "<!doctype html><html lang='" + String(zh ? "zh-Hant" : "en") + "'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-         "<title>Space Clock</title><style>*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#08111f;color:#eef4ff;max-width:760px;margin:auto;padding:18px}"
+         "<title>Space Clock</title><style>html{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#08111f;color:#eef4ff;max-width:760px;margin:auto;padding:18px}"
          "header{display:flex;align-items:center;justify-content:space-between;gap:12px}h1{color:#65b9ff;font-size:25px;margin:8px 0}h2{font-size:19px;margin:24px 0 8px}.muted{color:#aabbd0;font-size:14px}.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.tabs a,.lang{border:1px solid #344b63;border-radius:999px;padding:8px 12px;color:#c8d9ee;text-decoration:none;font-size:14px}.tabs a.active{background:#1688e5;border-color:#1688e5;color:white}.lang{white-space:nowrap}.panel{background:#101d2e;border:1px solid #263b52;border-radius:16px;padding:16px}.field{display:block;margin-top:15px;font-size:15px}.field input:not([type=checkbox]),.field select{display:block;width:100%;padding:11px;margin-top:6px;border-radius:9px;border:1px solid #52657a;background:#142236;color:white;font-size:16px}.field input[type=range]{padding:0}.field input[type=color]{height:48px;padding:5px}.check{display:flex;align-items:center;gap:9px;margin:15px 0}.check input{width:20px;height:20px;accent-color:#1688e5}.card{background:#0b1727;border:1px solid #344b63;border-radius:12px;padding:12px;margin:12px 0}.card summary{cursor:pointer;font-weight:700}.days{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px}.days label{white-space:nowrap}.btn,button{display:block;width:100%;padding:13px;margin-top:18px;border:0;border-radius:10px;background:#1688e5;color:white;font-size:16px;text-align:center;text-decoration:none;cursor:pointer}.btn.secondary{background:#20354e}.ok{color:#70e39a}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:520px){body{padding:12px}.panel{padding:13px}.grid{grid-template-columns:1fr}}</style></head><body>";
   m5::rtc_datetime_t webNow; getClockDateTime(&webNow);
   char webTime[24]; snprintf(webTime, sizeof(webTime), "%04d-%02d-%02d %02d:%02d:%02d", webNow.date.year, webNow.date.month, webNow.date.date, webNow.time.hours, webNow.time.minutes, webNow.time.seconds);
@@ -4943,8 +4976,8 @@ void sendFirmwareUpdatePage(const String& error = "") {
   String page;
   page.reserve(3500);
   page = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-         "<title>Firmware update</title><style>body{font-family:system-ui;background:#08111f;color:#eef4ff;max-width:620px;margin:auto;padding:20px}"
-         "h1{color:#65b9ff}.box{background:#101d2e;border:1px solid #344b63;border-radius:10px;padding:16px}input{box-sizing:border-box;width:100%;padding:12px;margin-top:12px}"
+         "<title>Firmware update</title><style>html{color-scheme:dark}body{font-family:system-ui;background:#08111f;color:#eef4ff;max-width:620px;margin:auto;padding:20px}"
+         "h1{color:#65b9ff}.box{background:#101d2e;border:1px solid #344b63;border-radius:10px;padding:16px}input{box-sizing:border-box;width:100%;padding:12px;margin-top:12px;background:#142236;color:#fff;border:1px solid #52657a}"
          "button,a{box-sizing:border-box;display:block;width:100%;padding:13px;margin-top:18px;border:0;border-radius:9px;background:#1688e5;color:white;font-size:17px;text-align:center;text-decoration:none}.error{color:#ff7d7d}</style></head><body>"
          "<h1>Wireless firmware update</h1><div class='box'><p>Keep the Core2 powered and connected to Wi-Fi until it restarts.</p>";
   if (error.length()) page += "<p class='error'>" + htmlEscape(error) + "</p>";

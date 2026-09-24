@@ -1,7 +1,7 @@
 {
-  "version": "2.9.17",
+  "version": "2.9.18",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "14b7898f9d930af7abfd610e88c3b6788d5a7bec11b8f1b0305466f218fa3091",
-  "size": 5413328,
-  "notes": "Updates My Records to read the hosted statistics API's computed data.summary fields. Statistics now run beside the database and no longer require a Mac to be online. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "92e1c6dce2ea6ccf4e9444e5b94e4ec7c2daa302a4a5b6e219b0cc288e0bc09a",
+  "size": 5419536,
+  "notes": "Refreshes the full bottom navigation icon set with consistent sizing for night light, settings, check, close, install, next, previous and clock actions. Device and browser settings now use a unified dark theme. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }
