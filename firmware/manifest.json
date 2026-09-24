@@ -1,7 +1,7 @@
 {
-  "version": "2.9.6",
+  "version": "2.9.7",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "c1815f9679675758a34e070e8c7ae1e70e9b1afdc29624b9b39955382d548556",
-  "size": 4486416,
-  "notes": "Improves emotion API login diagnostics for DNS, device time, TLS certificates, memory, and server responses. Restores missing Chinese glyphs in the emotion-observation UI. OTA keeps existing Wi-Fi, MQTT, alarm, and other settings."
+  "sha256": "2c0a1fcad8dc74c490b76493f751d25e9987d618abbfbcf0f0a0367415e568d4",
+  "size": 4778272,
+  "notes": "Repairs empty Chinese glyph bitmaps and restores the PSRAM-enabled Core2 build for Matrix code rain. Adds font and public-build validation, plus checked Matrix canvas allocation. OTA preserves existing Wi-Fi, MQTT, alarm, and other settings."
 }

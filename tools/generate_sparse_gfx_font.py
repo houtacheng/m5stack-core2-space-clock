@@ -51,7 +51,7 @@ def main():
         left, top, right, bottom = font.getbbox(ch, anchor="ls")
         width, height = max(1, right-left), max(1, bottom-top)
         image = Image.new("L", (width, height), 0)
-        ImageDraw.Draw(image).text((-left, -top), ch, font=font, fill=255)
+        ImageDraw.Draw(image).text((-left, -top), ch, font=font, fill=255, anchor="ls")
         bitmap.extend(packed_bitmap(image))
         glyphs.append((offset, width, height, max(1, round(font.getlength(ch))), left, top))
 

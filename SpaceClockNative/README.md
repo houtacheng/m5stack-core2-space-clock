@@ -69,7 +69,8 @@ option.
 
 ## Build
 
-Select **M5Stack Core2** in Arduino IDE. The project requires M5Unified/M5GFX,
+Select **M5Stack Core2** (M5Stack ESP32 board package 3.2.5, PSRAM **Enabled**,
+default 16 MB OTA partition layout) in Arduino IDE. The project requires M5Unified/M5GFX,
 ArduinoJson, WiFiManager and PubSubClient. The downloadable OTA image is
 `firmware/SpaceClockNative-OTA.bin`.
 
@@ -77,6 +78,22 @@ For a public release build, define `SPACE_CLOCK_PUBLIC_BUILD` so that ignored
 local Wi-Fi credentials are excluded from the binary:
 
 ```sh
-arduino-cli compile --fqbn m5stack:esp32:m5stack_core2 \
-  --build-property build.extra_flags=-DSPACE_CLOCK_PUBLIC_BUILD SpaceClockNative
+bash tools/build_public.sh
 ```
+
+The script validates embedded font bitmaps and uses
+`compiler.cpp.extra_flags=-DSPACE_CLOCK_PUBLIC_BUILD`. **Do not replace
+`build.extra_flags`**: doing so removes the Core2 PSRAM initialization define
+and can leave the full-screen Matrix canvas unavailable. The firmware now
+rejects builds without `BOARD_HAS_PSRAM`. Set `SPACE_CLOCK_ARDUINO_CLI` if the CLI
+is not on PATH; `SPACE_CLOCK_PYTHON` can select a Python runtime.
+
+OTA updates install only the application image, leaving existing NVS Wi-Fi,
+MQTT, alarm and other settings intact. Do not erase flash or upload a partition
+table when performing a routine update.
+
+Font changes can be checked with `python3 -m unittest discover -s tools -p
+test_font_tools.py` (Pillow required for generation tests). The validator checks
+nonempty glyph pixels and coverage, and the public-build check verifies the same
+bitmap data is present in the OTA image. When rasterizing a glyph with Pillow,
+use the same `anchor="ls"` for both its bounding box and its drawing operation.

@@ -236,6 +236,8 @@ M5Canvas astronautCanvas(&M5.Display);
 M5Canvas companionButtonCanvas(&M5.Display);
 M5Canvas meditationCardCanvas(&M5.Display);
 M5Canvas matrixCanvas(&M5.Display);
+bool matrixCanvasReady = false;
+bool matrixMemoryErrorDrawn = false;
 static constexpr uint8_t BOTTOM_LED_PIN = 25;
 static constexpr uint8_t BOTTOM_LED_COUNT = 10;
 Adafruit_NeoPixel bottomLeds(BOTTOM_LED_COUNT, BOTTOM_LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -982,6 +984,21 @@ void drawMatrixNavigationIcons(M5Canvas& canvas) {
 
 void drawMatrixRainFrame(uint32_t nowMs) {
   if (clockFace != ClockFace::Matrix || screenNow != Screen::Clock || alarmActive >= 0) return;
+  if (!matrixCanvasReady) {
+    // Do not silently draw into a failed sprite. Keep navigation available and
+    // display a diagnostic using a built-in font that needs no external assets.
+    if (matrixMemoryErrorDrawn) return;
+    matrixMemoryErrorDrawn = true;
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setFont(&fonts::Font2);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString("Matrix display memory unavailable", 10, 95);
+    M5.Display.drawString("Restart device; settings are preserved", 10, 120);
+    drawClockNavigationIcons();
+    return;
+  }
   uint32_t frameInterval = 100;  // CM4 uses 10 fps for the live rain layer.
   if (nowMs - lastMatrixFrame < frameInterval) return;
   float dt = lastMatrixFrame ? (nowMs - lastMatrixFrame) / 1000.0f : frameInterval / 1000.0f;
@@ -1119,7 +1136,10 @@ void animateFlipCards(int hour12, int minute) {
 }
 
 void drawClock(bool full = false) {
-  if (full) drawClockStatic();
+  if (full) {
+    matrixMemoryErrorDrawn = false;
+    drawClockStatic();
+  }
   m5::rtc_datetime_t dt;
   getClockDateTime(&dt);
   char buf[24];
@@ -3665,14 +3685,22 @@ void setup() {
   bottomLeds.begin();
   bottomLeds.clear();
   bottomLeds.show();
+  Serial.printf("[display] PSRAM: %u bytes, free: %u bytes\n", ESP.getPsramSize(), ESP.getFreePsram());
   astronautCanvas.setColorDepth(16);
   astronautCanvas.createSprite(105, 130);
   companionButtonCanvas.setColorDepth(16);
   companionButtonCanvas.createSprite(96, 96);
   meditationCardCanvas.setColorDepth(16);
   meditationCardCanvas.createSprite(98, 96);
+  matrixCanvas.setPsram(true);
   matrixCanvas.setColorDepth(16);
-  matrixCanvas.createSprite(320, 240);
+  matrixCanvasReady = matrixCanvas.createSprite(320, 240) != nullptr;
+  if (!matrixCanvasReady) {
+    // A lower-memory fallback still composites a complete frame (no flicker).
+    matrixCanvas.setColorDepth(8);
+    matrixCanvasReady = matrixCanvas.createSprite(320, 240) != nullptr;
+  }
+  Serial.printf("[display] Matrix canvas: %s (%d bpp)\n", matrixCanvasReady ? "ready" : "FAILED", matrixCanvas.getColorDepth());
   loadSettings();
   lastUserActivity = millis();
   emotionLastIntervalReminder = millis();

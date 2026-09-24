@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Fill missing glyphs in an existing sparse Adafruit GFX font header.
+"""Repair missing or empty glyphs in an existing sparse GFX font header.
 
-This preserves all existing glyphs and adds only characters found in the
-provided source files. It is useful when firmware strings grow after a font
-was generated from an earlier source snapshot.
+Preserve valid glyphs and repair empty rasters, including the baseline-anchor
+regression in 2.9.6. Also add characters found in the provided source files.
 """
 
 import argparse
@@ -71,21 +70,29 @@ def main():
         raise SystemExit("Could not parse glyph records")
 
     bitmap_text = bitmap_match.group(3)
-    bitmap_bytes = len(re.findall(r"0x[0-9A-Fa-f]{2}", bitmap_text))
+    bitmap = bytes(int(value, 16) for value in re.findall(r"0x[0-9A-Fa-f]{2}", bitmap_text))
+    bitmap_bytes = len(bitmap)
     font = ImageFont.truetype(str(args.font), args.pixels)
     appended = bytearray()
     replacements = {}
     missing = []
 
-    for codepoint in sorted(needed):
+    # Empty rasters can have valid dimensions. Checking only width/height leaves
+    # these invisible glyphs unrepaired. Inspect all previously populated slots.
+    populated = {cp for cp, m in records.items() if int(m.group(3)) and int(m.group(4))}
+    for codepoint in sorted(needed | populated):
         match = records.get(codepoint)
         if not match:
             continue
         width, height = int(match.group(3)), int(match.group(4))
-        if width and height:
+        offset = int(match.group(2))
+        byte_count = (width * height + 7) // 8
+        if width and height and any(bitmap[offset:offset + byte_count]):
             continue
 
         char = chr(codepoint)
+        if char.isspace() and codepoint != 0x3000:
+            continue
         if codepoint == 0x3000:
             advance = 16 if args.pixels <= 16 else 27
             replacements[codepoint] = (
@@ -105,8 +112,11 @@ def main():
             continue
 
         image = Image.new("L", (glyph_width, glyph_height), 0)
-        ImageDraw.Draw(image).text((-left, -top), char, font=font, fill=255)
+        ImageDraw.Draw(image).text((-left, -top), char, font=font, fill=255, anchor="ls")
         bits = pack_bitmap(image)
+        if not any(bits):
+            missing.append(codepoint)
+            continue
         offset = bitmap_bytes + len(appended)
         appended.extend(bits)
 
@@ -142,9 +152,9 @@ def main():
         args.header.write_text(header, encoding="utf-8")
 
     unresolved = ", ".join(f"U+{codepoint:04X}" for codepoint in missing)
-    print(f"{args.header}: added {len(replacements)} glyphs, {len(appended)} bitmap bytes")
+    print(f"{args.header}: repaired/added {len(replacements)} glyphs, {len(appended)} bitmap bytes")
     if unresolved:
-        print(f"Unsupported by font source: {unresolved}")
+        raise SystemExit(f"Unsupported or blank glyphs: {unresolved}")
 
 
 if __name__ == "__main__":

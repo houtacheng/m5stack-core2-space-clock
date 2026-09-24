@@ -1,6 +1,12 @@
 #pragma once
 
-#define SPACE_CLOCK_VERSION "2.9.6"
+#define SPACE_CLOCK_VERSION "2.9.7"
+
+// Replacing build.extra_flags drops the board's PSRAM initialization define.
+// Fail at compile time rather than publishing a blank Matrix display again.
+#if !defined(BOARD_HAS_PSRAM)
+#error "Core2 requires PSRAM enabled. Use compiler.cpp.extra_flags for public builds."
+#endif
 #define SPACE_CLOCK_MANIFEST_URL "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/manifest.json"
 #define SPACE_CLOCK_BLE_NAME "M5Stack Core2"
 #define SPACE_CLOCK_WIFI_AP "SpaceClock-Setup"

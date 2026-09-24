@@ -35,7 +35,7 @@ def main() -> None:
         height = max(1, bottom - top)
         advance = max(1, round(font.getlength(ch)))
         image = Image.new("L", (width, height), 0)
-        ImageDraw.Draw(image).text((-left, -top), ch, font=font, fill=255)
+        ImageDraw.Draw(image).text((-left, -top), ch, font=font, fill=255, anchor="ls")
         records.append((ord(ch), height, width, advance, -top, left, 0))
         bitmaps.append(image.tobytes())
 

@@ -1,5 +1,6 @@
 .arduino-build/
 .arduino-cache/
+__pycache__/
 *.bin
 *.elf
 *.map
