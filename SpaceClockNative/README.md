@@ -33,21 +33,24 @@ that IP in a browser to configure the clock.
 
 Open the device's settings page and choose **Emotion journal / 情緒觀察**. Save
 the API base URL first, then sign in with the PocketBase user account used by
-the journal. The password is not written to Preferences; the returned bearer
-token and account ID are kept on the Core2 so the device can submit a record.
+the journal. Use **Check database connection** to verify a saved login. The
+password is not written to Preferences; the returned bearer token and account
+ID are kept on the Core2 so the device can submit a record.
 Use **Forget this device's API login** to remove them. The current settings page
 uses local HTTP, so sign in only from a trusted Wi-Fi network and preferably use
 a dedicated account. The device does not enable ESP32 flash encryption, so its
 stored token is not protected against physical flash extraction.
 
 The form starts when you long-press the left **Companion** button on the clock.
+Its top-left light is green only after the saved account has been authenticated
+against the database; editing stays locked while the light is yellow or red.
 It captures the device's local time and guides you through trigger, body
-reaction, emotion, intensity, observation duration and grounding. On the final
-review page, tap **Confirm** and then **Send** to create the PocketBase `entries`
-record over HTTPS. The API base URL defaults to `https://emotion.theoakhouse.org`.
-The HTTPS client validates the server against the embedded ISRG Root X1 trust
-anchor; if the API changes certificate authority, the firmware trust anchor must
-be updated before it can connect.
+reaction, emotion, intensity, observation duration and grounding. Short-press
+**Cancel** to return to the clock, or long-press it for on-device reminder
+settings. On the final review page, tap **Confirm** and then **Send** to create
+the PocketBase `entries` record over HTTPS. The API base URL defaults to
+`https://emotion.theoakhouse.org`. The HTTPS client validates the server against
+embedded ISRG Root X1 and Google Trust Services Root R4 trust anchors.
 
 Reminder settings are saved independently in the same web tab. Interval mode
 supports 15, 30, 60, 120 or 240 minutes. Fixed mode supports three daily times;

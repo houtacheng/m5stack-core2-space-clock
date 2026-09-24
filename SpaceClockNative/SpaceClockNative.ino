@@ -35,7 +35,7 @@
 #endif
 #include "mqtt_guide.h"
 
-enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionReminder, FirmwareUpdate, About };
+enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionSettings, EmotionReminder, FirmwareUpdate, About };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
 
@@ -180,6 +180,9 @@ String emotionApiBase = "https://emotion.theoakhouse.org";
 String emotionApiIdentity;
 String emotionApiUserId;
 String emotionApiToken;
+enum class EmotionApiState : uint8_t { Unknown, Checking, Connected, Disconnected };
+EmotionApiState emotionApiState = EmotionApiState::Unknown;
+uint32_t emotionApiLastChecked = 0;
 uint32_t emotionLastIntervalReminder = 0;
 uint32_t emotionReminderEnd = 0;
 uint32_t emotionReminderSnoozeUntil = 0;
@@ -193,12 +196,15 @@ bool emotionSubmitCompleted = false;
 String emotionSubmitMessage;
 m5::rtc_datetime_t emotionFormTime;
 bool emotionTriggers[8] = {};
-uint8_t emotionHeartRate = 0, emotionBreathRate = 0, emotionSweating = 0;
+uint8_t emotionHeartRate = 4, emotionBreathRate = 4, emotionSweating = 0;
 int8_t emotionBodySignal = -1, emotionBodyPart = -1, emotionBehaviorCue = 0;
-uint8_t emotionCategory = 0, emotionIndexPercent = 100;
+uint8_t emotionCategory = 0, emotionIndexPercent = 50;
 int8_t emotionChoice = -1;
 uint8_t emotionObserveCount = 1, emotionObserveMinutes = 1;
-uint8_t emotionGroundingTiming = 0, emotionGroundingAction = 0;
+uint8_t emotionGroundingTiming = 1, emotionGroundingAction = 10;
+uint32_t emotionCancelPressedAt = 0;
+bool emotionCancelPressValid = false;
+uint8_t emotionSettingsPage = 0;
 uint32_t companionNavPressStarted = 0;
 bool companionNavPressValid = false;
 uint32_t lastMqttReconnect = 0;
@@ -274,7 +280,7 @@ static constexpr uint16_t UI_BLUE = 0x2310;
 static constexpr uint16_t PANEL = 0x2124;
 
 static const char* const EMOTION_PAGE_TITLES[] = {
-  "填寫時間", "觸發點", "身體反應", "情緒類別", "情緒指數", "觀察次數與時長", "情緒落地", "總覽與送出"
+  "時間", "觸發點", "身體反應", "情緒類別", "情緒指數", "觀察次數", "情緒落地", "本筆總覽"
 };
 static const char* const EMOTION_TRIGGERS[] = {
   "表情", "一句話", "語氣", "動作", "眼神", "無聲的壓力", "惡夢", "記憶點"
@@ -305,7 +311,7 @@ static const char* const EMOTION_CHOICES[5][10] = {
   {"羞愧", "羞恥", "覺得自己不好", "自責", "內疚", "虧欠感", "挫敗", "無能感", "不配得感", "後悔"},
   {"安心", "平靜", "放鬆", "感謝", "滿足", "愉快", "喜悅", "有希望", "被理解", "有力量"}
 };
-static const char* const EMOTION_GROUNDING_TIMES[] = {"不填", "當場", "事後"};
+static const char* const EMOTION_GROUNDING_TIMES[] = {"不填", "當下", "事後"};
 static const char* const EMOTION_GROUNDING_ACTIONS[] = {
   "無操作", "躺下", "摸摸頭", "走路", "放鬆肩膀", "轉脖子", "拜佛", "背書", "念誦", "持咒", "深呼吸",
   "腹式呼吸", "拉筋/伸展", "甩手放鬆", "按壓胸口", "按壓手掌", "握拳再放鬆", "喝溫水", "洗臉/沖冷水",
@@ -551,6 +557,8 @@ void applyNetworkHostname() {
 
 void drawClock(bool full);
 void drawAstronaut();
+bool verifyEmotionApiConnection(bool force = false);
+void showEmotionSettings();
 
 bool hasSavedWifiProfiles() {
   for (int slot = 0; slot < SAVED_WIFI_COUNT; ++slot) {
@@ -2173,6 +2181,30 @@ String emotionLocalTimeText(const m5::rtc_datetime_t& dt) {
   return String(value);
 }
 
+uint8_t emotionDaysInMonth(uint16_t year, uint8_t month) {
+  static const uint8_t days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) return 29;
+  return days[constrain((int)month, 1, 12) - 1];
+}
+
+bool emotionApiConnected() {
+  return emotionApiState == EmotionApiState::Connected && WiFi.status() == WL_CONNECTED
+    && emotionApiToken.length() && emotionApiUserId.length();
+}
+
+void drawEmotionConnectionIndicator() {
+  uint16_t color = emotionApiConnected() ? TFT_GREEN
+    : (emotionApiState == EmotionApiState::Checking ? TFT_YELLOW : TFT_RED);
+  M5.Display.fillCircle(9, 13, 6, 0x2124);
+  M5.Display.fillCircle(9, 13, 4, color);
+}
+
+String emotionTitleText() {
+  if (emotionFormPage == 5) return "情緒觀察 6/8 觀察次數";
+  if (emotionFormPage == 7) return "情緒觀察 8/8 本筆總覽";
+  return "情緒觀察 " + String(emotionFormPage + 1) + "/8 " + EMOTION_PAGE_TITLES[emotionFormPage];
+}
+
 void drawEmotionRow(int y, const String& label, const String& value, bool selected = false) {
   uint16_t fill = selected ? 0x2A5D : (y / 32 & 1 ? 0x18E3 : 0x2124);
   M5.Display.fillRoundRect(10, y, 300, 28, 5, fill);
@@ -2187,20 +2219,43 @@ void drawEmotionRow(int y, const String& label, const String& value, bool select
 void drawEmotionObservation() {
   if (screenNow != Screen::EmotionObservation) return;
   M5.Display.fillScreen(BG);
-  useUIMediumFont();
+  useUIFont(1);
   M5.Display.setTextColor(TFT_WHITE, BG);
   M5.Display.setTextDatum(top_left);
-  String titleText = "情緒觀察  " + String(emotionFormPage + 1) + "/8  " + EMOTION_PAGE_TITLES[emotionFormPage];
-  M5.Display.drawString(titleText, 8, 5);
+  drawEmotionConnectionIndicator();
+  M5.Display.drawString(emotionTitleText(), 20, 5);
+
+  if (!emotionApiConnected()) {
+    M5.Display.fillRoundRect(17, 48, 286, 137, 14, 0x2124);
+    M5.Display.drawRoundRect(17, 48, 286, 137, 14, TFT_RED);
+    useUIMediumFont(); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(TFT_WHITE, 0x2124);
+    M5.Display.drawString(emotionApiState == EmotionApiState::Checking ? "正在確認資料庫…" : "資料庫尚未連線", 160, 84);
+    useUIFont(1); M5.Display.setTextColor(0xBDF7, 0x2124);
+    M5.Display.drawString(WiFi.status() != WL_CONNECTED ? "請先連接 Wi-Fi" : "請先從網頁設定登入 API", 160, 126);
+    M5.Display.setTextColor(0x9DB2, 0x2124);
+    M5.Display.drawString("連線成功後才可開始填寫", 160, 156);
+    drawBottomBar("", "", "取消");
+    return;
+  }
 
   if (emotionFormPage == 0) {
-    M5.Display.drawRoundRect(12, 48, 296, 104, 14, 0x4A69);
-    useUILargeFont();
-    M5.Display.setTextColor(0xBDF7, BG);
-    M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString(emotionLocalTimeText(emotionFormTime), 160, 92);
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG);
-    M5.Display.drawCentreString("按一下可重新擷取目前時間", 160, 133, 1);
+    const char* labels[] = {"年", "月", "日", "時", "分"};
+    int values[] = {emotionFormTime.date.year, emotionFormTime.date.month, emotionFormTime.date.date,
+                    emotionFormTime.time.hours, emotionFormTime.time.minutes};
+    for (int i = 0; i < 5; ++i) {
+      int x = 5 + i * 63;
+      M5.Display.fillRoundRect(x, 55, 58, 94, 8, 0x2124);
+      M5.Display.drawRoundRect(x, 55, 58, 94, 8, 0x4A69);
+      useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2124);
+      M5.Display.drawString(labels[i], x + 29, 73);
+      M5.Display.setTextColor(TFT_WHITE, 0x2124);
+      char value[6];
+      if (i == 0) snprintf(value, sizeof(value), "%04d", values[i]);
+      else snprintf(value, sizeof(value), "%02d", values[i]);
+      M5.Display.drawString(value, x + 29, 112);
+    }
+    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG); M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString("點一下各格調整；預設為現在時間", 160, 174);
   } else if (emotionFormPage == 1) {
     for (int i = 0; i < 8; ++i) {
       int x = (i % 2) ? 164 : 10, y = 39 + (i / 2) * 41;
@@ -2211,36 +2266,55 @@ void drawEmotionObservation() {
       M5.Display.drawString(String(emotionTriggers[i] ? "✓ " : "") + EMOTION_TRIGGERS[i], x + 73, y + 18);
     }
   } else if (emotionFormPage == 2) {
-    const char* bodySignal = emotionBodySignal < 0 ? "不填" : EMOTION_BODY_SIGNALS[(uint8_t)emotionBodySignal];
-    drawEmotionRow(40, "心率", EMOTION_HEART_RATES[emotionHeartRate]);
-    drawEmotionRow(68, "呼吸", EMOTION_BREATH_RATES[emotionBreathRate]);
-    drawEmotionRow(96, "出汗", EMOTION_SWEATING[emotionSweating]);
-    drawEmotionRow(124, "身體訊號", bodySignal);
-    drawEmotionRow(152, "身體部位", emotionBodyPart < 0 ? "不填" : EMOTION_BODY_PARTS[(uint8_t)emotionBodyPart]);
-    drawEmotionRow(180, "行為線索", EMOTION_BEHAVIOR_CUES[emotionBehaviorCue]);
+    const char* labels[] = {"心律", "呼吸", "出汗", "身體訊號", "身體部位", "行為線索"};
+    String values[] = {EMOTION_HEART_RATES[emotionHeartRate], EMOTION_BREATH_RATES[emotionBreathRate],
+      EMOTION_SWEATING[emotionSweating], emotionBodySignal < 0 ? "不填" : EMOTION_BODY_SIGNALS[(uint8_t)emotionBodySignal],
+      emotionBodyPart < 0 ? "不填" : EMOTION_BODY_PARTS[(uint8_t)emotionBodyPart], EMOTION_BEHAVIOR_CUES[emotionBehaviorCue]};
+    for (int i = 0; i < 6; ++i) {
+      int x = 5 + (i % 3) * 105, y = 41 + (i / 3) * 79;
+      M5.Display.fillRoundRect(x, y, 100, 72, 8, 0x2124);
+      M5.Display.drawRoundRect(x, y, 100, 72, 8, 0x4A69);
+      useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2124);
+      M5.Display.drawString(labels[i], x + 50, y + 17);
+      M5.Display.setTextColor(TFT_WHITE, 0x2124);
+      M5.Display.drawString(values[i], x + 50, y + 47);
+    }
   } else if (emotionFormPage == 3) {
-    drawEmotionRow(47, "類別　◀ / ▶", EMOTION_CATEGORIES[emotionCategory], true);
+    M5.Display.fillRoundRect(12, 46, 296, 61, 10, 0x2A5D);
+    useUIFont(1); M5.Display.setTextColor(0x9DB2, 0x2A5D); M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString("類別　◀ / ▶", 160, 61);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D);
+    M5.Display.drawString(EMOTION_CATEGORIES[emotionCategory], 160, 87);
     String choiceText = emotionChoice < 0 ? "未選" : EMOTION_CHOICES[emotionCategory][emotionChoice];
-    drawEmotionRow(101, "情緒　◀ / ▶", choiceText, true);
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString("觸碰該列左右側切換選項", 160, 160);
+    M5.Display.fillRoundRect(12, 118, 296, 61, 10, 0x2A5D);
+    useUIFont(1); M5.Display.setTextColor(0x9DB2, 0x2A5D); M5.Display.drawString("情緒　◀ / ▶", 160, 133);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D); M5.Display.drawString(choiceText, 160, 159);
   } else if (emotionFormPage == 4) {
-    useUIMediumFont(); M5.Display.setTextColor(0xBDF7, BG); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString(String(emotionIndexPercent) + "%", 160, 97);
-    M5.Display.fillRoundRect(34, 129, 108, 44, 10, 0x2945);
-    M5.Display.fillRoundRect(178, 129, 108, 44, 10, 0x2945);
-    useUIFont(1); M5.Display.setTextColor(TFT_WHITE, 0x2945);
-    M5.Display.drawCentreString("－ 5%", 88, 141, 1); M5.Display.drawCentreString("＋ 5%", 232, 141, 1);
+    useUILargeFont(); M5.Display.setTextColor(0xBDF7, BG); M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString(String(emotionIndexPercent) + "%", 160, 88);
+    const int sliderLeft = 28, sliderRight = 292, sliderY = 151;
+    int thumbX = map(emotionIndexPercent, 5, 120, sliderLeft, sliderRight);
+    M5.Display.fillRoundRect(sliderLeft, sliderY - 5, sliderRight - sliderLeft, 10, 5, 0x2945);
+    M5.Display.fillRoundRect(sliderLeft, sliderY - 5, thumbX - sliderLeft, 10, 5, 0x65D9);
+    M5.Display.fillCircle(thumbX, sliderY, 12, TFT_WHITE); M5.Display.drawCircle(thumbX, sliderY, 12, 0x65D9);
+    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG);
+    M5.Display.drawString("5", sliderLeft, 181); M5.Display.drawString("120", sliderRight, 181);
   } else if (emotionFormPage == 5) {
-    drawEmotionRow(62, "觀察次數　◀ / ▶", String(emotionObserveCount) + " 次", true);
-    drawEmotionRow(112, "觀察時長　◀ / ▶", String(emotionObserveMinutes) + " 分鐘", true);
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString("每列左側減少、右側增加", 160, 172);
+    M5.Display.fillRoundRect(12, 48, 296, 61, 10, 0x2A5D);
+    M5.Display.fillRoundRect(12, 120, 296, 61, 10, 0x2A5D);
+    useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2A5D);
+    M5.Display.drawString("觀察次數　◀ / ▶", 160, 63); M5.Display.drawString("觀察時長　◀ / ▶", 160, 135);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D);
+    M5.Display.drawString(String(emotionObserveCount) + " 次", 160, 89);
+    M5.Display.drawString(String(emotionObserveMinutes) + " 分鐘", 160, 161);
   } else if (emotionFormPage == 6) {
-    drawEmotionRow(50, "落地時機　◀ / ▶", EMOTION_GROUNDING_TIMES[emotionGroundingTiming], true);
-    drawEmotionRow(105, "落地方式　◀ / ▶", EMOTION_GROUNDING_ACTIONS[emotionGroundingAction], true);
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString("觸碰該列左右側切換選項", 160, 163);
+    M5.Display.fillRoundRect(12, 48, 296, 61, 10, 0x2A5D);
+    M5.Display.fillRoundRect(12, 120, 296, 61, 10, 0x2A5D);
+    useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2A5D);
+    M5.Display.drawString("落地時機　◀ / ▶", 160, 63); M5.Display.drawString("落地方式　◀ / ▶", 160, 135);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D);
+    M5.Display.drawString(EMOTION_GROUNDING_TIMES[emotionGroundingTiming], 160, 89);
+    M5.Display.drawString(EMOTION_GROUNDING_ACTIONS[emotionGroundingAction], 160, 161);
   } else {
     useUIFont(1); M5.Display.setTextColor(0xD6DF, BG); M5.Display.setTextDatum(top_left);
     String triggerSummary;
@@ -2270,13 +2344,50 @@ void showEmotionObservation(bool newEntry = false) {
     emotionSubmitCompleted = false;
     emotionSubmitMessage = "";
     memset(emotionTriggers, 0, sizeof(emotionTriggers));
-    emotionHeartRate = emotionBreathRate = emotionSweating = 0;
+    emotionHeartRate = emotionBreathRate = 4; emotionSweating = 0;
     emotionBodySignal = emotionBodyPart = -1; emotionBehaviorCue = 0;
     emotionCategory = 2; emotionChoice = -1;
-    emotionIndexPercent = 100; emotionObserveCount = emotionObserveMinutes = 1;
-    emotionGroundingTiming = emotionGroundingAction = 0;
+    emotionIndexPercent = 50; emotionObserveCount = emotionObserveMinutes = 1;
+    emotionGroundingTiming = 1; emotionGroundingAction = 10;
   }
   drawEmotionObservation();
+  if (newEntry) {
+    verifyEmotionApiConnection(true);
+    drawEmotionObservation();
+  }
+}
+
+String emotionReminderTimeText(uint16_t minutes) {
+  if (minutes == 0xFFFF) return "關閉";
+  char value[6]; snprintf(value, sizeof(value), "%02u:%02u", minutes / 60, minutes % 60);
+  return String(value);
+}
+
+void showEmotionSettings() {
+  screenNow = Screen::EmotionSettings;
+  M5.Display.fillScreen(BG);
+  drawEmotionConnectionIndicator();
+  useUIFont(1); M5.Display.setTextDatum(top_left); M5.Display.setTextColor(TFT_WHITE, BG);
+  M5.Display.drawString("情緒觀察設定 " + String(emotionSettingsPage + 1) + "/2", 20, 5);
+  M5.Display.setTextColor(0xBDF7, BG);
+  M5.Display.drawString(emotionSettingsPage ? "提醒方式" : "填寫提醒", 12, 31);
+  if (!emotionSettingsPage) {
+    const char* modes[] = {"關閉", "間隔提醒", "固定鬧鐘提醒"};
+    drawEmotionRow(53, "提醒模式", modes[emotionReminderMode], true);
+    drawEmotionRow(84, "間隔", String(emotionReminderIntervalMinutes) + " 分鐘", true);
+    drawEmotionRow(115, "固定時間 1", emotionReminderTimeText(emotionReminderTimes[0]), true);
+    drawEmotionRow(146, "固定時間 2", emotionReminderTimeText(emotionReminderTimes[1]), true);
+    drawEmotionRow(177, "固定時間 3", emotionReminderTimeText(emotionReminderTimes[2]), true);
+    drawBottomBar("", "下一頁", "完成");
+  } else {
+    const char* sounds[] = {"打版", "磬聲", "流水聲", "水滴聲"};
+    drawEmotionRow(53, "振動", emotionReminderVibration ? "開" : "關", true);
+    drawEmotionRow(84, "鬧鐘", emotionReminderSound ? "開" : "關", true);
+    drawEmotionRow(115, "提醒時間", String(emotionReminderDurationSeconds) + " 秒", true);
+    drawEmotionRow(146, "鬧鐘鈴聲", sounds[emotionReminderSoundChoice], true);
+    drawEmotionRow(177, "音量", String(emotionReminderVolume) + "%", true);
+    drawBottomBar("上一頁", "", "完成");
+  }
 }
 
 String emotionUuid() {
@@ -2311,21 +2422,23 @@ String emotionApiHost(const String& base) {
 }
 
 bool emotionApiLogin(const String& identity, const String& password, String& message) {
-  if (WiFi.status() != WL_CONNECTED) { message = "請先連接 Wi-Fi，再登入 API。"; return false; }
+  emotionApiState = EmotionApiState::Checking;
+  auto fail = [&](const String& reason) {
+    message = reason; emotionApiState = EmotionApiState::Disconnected; emotionApiLastChecked = millis(); return false;
+  };
+  if (WiFi.status() != WL_CONNECTED) return fail("請先連接 Wi-Fi，再登入 API。");
   String base = normalizeEmotionApiBase(emotionApiBase);
-  if (!base.length()) { message = "API 網址必須使用 https://，請先儲存有效網址。"; return false; }
+  if (!base.length()) return fail("API 網址必須使用 https://，請先儲存有效網址。");
 
   String host = emotionApiHost(base);
   IPAddress resolvedAddress;
   if (!host.length() || WiFi.hostByName(host.c_str(), resolvedAddress) != 1) {
-    message = "找不到 API 主機（DNS 解析失敗）：" + host + "。請確認設備 Wi-Fi 可連上網際網路及 DNS。";
-    return false;
+    return fail("找不到 API 主機（DNS 解析失敗）：" + host + "。請確認設備 Wi-Fi 可連上網際網路及 DNS。");
   }
   if (time(nullptr) < 1700000000) {
     syncTime();
     if (time(nullptr) < 1700000000) {
-      message = "設備時間尚未同步，無法安全驗證 HTTPS 憑證。請確認網路可連外後重試。";
-      return false;
+      return fail("設備時間尚未同步，無法安全驗證 HTTPS 憑證。請確認網路可連外後重試。");
     }
   }
 
@@ -2339,7 +2452,7 @@ bool emotionApiLogin(const String& identity, const String& password, String& mes
   secure.setTimeout(15);
   HTTPClient http;
   http.setTimeout(12000);
-  if (!http.begin(secure, base + "/api/collections/users/auth-with-password")) { message = "無法建立 HTTPS 連線。"; return false; }
+  if (!http.begin(secure, base + "/api/collections/users/auth-with-password")) return fail("無法建立 HTTPS 連線。");
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   String response = code > 0 ? http.getString() : "";
@@ -2374,11 +2487,13 @@ bool emotionApiLogin(const String& identity, const String& password, String& mes
         message = "API 回應 HTTP " + String(code) + (serverMessage.length() ? "：" + serverMessage : "。請確認 API 網址及服務狀態。");
       }
     }
+    emotionApiState = EmotionApiState::Disconnected;
+    emotionApiLastChecked = millis();
     return false;
   }
   DynamicJsonDocument responseDoc(4096);
   if (deserializeJson(responseDoc, response) || !responseDoc["token"].is<const char*>() || !responseDoc["record"]["id"].is<const char*>()) {
-    message = "伺服器回應格式不符 PocketBase 規格。"; return false;
+    return fail("伺服器回應格式不符 PocketBase 規格。");
   }
   emotionApiToken = responseDoc["token"].as<String>();
   emotionApiUserId = responseDoc["record"]["id"].as<String>();
@@ -2388,30 +2503,54 @@ bool emotionApiLogin(const String& identity, const String& password, String& mes
   prefs.putString("emoUser", emotionApiUserId);
   prefs.putString("emoToken", emotionApiToken);
   prefs.end();
+  emotionApiState = EmotionApiState::Connected;
+  emotionApiLastChecked = millis();
   message = "API 登入成功；帳號密碼未儲存，token 僅保存在本機設備。";
   return true;
 }
 
 bool refreshEmotionApiToken() {
-  if (!emotionApiToken.length() || WiFi.status() != WL_CONNECTED) return false;
+  if (!emotionApiToken.length() || !emotionApiUserId.length() || WiFi.status() != WL_CONNECTED) {
+    emotionApiState = EmotionApiState::Disconnected;
+    return false;
+  }
+  String base = normalizeEmotionApiBase(emotionApiBase);
+  if (!base.length()) { emotionApiState = EmotionApiState::Disconnected; return false; }
   WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
   HTTPClient http; http.setTimeout(9000);
-  if (!http.begin(secure, emotionApiBase + "/api/collections/users/auth-refresh")) return false;
+  if (!http.begin(secure, base + "/api/collections/users/auth-refresh")) { emotionApiState = EmotionApiState::Disconnected; return false; }
   http.addHeader("Authorization", "Bearer " + emotionApiToken);
   int code = http.POST("");
   String response = code > 0 ? http.getString() : "";
   http.end(); secure.stop();
-  if (code != 200) return false;
+  if (code != 200) { emotionApiState = EmotionApiState::Disconnected; return false; }
   DynamicJsonDocument doc(4096);
-  if (deserializeJson(doc, response) || !doc["token"].is<const char*>()) return false;
+  if (deserializeJson(doc, response) || !doc["token"].is<const char*>()) { emotionApiState = EmotionApiState::Disconnected; return false; }
   emotionApiToken = doc["token"].as<String>();
   if (doc["record"]["id"].is<const char*>()) emotionApiUserId = doc["record"]["id"].as<String>();
   prefs.begin("spaceclock", false); prefs.putString("emoToken", emotionApiToken); prefs.putString("emoUser", emotionApiUserId); prefs.end();
+  emotionApiState = EmotionApiState::Connected;
   return true;
 }
 
+bool verifyEmotionApiConnection(bool force) {
+  uint32_t nowMs = millis();
+  if (!force && emotionApiState == EmotionApiState::Connected && nowMs - emotionApiLastChecked < 60000UL) return true;
+  if (WiFi.status() != WL_CONNECTED || !emotionApiToken.length() || !emotionApiUserId.length()) {
+    emotionApiState = EmotionApiState::Disconnected;
+    emotionApiLastChecked = nowMs;
+    return false;
+  }
+  emotionApiState = EmotionApiState::Checking;
+  if (screenNow == Screen::EmotionObservation) drawEmotionObservation();
+  bool connected = refreshEmotionApiToken();
+  emotionApiState = connected ? EmotionApiState::Connected : EmotionApiState::Disconnected;
+  emotionApiLastChecked = millis();
+  return connected;
+}
+
 bool submitEmotionObservation() {
-  if (!emotionApiToken.length() || !emotionApiUserId.length()) { emotionSubmitMessage = "請先在網頁「情緒觀察」設定登入 API 帳號。"; drawEmotionObservation(); return false; }
+  if (!emotionApiConnected() && !verifyEmotionApiConnection(true)) { emotionSubmitMessage = "資料庫未連線，請先在網頁設定登入 API。"; drawEmotionObservation(); return false; }
   if (WiFi.status() != WL_CONNECTED) { emotionSubmitMessage = "目前沒有 Wi-Fi，請連線後再送出。"; drawEmotionObservation(); return false; }
   time_t now = time(nullptr); struct tm utcNow;
   if (now < 1700000000 || !gmtime_r(&now, &utcNow)) { emotionSubmitMessage = "設備時間尚未同步，請連線後重試。"; drawEmotionObservation(); return false; }
@@ -2475,12 +2614,14 @@ bool submitEmotionObservation() {
     }
   }
   if (code == 200 || code == 201) {
+    emotionApiState = EmotionApiState::Connected; emotionApiLastChecked = millis();
     emotionSubmitMessage = "已成功送出。";
     DynamicJsonDocument reply(1024);
     if (!deserializeJson(reply, response) && reply["id"].is<const char*>()) emotionSubmitMessage = "已成功送出，紀錄編號 " + reply["id"].as<String>();
     drawEmotionObservation();
     return true;
   }
+  emotionApiState = EmotionApiState::Disconnected; emotionApiLastChecked = millis();
   if (code == 401) emotionSubmitMessage = "登入已過期，請回網頁「情緒觀察」重新登入。";
   else if (code < 0) emotionSubmitMessage = "HTTPS／網路連線失敗（" + String(code) + "），資料未送出。";
   else emotionSubmitMessage = "送出失敗（HTTP " + String(code) + "），資料未送出。";
@@ -2561,25 +2702,84 @@ void checkEmotionReminder(uint32_t nowMs, const m5::rtc_datetime_t& dt) {
 }
 
 void handleEmotionTouch(const m5::touch_detail_t& t) {
-  if (!t.wasReleased()) return;
-  haptic(12);
   if (screenNow == Screen::EmotionReminder) {
+    if (!t.wasReleased()) return;
+    haptic(12);
     if (t.y >= 210 && t.x < 107) { stopEmotionReminder(false); showEmotionObservation(true); }
     else if (t.y >= 210 && t.x < 214) { stopEmotionReminder(); emotionReminderSnoozeUntil = millis() + 600000UL; }
     else if (t.y >= 210) stopEmotionReminder();
     return;
   }
+  if (screenNow == Screen::EmotionSettings) {
+    if (!t.wasReleased()) return;
+    haptic(12);
+    if (t.y >= 210) {
+      if (t.x < 107 && emotionSettingsPage) { --emotionSettingsPage; showEmotionSettings(); }
+      else if (t.x < 214 && !emotionSettingsPage) { ++emotionSettingsPage; showEmotionSettings(); }
+      else if (t.x >= 214) { saveSettings(); showEmotionObservation(false); }
+      return;
+    }
+    if (t.y < 53 || t.y >= 208) return;
+    int row = constrain((t.y - 53) / 31, 0, 4);
+    if (!emotionSettingsPage) {
+      if (row == 0) emotionReminderMode = (emotionReminderMode + 1) % 3;
+      else if (row == 1) {
+        const uint16_t choices[] = {15, 30, 60, 120, 240};
+        int index = 0; while (index < 5 && choices[index] != emotionReminderIntervalMinutes) ++index;
+        emotionReminderIntervalMinutes = choices[(index + 1) % 5];
+      } else {
+        int slot = row - 2;
+        uint16_t fallback[] = {600, 900, 1200};
+        if (emotionReminderTimes[slot] == 0xFFFF) emotionReminderTimes[slot] = fallback[slot];
+        else if (emotionReminderTimes[slot] >= 1410) emotionReminderTimes[slot] = 0xFFFF;
+        else emotionReminderTimes[slot] += 30;
+      }
+    } else {
+      if (row == 0) emotionReminderVibration = !emotionReminderVibration;
+      else if (row == 1) emotionReminderSound = !emotionReminderSound;
+      else if (row == 2) {
+        const uint8_t choices[] = {10, 30, 60, 120};
+        int index = 0; while (index < 4 && choices[index] != emotionReminderDurationSeconds) ++index;
+        emotionReminderDurationSeconds = choices[(index + 1) % 4];
+      } else if (row == 3) {
+        emotionReminderSoundChoice = (emotionReminderSoundChoice + 1) % 4;
+        playSoundChoice(emotionReminderSoundChoice, emotionReminderVolume, 1);
+      } else {
+        emotionReminderVolume = emotionReminderVolume >= 100 ? 10 : emotionReminderVolume + 10;
+        playSoundChoice(emotionReminderSoundChoice, emotionReminderVolume, 1);
+      }
+    }
+    emotionLastIntervalReminder = millis();
+    saveSettings(); showEmotionSettings();
+    return;
+  }
+  if (t.wasPressed()) {
+    emotionCancelPressValid = t.y >= 210 && t.x >= 214;
+    emotionCancelPressedAt = emotionCancelPressValid ? millis() : 0;
+  }
+  if (emotionApiConnected() && emotionFormPage == 4 && t.isPressed() && t.y >= 115 && t.y < 195) {
+    int next = constrain((int)map(constrain((int)t.x, 28, 292), 28, 292, 5, 120), 5, 120);
+    next = constrain(((next + 2) / 5) * 5, 5, 120);
+    if (next != emotionIndexPercent) { emotionIndexPercent = next; drawEmotionObservation(); }
+    return;
+  }
+  if (!t.wasReleased()) return;
+  haptic(12);
   if (t.y >= 210) {
     if (t.x >= 214) {
+      bool longPress = emotionCancelPressValid && emotionCancelPressedAt && millis() - emotionCancelPressedAt >= 700UL;
+      emotionCancelPressValid = false; emotionCancelPressedAt = 0;
       emotionSubmitArmed = false; emotionSubmitMessage = "";
       if (emotionReminderEnd) stopEmotionReminder();
+      else if (longPress) { emotionSettingsPage = 0; showEmotionSettings(); }
       else { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); }
+    } else if (!emotionApiConnected()) {
+      return;
     } else if (t.x < 107 && emotionFormPage > 0) {
       --emotionFormPage; emotionSubmitArmed = false; drawEmotionObservation();
     } else if (t.x >= 107 && t.x < 214) {
       if (emotionFormPage < 7) {
         ++emotionFormPage; emotionSubmitArmed = false; emotionSubmitMessage = "";
-        if (emotionFormPage == 7) getClockDateTime(&emotionFormTime);
         drawEmotionObservation();
       } else if (emotionSubmitCompleted) {
         return;
@@ -2592,8 +2792,19 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     }
     return;
   }
+  emotionCancelPressValid = false; emotionCancelPressedAt = 0;
+  if (!emotionApiConnected()) return;
   if (emotionFormPage == 0) {
-    getClockDateTime(&emotionFormTime);
+    if (t.y >= 55 && t.y < 149) {
+      int field = constrain(t.x / 63, 0, 4);
+      if (field == 0) emotionFormTime.date.year = emotionFormTime.date.year >= 2099 ? 2020 : emotionFormTime.date.year + 1;
+      else if (field == 1) emotionFormTime.date.month = emotionFormTime.date.month >= 12 ? 1 : emotionFormTime.date.month + 1;
+      else if (field == 2) emotionFormTime.date.date = emotionFormTime.date.date >= emotionDaysInMonth(emotionFormTime.date.year, emotionFormTime.date.month) ? 1 : emotionFormTime.date.date + 1;
+      else if (field == 3) emotionFormTime.time.hours = (emotionFormTime.time.hours + 1) % 24;
+      else emotionFormTime.time.minutes = (emotionFormTime.time.minutes + 5) % 60;
+      emotionFormTime.date.date = min<int>((int)emotionFormTime.date.date,
+        (int)emotionDaysInMonth(emotionFormTime.date.year, emotionFormTime.date.month));
+    }
     drawEmotionObservation();
   } else if (emotionFormPage == 1) {
     if (t.y >= 39 && t.y < 203) {
@@ -2602,29 +2813,30 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
       drawEmotionObservation();
     }
   } else if (emotionFormPage == 2) {
-    int row = constrain((t.y - 40) / 28, 0, 5);
+    if (t.y < 41 || t.y >= 192) return;
+    int row = (t.y >= 120 ? 3 : 0) + constrain((int)t.x / 105, 0, 2);
     if (row == 0) emotionHeartRate = (emotionHeartRate + 1) % (sizeof(EMOTION_HEART_RATES) / sizeof(EMOTION_HEART_RATES[0]));
     else if (row == 1) emotionBreathRate = (emotionBreathRate + 1) % (sizeof(EMOTION_BREATH_RATES) / sizeof(EMOTION_BREATH_RATES[0]));
     else if (row == 2) emotionSweating = (emotionSweating + 1) % (sizeof(EMOTION_SWEATING) / sizeof(EMOTION_SWEATING[0]));
-    else if (row == 3) emotionBodySignal = emotionBodySignal < 0 ? 0 : (emotionBodySignal + 1) % (sizeof(EMOTION_BODY_SIGNALS) / sizeof(EMOTION_BODY_SIGNALS[0]));
-    else if (row == 4) emotionBodyPart = emotionBodyPart < 0 ? 0 : (emotionBodyPart + 1) % (sizeof(EMOTION_BODY_PARTS) / sizeof(EMOTION_BODY_PARTS[0]));
+    else if (row == 3) emotionBodySignal = emotionBodySignal < 0 ? 0 :
+      (emotionBodySignal + 1 >= (int)(sizeof(EMOTION_BODY_SIGNALS) / sizeof(EMOTION_BODY_SIGNALS[0])) ? -1 : emotionBodySignal + 1);
+    else if (row == 4) emotionBodyPart = emotionBodyPart < 0 ? 0 :
+      (emotionBodyPart + 1 >= (int)(sizeof(EMOTION_BODY_PARTS) / sizeof(EMOTION_BODY_PARTS[0])) ? -1 : emotionBodyPart + 1);
     else emotionBehaviorCue = (emotionBehaviorCue + 1) % (sizeof(EMOTION_BEHAVIOR_CUES) / sizeof(EMOTION_BEHAVIOR_CUES[0]));
     drawEmotionObservation();
   } else if (emotionFormPage == 3) {
-    if (t.y >= 47 && t.y < 89) { emotionCategory = (emotionCategory + (t.x >= 160 ? 1 : 4)) % 5; emotionChoice = -1; }
-    else if (t.y >= 101 && t.y < 145) emotionChoice = (emotionChoice + (t.x >= 160 ? 1 : 9)) % 10;
+    if (t.y >= 46 && t.y < 107) { emotionCategory = (emotionCategory + (t.x >= 160 ? 1 : 4)) % 5; emotionChoice = -1; }
+    else if (t.y >= 118 && t.y < 179) emotionChoice = (emotionChoice + (t.x >= 160 ? 1 : 9)) % 10;
     drawEmotionObservation();
   } else if (emotionFormPage == 4) {
-    if (t.x < 160) emotionIndexPercent = emotionIndexPercent <= 5 ? 5 : emotionIndexPercent - 5;
-    else emotionIndexPercent = emotionIndexPercent >= 120 ? 120 : emotionIndexPercent + 5;
-    drawEmotionObservation();
+    return;
   } else if (emotionFormPage == 5) {
     bool increment = t.x >= 160;
-    if (t.y < 108) emotionObserveCount = constrain((int)emotionObserveCount + (increment ? 1 : -1), 1, 10);
+    if (t.y < 115) emotionObserveCount = constrain((int)emotionObserveCount + (increment ? 1 : -1), 1, 10);
     else emotionObserveMinutes = constrain((int)emotionObserveMinutes + (increment ? 1 : -1), 1, 30);
     drawEmotionObservation();
   } else if (emotionFormPage == 6) {
-    if (t.y < 98) emotionGroundingTiming = (emotionGroundingTiming + 1) % 3;
+    if (t.y < 115) emotionGroundingTiming = (emotionGroundingTiming + 1) % 3;
     else emotionGroundingAction = (emotionGroundingAction + 1) % (sizeof(EMOTION_GROUNDING_ACTIONS) / sizeof(EMOTION_GROUNDING_ACTIONS[0]));
     drawEmotionObservation();
   }
@@ -2719,7 +2931,7 @@ void handleTouch() {
   }
   if (!flatVirtualButtonsEnabled && t.y >= 210 && (t.wasPressed() || t.isPressed() || t.wasReleased()) && deviceIsFlat()) return;
   if (t.wasPressed() || t.isPressed() || t.wasReleased()) lastUserActivity = millis();
-  if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
+  if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionSettings || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
   if (screenNow == Screen::Clock) { handleClockTouch(t); return; }
   if (screenNow == Screen::Companion && t.y >= 210) {
     if (t.wasPressed() && t.x >= 107 && t.x < 214) companionCenterPressedAt = millis();
@@ -3304,7 +3516,10 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<section class='panel'><h2>" + tr("Emotion journal API account", "情緒觀察 API 帳號") + "</h2>";
     page += "<p class='muted'>" + tr("Save the API URL below before signing in. The password is sent to the configured HTTPS API for login and is not saved. The returned bearer token is stored in this Core2's Preferences so entries can be submitted later. This device's settings page uses local HTTP, so only sign in on a trusted Wi-Fi network; use a dedicated account.", "請先儲存下方 API 網址再登入。密碼只會透過 HTTPS 傳給 API 登入，不會儲存；Bearer token 會保存在這台 Core2 供稍後送出紀錄。設備設定頁使用區域網路 HTTP，請只在可信任的 Wi-Fi 登入，並使用專用帳號。") + "</p>";
     if (emotionApiToken.length()) {
+      bool apiOnline = emotionApiConnected();
+      page += "<p class='" + String(apiOnline ? "ok" : "muted") + "'>● " + (apiOnline ? tr("Database connected", "資料庫已連線") : tr("Saved login; connection not verified", "已儲存登入；尚未確認連線")) + "</p>";
       page += "<p class='ok'>" + tr("Signed in as ", "目前登入帳號：") + htmlEscape(emotionApiIdentity) + "</p>";
+      page += "<form method='post' action='/emotion-check'><input type='hidden' name='lang' value='" + String(zh ? "zh" : "en") + "'><button class='btn secondary' type='submit'>" + tr("Check database connection", "檢查資料庫連線") + "</button></form>";
       page += "<form method='post' action='/emotion-logout'><input type='hidden' name='lang' value='" + String(zh ? "zh" : "en") + "'><button class='btn secondary' type='submit'>" + tr("Forget this device's API login", "清除此設備的 API 登入") + "</button></form>";
     } else {
       page += "<form method='post' action='/emotion-login'><input type='hidden' name='lang' value='" + String(zh ? "zh" : "en") + "'><label class='field'>" + tr("Account email", "帳號 Email") + "<input type='email' name='emotionIdentity' autocomplete='username' required></label><label class='field'>" + tr("Password", "密碼") + "<input type='password' name='emotionPassword' autocomplete='current-password' required></label><button type='submit'>" + tr("Sign in to emotion API", "登入情緒觀察 API") + "</button></form>";
@@ -3483,9 +3698,18 @@ void setupSettingsServer() {
     password = "";
     sendSettingsPage(message, "emotion", language);
   });
+  settingsServer.on("/emotion-check", HTTP_POST, []() {
+    String language = settingsServer.arg("lang");
+    bool connected = verifyEmotionApiConnection(true);
+    String message = connected
+      ? (language == "zh" ? "資料庫連線正常，可以開始填寫。" : "The database connection is ready; entries can be started.")
+      : (language == "zh" ? "資料庫連線失敗，請重新登入。" : "The database connection failed; please sign in again.");
+    sendSettingsPage(message, "emotion", language);
+  });
   settingsServer.on("/emotion-logout", HTTP_POST, []() {
     String language = settingsServer.arg("lang");
     emotionApiToken = ""; emotionApiUserId = ""; emotionApiIdentity = "";
+    emotionApiState = EmotionApiState::Disconnected; emotionApiLastChecked = millis();
     prefs.begin("spaceclock", false); prefs.remove("emoToken"); prefs.remove("emoUser"); prefs.remove("emoIdent"); prefs.end();
     sendSettingsPage(language == "zh" ? "已清除此設備上的 API 登入資訊。" : "The API login was forgotten on this device.", "emotion", language);
   });
@@ -3596,6 +3820,7 @@ void setupSettingsServer() {
       if (requestedBase.length()) {
         if (requestedBase != emotionApiBase) {
           emotionApiToken = ""; emotionApiUserId = ""; emotionApiIdentity = "";
+          emotionApiState = EmotionApiState::Disconnected; emotionApiLastChecked = millis();
         }
         emotionApiBase = requestedBase;
       } else if (settingsServer.arg("emotionApiBase") != emotionApiBase) emotionBaseRejected = true;
@@ -3724,6 +3949,25 @@ void loop() {
   handleSerialConfig();
   uint32_t nowMs = millis();
   maintainSavedWifi(nowMs);
+  if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionSettings) {
+    bool redrawConnection = false;
+    if (WiFi.status() != WL_CONNECTED && emotionApiState != EmotionApiState::Disconnected) {
+      emotionApiState = EmotionApiState::Disconnected;
+      emotionApiLastChecked = nowMs;
+      redrawConnection = true;
+    } else if (WiFi.status() == WL_CONNECTED && emotionApiToken.length() && emotionApiUserId.length()) {
+      bool retryDisconnected = emotionApiState == EmotionApiState::Disconnected && nowMs - emotionApiLastChecked >= 15000UL;
+      bool periodicCheck = emotionApiState == EmotionApiState::Connected && nowMs - emotionApiLastChecked >= 300000UL;
+      if (emotionApiState == EmotionApiState::Unknown || retryDisconnected || periodicCheck) {
+        verifyEmotionApiConnection(true);
+        redrawConnection = true;
+      }
+    }
+    if (redrawConnection) {
+      if (screenNow == Screen::EmotionObservation) drawEmotionObservation();
+      else showEmotionSettings();
+    }
+  }
   maintainMqtt(nowMs);
   if (meditationAmbientPendingAt && (int32_t)(nowMs - meditationAmbientPendingAt) >= 0) {
     meditationAmbientPendingAt = 0;
