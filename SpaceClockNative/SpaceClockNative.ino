@@ -213,8 +213,6 @@ uint8_t emotionObserveCount = 1, emotionObserveMinutes = 1;
 uint8_t emotionGroundingTiming = 1, emotionGroundingAction = 10;
 uint32_t emotionCancelPressedAt = 0;
 bool emotionCancelPressValid = false;
-int8_t emotionTimeSwipeField = -1;
-int16_t emotionTimeSwipeStartY = 0;
 uint8_t emotionSettingsPage = 0;
 uint32_t companionNavPressStarted = 0;
 bool companionNavPressValid = false;
@@ -333,7 +331,7 @@ static const char* const EMOTION_CHOICES[10][14] = {
 static const char* const EMOTION_GROUNDING_TIMES[] = {"不填", "當下", "事後"};
 static const char* const EMOTION_GROUNDING_ACTIONS[] = {
   "無操作", "躺下", "摸摸頭", "走路", "放鬆肩膀", "轉脖子", "拜佛", "背書", "念誦", "持咒", "深呼吸",
-  "腹式呼吸", "拉筋/伸展", "甩手放鬆", "按壓胸口", "按壓手掌", "握拳再放鬆", "喝溫水", "洗臉/沖冷水",
+  "二次呼吸", "腹式呼吸", "拉筋/伸展", "甩手放鬆", "按壓胸口", "按壓手掌", "握拳再放鬆", "喝溫水", "洗臉/沖冷水",
   "踩地感受支撐", "看固定物30秒", "慢慢數呼吸"
 };
 
@@ -2481,7 +2479,7 @@ void drawEmotionObservation() {
       M5.Display.fillTriangle(x + 25, 133, x + 33, 133, x + 29, 139, accent);
     }
     useUIFont(1); M5.Display.setTextColor(emotionTheme(62), TFT_BLACK); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString("在各格上下滑動調整數值", 160, 183);
+    M5.Display.drawString("點上半部增加，點下半部減少", 160, 183);
   } else if (emotionFormPage == 1) {
     for (int i = 0; i < 8; ++i) {
       int x = (i % 2) ? 164 : 10, y = 39 + (i / 2) * 41;
@@ -2508,15 +2506,19 @@ void drawEmotionObservation() {
   } else if (emotionFormPage == 3) {
     M5.Display.fillRoundRect(12, 46, 296, 61, 10, selected);
     M5.Display.drawRoundRect(12, 46, 296, 61, 10, accent);
-    useUIFont(1); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.setTextDatum(middle_center);
+    useUIMediumFont(); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.setTextDatum(middle_center);
     M5.Display.drawString("類別　◀ / ▶", 160, 61);
     useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected);
     M5.Display.drawString(EMOTION_CATEGORIES[emotionCategory], 160, 87);
     String choiceText = emotionChoice < 0 ? "未選" : EMOTION_CHOICES[emotionCategory][emotionChoice];
     M5.Display.fillRoundRect(12, 118, 296, 61, 10, selected);
     M5.Display.drawRoundRect(12, 118, 296, 61, 10, accent);
-    useUIFont(1); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.drawString("情緒　◀ / ▶", 160, 133);
+    useUIMediumFont(); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.drawString("情緒　◀ / ▶", 160, 133);
     useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected); M5.Display.drawString(choiceText, 160, 159);
+    if (emotionSubmitMessage.length()) {
+      useUIFont(1); M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+      M5.Display.drawString(emotionSubmitMessage, 160, 198);
+    }
   } else if (emotionFormPage == 4) {
     M5.Display.fillRoundRect(16, 46, 288, 139, 12, panel);
     M5.Display.drawRoundRect(16, 46, 288, 139, 12, border);
@@ -2620,7 +2622,6 @@ void showEmotionObservation(bool newEntry = false) {
   if (newEntry) {
     emotionFormPage = 0;
     emotionSubmitArmed = false;
-    emotionTimeSwipeField = -1;
     emotionSubmitCompleted = false;
     emotionSubmitMessage = "";
     emotionLastSubmittedId = "";
@@ -3124,10 +3125,6 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
   if (t.wasPressed()) {
     emotionCancelPressValid = t.y >= 210 && t.x >= 214;
     emotionCancelPressedAt = emotionCancelPressValid ? millis() : 0;
-    if (emotionApiConnected() && emotionFormPage == 0 && t.y >= 48 && t.y < 160) {
-      emotionTimeSwipeField = constrain((int)t.x / 63, 0, 4);
-      emotionTimeSwipeStartY = t.y;
-    }
   }
   if (emotionApiConnected() && emotionFormPage == 4 && t.isPressed() && t.y >= 115 && t.y < 195) {
     int next = constrain((int)map(constrain((int)t.x, 28, 292), 28, 292, 5, 120), 5, 120);
@@ -3136,17 +3133,6 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     return;
   }
   if (!t.wasReleased()) return;
-  if (emotionTimeSwipeField >= 0) {
-    int8_t field = emotionTimeSwipeField;
-    int delta = emotionTimeSwipeStartY - t.y;
-    emotionTimeSwipeField = -1;
-    if (abs(delta) >= 8) {
-      haptic(12);
-      adjustEmotionTimeField(field, delta > 0 ? 1 : -1);
-      drawEmotionObservation();
-    }
-    return;
-  }
   haptic(12);
   if (emotionApiConnected() && emotionFormPage < 7 && t.x >= 282 && t.y < 34) {
     resetEmotionPage(emotionFormPage);
@@ -3171,6 +3157,11 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
       --emotionFormPage; emotionSubmitArmed = false; emotionSubmitMessage = ""; drawEmotionObservation();
     } else if (t.x >= 107 && t.x < 214) {
       if (emotionFormPage < 7) {
+        if (emotionFormPage == 3 && emotionChoice < 0) {
+          emotionSubmitMessage = "請先選擇一個情緒";
+          drawEmotionObservation();
+          return;
+        }
         ++emotionFormPage; emotionSubmitArmed = false; emotionSubmitMessage = "";
         drawEmotionObservation();
       } else if (emotionSubmitCompleted) {
@@ -3187,6 +3178,11 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
   emotionCancelPressValid = false; emotionCancelPressedAt = 0;
   if (!emotionApiConnected()) return;
   if (emotionFormPage == 0) {
+    if (t.y >= 48 && t.y < 160) {
+      uint8_t field = constrain(((int)t.x - 5) / 63, 0, 4);
+      adjustEmotionTimeField(field, t.y < 104 ? 1 : -1);
+      drawEmotionObservation();
+    }
     return;
   } else if (emotionFormPage == 1) {
     if (t.y >= 39 && t.y < 203) {
@@ -3214,6 +3210,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     } else if (t.y >= 118 && t.y < 179) {
       const uint8_t choiceCount = EMOTION_CHOICE_COUNTS[emotionCategory];
       emotionChoice = (emotionChoice + (t.x >= 160 ? 1 : choiceCount - 1)) % choiceCount;
+      emotionSubmitMessage = "";
     }
     drawEmotionObservation();
   } else if (emotionFormPage == 4) {
@@ -3224,8 +3221,14 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     else emotionObserveMinutes = constrain((int)emotionObserveMinutes + (increment ? 1 : -1), 1, 30);
     drawEmotionObservation();
   } else if (emotionFormPage == 6) {
-    if (t.y < 115) emotionGroundingTiming = (emotionGroundingTiming + 1) % 3;
-    else emotionGroundingAction = (emotionGroundingAction + 1) % (sizeof(EMOTION_GROUNDING_ACTIONS) / sizeof(EMOTION_GROUNDING_ACTIONS[0]));
+    bool next = t.x >= 160;
+    if (t.y < 115) {
+      const uint8_t count = sizeof(EMOTION_GROUNDING_TIMES) / sizeof(EMOTION_GROUNDING_TIMES[0]);
+      emotionGroundingTiming = (emotionGroundingTiming + (next ? 1 : count - 1)) % count;
+    } else {
+      const uint8_t count = sizeof(EMOTION_GROUNDING_ACTIONS) / sizeof(EMOTION_GROUNDING_ACTIONS[0]);
+      emotionGroundingAction = (emotionGroundingAction + (next ? 1 : count - 1)) % count;
+    }
     drawEmotionObservation();
   }
 }

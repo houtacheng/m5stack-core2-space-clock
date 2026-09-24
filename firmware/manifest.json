@@ -1,7 +1,7 @@
 {
-  "version": "2.9.10",
+  "version": "2.9.11",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "0d91a3a73aeaaaeea9155b865c6d11db7bf39e3cf32fa753dca279aacd2fcc8c",
-  "size": 4805152,
-  "notes": "Fixes emotion-entry withdrawal with the API-required authenticated soft delete. Alarm dismissal now follows the active clock face: drag the astronaut on Space, rotate the large gear one clockwise turn on Flip, or hold the blue pill until it dissolves on Matrix. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "ad21e01a314f9777bc3a09305129d88e71b57b0b7bc09d7e5c858c429e4d7733",
+  "size": 4805280,
+  "notes": "Changes emotion-form time adjustment from swipe to upper/lower taps, standardizes category and emotion text sizing, makes category, emotion and grounding selectors use left for previous and right for next, prevents leaving Page 4 until an emotion is selected, and adds secondary breathing. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }

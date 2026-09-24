@@ -3,6 +3,10 @@
 Fast native C++ firmware for the M5Stack Core2, with original artwork and a
 touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 
+Version 2.9.11 changes emotion-form time fields to upper/lower tap controls,
+uses consistent previous/next selectors, blocks continuation until an emotion
+is selected, and adds secondary breathing as a grounding action.
+
 Version 2.9.10 changes emotion-entry withdrawal to the PocketBase-compatible
 soft-delete flow (`PATCH` with `deleted: true`), matching the journal API rules.
 It also gives each clock face its own animated alarm-dismissal challenge: drag

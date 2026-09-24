@@ -2,7 +2,10 @@
 
 Native firmware that turns an M5Stack Core2 into a smooth animated clock,
 20-alarm clock, meditation timer, emotion-observation logger, MQTT device and
-four-page Bitfocus Companion Satellite control panel. Version 2.9.10 fixes
+four-page Bitfocus Companion Satellite control panel. Version 2.9.11 replaces
+time-field swipes with upper/lower taps, makes emotion and grounding selectors
+consistently bidirectional, requires an emotion before continuing, and adds
+secondary breathing. Version 2.9.10 fixes
 emotion-entry withdrawal by using the API's required authenticated soft-delete
 update instead of a forbidden direct deletion. Alarm dismissal now follows the
 active face: astronaut drag, one clockwise gear turn, or a dissolving blue-pill
