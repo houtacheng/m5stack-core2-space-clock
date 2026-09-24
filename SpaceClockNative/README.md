@@ -3,6 +3,10 @@
 Fast native C++ firmware for the M5Stack Core2, with original artwork and a
 touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 
+Version 2.9.12 makes the upper half of each time field move backward and the
+lower half move forward. Sweating is now a two-state checkbox and is submitted
+to PocketBase as a JSON boolean, matching the web journal.
+
 Version 2.9.11 changes emotion-form time fields to upper/lower tap controls,
 uses consistent previous/next selectors, blocks continuation until an emotion
 is selected, and adds secondary breathing as a grounding action.

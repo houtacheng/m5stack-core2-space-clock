@@ -1,7 +1,7 @@
 {
-  "version": "2.9.11",
+  "version": "2.9.12",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "ad21e01a314f9777bc3a09305129d88e71b57b0b7bc09d7e5c858c429e4d7733",
-  "size": 4805280,
-  "notes": "Changes emotion-form time adjustment from swipe to upper/lower taps, standardizes category and emotion text sizing, makes category, emotion and grounding selectors use left for previous and right for next, prevents leaving Page 4 until an emotion is selected, and adds secondary breathing. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "c6568bb93311fc5977f58032535ebc02975b3062c445ac426280e0c5bb39aa1f",
+  "size": 4805248,
+  "notes": "Reverses Page 1 time controls so the upper half moves backward and the lower half moves forward. Page 3 sweating is now a simple unchecked/checked toggle and is submitted to PocketBase as a JSON boolean matching the web journal. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }

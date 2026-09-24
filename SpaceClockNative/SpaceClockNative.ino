@@ -300,7 +300,7 @@ static const char* const EMOTION_HEART_RATES[] = {
 static const char* const EMOTION_BREATH_RATES[] = {
   "不填", "觀察不出來", "很慢", "偏慢", "正常", "偏快", "很快", "呼吸急促"
 };
-static const char* const EMOTION_SWEATING[] = {"不填", "沒有", "輕微", "明顯", "冒冷汗"};
+static const char* const EMOTION_SWEATING[] = {"未勾選", "已勾選"};
 static const char* const EMOTION_BODY_SIGNALS[] = {
   "心悸/心口抽緊", "胸悶/胸口壓迫", "呼吸急促", "呼吸變淺", "嘆氣", "肩頸緊繃", "頭痛", "胃部不適",
   "手腳發冷", "身體發熱", "手抖", "冒汗", "想哭", "身體僵住", "坐立難安", "疲倦"
@@ -2479,7 +2479,7 @@ void drawEmotionObservation() {
       M5.Display.fillTriangle(x + 25, 133, x + 33, 133, x + 29, 139, accent);
     }
     useUIFont(1); M5.Display.setTextColor(emotionTheme(62), TFT_BLACK); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString("點上半部增加，點下半部減少", 160, 183);
+    M5.Display.drawString("點上半部後退，點下半部增加", 160, 183);
   } else if (emotionFormPage == 1) {
     for (int i = 0; i < 8; ++i) {
       int x = (i % 2) ? 164 : 10, y = 39 + (i / 2) * 41;
@@ -2860,13 +2860,14 @@ bool submitEmotionObservation() {
   data["trigger_other"] = "";
   data["heart_rate"] = EMOTION_HEART_RATES[emotionHeartRate];
   data["breath_rate"] = EMOTION_BREATH_RATES[emotionBreathRate];
-  data["sweating"] = EMOTION_SWEATING[emotionSweating];
+  data["sweating"] = emotionSweating != 0;
   JsonArray bodySignals = data.createNestedArray("body_signals");
   if (emotionBodySignal >= 0) bodySignals.add(EMOTION_BODY_SIGNALS[(uint8_t)emotionBodySignal]);
   JsonArray bodyParts = data.createNestedArray("body_parts");
   if (emotionBodyPart >= 0) bodyParts.add(EMOTION_BODY_PARTS[(uint8_t)emotionBodyPart]);
   data["body_other"] = "";
-  data["body_reaction"] = String(EMOTION_HEART_RATES[emotionHeartRate]) + "、" + EMOTION_BREATH_RATES[emotionBreathRate] + "、" + EMOTION_SWEATING[emotionSweating];
+  data["body_reaction"] = String(EMOTION_HEART_RATES[emotionHeartRate]) + "、" + EMOTION_BREATH_RATES[emotionBreathRate]
+    + (emotionSweating ? "、冒汗" : "");
   JsonArray behaviors = data.createNestedArray("behavior_cues");
   if (emotionBehaviorCue > 0) behaviors.add(EMOTION_BEHAVIOR_CUES[emotionBehaviorCue]);
   data["behavior_other"] = "";
@@ -3180,7 +3181,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
   if (emotionFormPage == 0) {
     if (t.y >= 48 && t.y < 160) {
       uint8_t field = constrain(((int)t.x - 5) / 63, 0, 4);
-      adjustEmotionTimeField(field, t.y < 104 ? 1 : -1);
+      adjustEmotionTimeField(field, t.y < 104 ? -1 : 1);
       drawEmotionObservation();
     }
     return;
@@ -3195,7 +3196,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     int row = (t.y >= 120 ? 3 : 0) + constrain((int)t.x / 105, 0, 2);
     if (row == 0) emotionHeartRate = (emotionHeartRate + 1) % (sizeof(EMOTION_HEART_RATES) / sizeof(EMOTION_HEART_RATES[0]));
     else if (row == 1) emotionBreathRate = (emotionBreathRate + 1) % (sizeof(EMOTION_BREATH_RATES) / sizeof(EMOTION_BREATH_RATES[0]));
-    else if (row == 2) emotionSweating = (emotionSweating + 1) % (sizeof(EMOTION_SWEATING) / sizeof(EMOTION_SWEATING[0]));
+    else if (row == 2) emotionSweating = emotionSweating ? 0 : 1;
     else if (row == 3) emotionBodySignal = emotionBodySignal < 0 ? 0 :
       (emotionBodySignal + 1 >= (int)(sizeof(EMOTION_BODY_SIGNALS) / sizeof(EMOTION_BODY_SIGNALS[0])) ? -1 : emotionBodySignal + 1);
     else if (row == 4) emotionBodyPart = emotionBodyPart < 0 ? 0 :
