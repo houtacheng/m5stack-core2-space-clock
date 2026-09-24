@@ -1,7 +1,7 @@
 {
-  "version": "2.9.14",
+  "version": "2.9.15",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "5426f303ee87ae2b77769ee907d8a1b6ee6e2da09f7445d209dc04983da123dd",
-  "size": 5411888,
-  "notes": "Adds a Matrix-styled My Records page to emotion observation Page 1. It reads the authenticated /api/statistics endpoint for all non-deleted records and displays learning days, entry count, daily average, common body response and emotion, strongest emotion, and most-used grounding method. Includes token refresh, retry, and clear offline/login errors. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "6c135da55b1ccd2bb6efbed140b36092f0cd60c99eaadc9590d38f1ecb16537d",
+  "size": 5410752,
+  "notes": "Fixes My Records statistics parsing when /api/statistics is delivered through Caddy or Cloudflare. HTTP transfer framing is decoded before the low-memory JSON field filter runs, preventing false missing-data errors. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }

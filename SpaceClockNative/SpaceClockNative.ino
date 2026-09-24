@@ -3478,8 +3478,13 @@ int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
     data["strongestEmotion"]["emotion"] = true;
     data["strongestEmotion"]["index"] = true;
     data["grounding"]["mostUsed"]["name"] = true;
+    // HTTPClient::getStream() exposes HTTP/1.1 chunk framing on some Caddy /
+    // Cloudflare responses. ArduinoJson can then accept the leading chunk size
+    // as a valid scalar and silently produce a document without `data`. Let
+    // HTTPClient decode the response body first, then apply the JSON filter.
+    String response = http.getString();
     DeserializationError parseError = deserializeJson(
-      result, http.getStream(), DeserializationOption::Filter(filter));
+      result, response, DeserializationOption::Filter(filter));
     if (parseError) {
       errorBody = parseError.c_str();
       code = -10002;
