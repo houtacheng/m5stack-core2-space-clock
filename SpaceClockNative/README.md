@@ -3,6 +3,10 @@
 Fast native C++ firmware for the M5Stack Core2, with original artwork and a
 touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 
+Version 2.9.17 reads the seven My Records values directly from the hosted
+statistics API's `data.summary` object. The endpoint now runs beside the
+database, so statistics no longer depend on a Mac being online.
+
 Version 2.9.16 displays both actions on every clock navigation button with
 normalized icon pairs: Companion / Emotion, Meditation / Home Assistant, and
 Settings / Night Light. Short-press and long-press behavior is unchanged.

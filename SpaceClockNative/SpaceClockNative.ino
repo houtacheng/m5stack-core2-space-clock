@@ -3495,25 +3495,18 @@ int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
   http.addHeader("Authorization", "Bearer " + emotionApiToken);
   int code = http.GET();
   if (code == 200) {
-    // The statistics endpoint also returns charts and daily history. Filter the
-    // response while streaming so the Core2 only retains the seven summary
-    // values used by this screen.
-    DynamicJsonDocument filter(768);
-    JsonObject data = filter.createNestedObject("data");
-    data["count"] = true;
-    data["days"] = true;
-    data["mostCommonEmotion"]["name"] = true;
-    data["bodySignals"]["mostCommon"]["name"] = true;
-    data["strongestEmotion"]["emotion"] = true;
-    data["strongestEmotion"]["index"] = true;
-    data["grounding"]["mostUsed"]["name"] = true;
-    // HTTPClient::getStream() exposes HTTP/1.1 chunk framing on some Caddy /
-    // Cloudflare responses. ArduinoJson can then accept the leading chunk size
-    // as a valid scalar and silently produce a document without `data`. Let
-    // HTTPClient decode the response body first, then apply the JSON filter.
+    DynamicJsonDocument filter(1024);
+    JsonObject summary = filter["data"].createNestedObject("summary");
+    summary["learningDays"] = true;
+    summary["filledSheets"] = true;
+    summary["averagePerDay"] = true;
+    summary["mostCommonBodyReaction"]["name"] = true;
+    summary["mostCommonEmotion"]["name"] = true;
+    summary["strongestEmotion"]["emotion"] = true;
+    summary["strongestEmotion"]["index"] = true;
+    summary["mostCommonGrounding"]["name"] = true;
     String response = http.getString();
-    DeserializationError parseError = deserializeJson(
-      result, response, DeserializationOption::Filter(filter));
+    DeserializationError parseError = deserializeJson(result, response, DeserializationOption::Filter(filter));
     if (parseError) {
       errorBody = parseError.c_str();
       code = -10002;
@@ -3563,28 +3556,27 @@ bool loadEmotionRecordStats() {
     return false;
   }
 
-  JsonObject data = stats["data"].as<JsonObject>();
-  if (data.isNull()) {
-    emotionRecordsError = "統計 API 缺少 data 欄位";
+  JsonObject summary = stats["data"]["summary"].as<JsonObject>();
+  if (summary.isNull()) {
+    emotionRecordsError = "統計 API 缺少 summary 欄位";
     emotionRecordsState = EmotionRecordsState::Error;
     return false;
   }
-  emotionRecordsSheetCount = data["count"] | 0UL;
-  emotionRecordsLearningDays = data["days"] | 0;
+  emotionRecordsSheetCount = summary["filledSheets"] | 0UL;
+  emotionRecordsLearningDays = summary["learningDays"] | 0;
   char average[16];
-  snprintf(average, sizeof(average), "%.1f",
-    emotionRecordsLearningDays ? (double)emotionRecordsSheetCount / emotionRecordsLearningDays : 0.0);
+  snprintf(average, sizeof(average), "%.1f", summary["averagePerDay"] | 0.0);
   emotionRecordsAverage = average;
 
-  const char* topBody = data["bodySignals"]["mostCommon"]["name"] | "-";
-  const char* topEmotion = data["mostCommonEmotion"]["name"] | "-";
-  const char* strongest = data["strongestEmotion"]["emotion"] | "-";
-  const char* topGrounding = data["grounding"]["mostUsed"]["name"] | "-";
+  const char* topBody = summary["mostCommonBodyReaction"]["name"] | "-";
+  const char* topEmotion = summary["mostCommonEmotion"]["name"] | "-";
+  const char* strongest = summary["strongestEmotion"]["emotion"] | "-";
+  const char* topGrounding = summary["mostCommonGrounding"]["name"] | "-";
   emotionRecordsTopBody = topBody && topBody[0] ? topBody : "-";
   emotionRecordsTopEmotion = topEmotion && topEmotion[0] ? topEmotion : "-";
   emotionRecordsTopGrounding = topGrounding && topGrounding[0] ? topGrounding : "-";
   emotionRecordsStrongest = strongest && strongest[0] ? strongest : "-";
-  int strongestIndex = data["strongestEmotion"]["index"] | -1;
+  int strongestIndex = summary["strongestEmotion"]["index"] | -1;
   if (emotionRecordsStrongest != "-" && strongestIndex >= 0) {
     emotionRecordsStrongest += " " + String(strongestIndex) + "%";
   }

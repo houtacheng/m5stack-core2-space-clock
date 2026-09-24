@@ -1,7 +1,7 @@
 {
-  "version": "2.9.16",
+  "version": "2.9.17",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "ea27a6834fe1bcbc67285176a208ea0c775c47e78c4d8e22a8ad2831aae9be96",
-  "size": 5413136,
-  "notes": "Adds normalized short-press / long-press icon pairs to the three clock navigation buttons: Companion / Emotion, Meditation / Home Assistant, and Settings / Night Light. Button behavior is unchanged. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "14b7898f9d930af7abfd610e88c3b6788d5a7bec11b8f1b0305466f218fa3091",
+  "size": 5413328,
+  "notes": "Updates My Records to read the hosted statistics API's computed data.summary fields. Statistics now run beside the database and no longer require a Mac to be online. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }
