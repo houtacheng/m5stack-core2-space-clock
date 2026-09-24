@@ -1,7 +1,7 @@
 {
-  "version": "2.9.18",
+  "version": "2.9.20",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "92e1c6dce2ea6ccf4e9444e5b94e4ec7c2daa302a4a5b6e219b0cc288e0bc09a",
-  "size": 5419536,
-  "notes": "Refreshes the full bottom navigation icon set with consistent sizing for night light, settings, check, close, install, next, previous and clock actions. Device and browser settings now use a unified dark theme. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "b35898221af104a83c16dc0540c4cc25efcb7886d37788ce25ab7a5c8535efb4",
+  "size": 5423184,
+  "notes": "Adds todaySheets to Emotion Observation > My Records and includes the resilient OTA updater with live progress, a 12-second stall limit, bounded retry, temporary Wi-Fi sleep disabling, detailed diagnostics and SHA-256 verification. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }

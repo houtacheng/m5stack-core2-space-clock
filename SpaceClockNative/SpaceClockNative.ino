@@ -12,6 +12,7 @@
 #include <ArduinoJson.h>
 #include <mp3dec.h>
 #include <mbedtls/base64.h>
+#include <mbedtls/sha256.h>
 #include <esp_heap_caps.h>
 #include <math.h>
 #include <time.h>
@@ -142,6 +143,8 @@ uint8_t firmwareCheckHour = 3;
 int32_t lastAutomaticUpdateDay = -1;
 String latestFirmwareVersion;
 String latestFirmwareUrl;
+String latestFirmwareSha256;
+uint32_t latestFirmwareExpectedSize = 0;
 String firmwareUpdateMessage = "Tap Check to look for a new version.";
 bool firmwareUpdateAvailable = false;
 bool wakeTouchConsumed = false;
@@ -252,6 +255,7 @@ enum class EmotionRecordsState : uint8_t { Loading, Ready, Error };
 EmotionRecordsState emotionRecordsState = EmotionRecordsState::Loading;
 uint16_t emotionRecordsLearningDays = 0;
 uint32_t emotionRecordsSheetCount = 0;
+uint32_t emotionRecordsTodaySheets = 0;
 String emotionRecordsAverage = "0.0";
 String emotionRecordsTopBody = "-";
 String emotionRecordsTopEmotion = "-";
@@ -2771,6 +2775,8 @@ bool readFirmwareManifest(bool redraw = true) {
   }
   latestFirmwareVersion = doc["version"].as<String>();
   latestFirmwareUrl = doc["url"].as<String>();
+  latestFirmwareSha256 = doc["sha256"].is<const char*>() ? doc["sha256"].as<String>() : "";
+  latestFirmwareExpectedSize = doc["size"].is<uint32_t>() ? doc["size"].as<uint32_t>() : 0;
   firmwareUpdateAvailable = compareFirmwareVersions(SPACE_CLOCK_VERSION, latestFirmwareVersion) < 0;
   firmwareUpdateMessage = firmwareUpdateAvailable ? "New firmware is ready. Tap Install." : "This firmware is up to date.";
   if (redraw) showFirmwareUpdate();
@@ -2779,30 +2785,141 @@ bool readFirmwareManifest(bool redraw = true) {
 
 bool installLatestFirmware(bool redraw = true) {
   if (!firmwareUpdateAvailable || !latestFirmwareUrl.length()) return false;
-  if (redraw) {
-    firmwareUpdateMessage = "Downloading. Keep USB power connected...";
-    showFirmwareUpdate();
-  }
-  WiFiClientSecure secure;
-  secure.setInsecure();
-  HTTPClient http;
-  http.setConnectTimeout(10000);
-  http.setTimeout(30000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(secure, latestFirmwareUrl)) return false;
-  int status = http.GET();
-  int size = http.getSize();
-  if (status != HTTP_CODE_OK || size <= 0 || !Update.begin(size, U_FLASH)) {
-    firmwareUpdateMessage = "Download could not start.";
-    http.end();
+  static constexpr uint8_t MAX_ATTEMPTS = 2;
+  static constexpr uint32_t STALL_TIMEOUT_MS = 12000;
+  wifi_ps_type_t previousSleepMode = WiFi.getSleep();
+  WiFi.setSleep(false);
+  bool success = false;
+  String failure = "Download failed.";
+
+  for (uint8_t attempt = 1; attempt <= MAX_ATTEMPTS && !success; ++attempt) {
+    firmwareUpdateMessage = "Connecting (attempt " + String(attempt) + "/" + String(MAX_ATTEMPTS) + ")...";
     if (redraw) showFirmwareUpdate();
-    return false;
+    Serial.printf("[ota] attempt %u/%u: %s\n", attempt, MAX_ATTEMPTS, latestFirmwareUrl.c_str());
+
+    WiFiClientSecure secure;
+    secure.setInsecure();
+    secure.setTimeout(5);
+    HTTPClient http;
+    http.setConnectTimeout(10000);
+    http.setTimeout(5000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (!http.begin(secure, latestFirmwareUrl)) {
+      failure = "Could not open firmware URL.";
+      Serial.println("[ota] HTTP begin failed");
+      continue;
+    }
+
+    int status = http.GET();
+    int imageSize = http.getSize();
+    Serial.printf("[ota] HTTP %d, content length %d\n", status, imageSize);
+    if (status != HTTP_CODE_OK || imageSize <= 0) {
+      failure = "Firmware server returned HTTP " + String(status) + ".";
+      http.end();
+      continue;
+    }
+    if (latestFirmwareExpectedSize && (uint32_t)imageSize != latestFirmwareExpectedSize) {
+      failure = "Firmware size does not match manifest.";
+      Serial.printf("[ota] size mismatch: manifest %u, response %d\n", latestFirmwareExpectedSize, imageSize);
+      http.end();
+      continue;
+    }
+    if (!Update.begin((size_t)imageSize, U_FLASH)) {
+      failure = "OTA slot unavailable: " + String(Update.errorString()) + ".";
+      Serial.printf("[ota] Update.begin failed: %s\n", Update.errorString());
+      http.end();
+      continue;
+    }
+
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    NetworkClient* stream = http.getStreamPtr();
+    static uint8_t buffer[4096];
+    size_t written = 0;
+    uint32_t lastDataAt = millis();
+    uint32_t lastDrawAt = 0;
+    int lastPercent = -1;
+    bool streamFailed = false;
+
+    while (written < (size_t)imageSize) {
+      int available = stream ? stream->available() : 0;
+      if (available > 0) {
+        size_t toRead = (size_t)available;
+        if (toRead > sizeof(buffer)) toRead = sizeof(buffer);
+        if (toRead > (size_t)imageSize - written) toRead = (size_t)imageSize - written;
+        int received = stream->read(buffer, toRead);
+        if (received > 0) {
+          if (Update.write(buffer, (size_t)received) != (size_t)received) {
+            failure = "Flash write failed: " + String(Update.errorString()) + ".";
+            Serial.printf("[ota] flash write failed at %u: %s\n", (unsigned)written, Update.errorString());
+            streamFailed = true;
+            break;
+          }
+          mbedtls_sha256_update(&sha, buffer, (size_t)received);
+          written += (size_t)received;
+          lastDataAt = millis();
+          int percent = (int)((written * 100ULL) / (size_t)imageSize);
+          if (percent != lastPercent && (percent == 100 || percent >= lastPercent + 2 || millis() - lastDrawAt >= 1000)) {
+            lastPercent = percent;
+            lastDrawAt = millis();
+            firmwareUpdateMessage = "Downloading " + String(percent) + "% (" + String(attempt) + "/" + String(MAX_ATTEMPTS) + ")";
+            if (redraw) showFirmwareUpdate();
+            Serial.printf("[ota] %d%% (%u/%d bytes)\n", percent, (unsigned)written, imageSize);
+          }
+          continue;
+        }
+      }
+
+      if (stream && !stream->connected()) {
+        failure = "Firmware connection closed at " + String((written * 100ULL) / (size_t)imageSize) + "%.";
+        Serial.printf("[ota] connection closed at %u/%d bytes\n", (unsigned)written, imageSize);
+        streamFailed = true;
+        break;
+      }
+      if (millis() - lastDataAt >= STALL_TIMEOUT_MS) {
+        failure = "Download stalled for 12 seconds.";
+        Serial.printf("[ota] stalled at %u/%d bytes\n", (unsigned)written, imageSize);
+        streamFailed = true;
+        break;
+      }
+      delay(2);
+    }
+
+    uint8_t digest[32];
+    mbedtls_sha256_finish(&sha, digest);
+    mbedtls_sha256_free(&sha);
+    http.end();
+
+    if (!streamFailed && written == (size_t)imageSize) {
+      char digestHex[65];
+      for (uint8_t i = 0; i < sizeof(digest); ++i) snprintf(digestHex + i * 2, 3, "%02x", digest[i]);
+      digestHex[64] = 0;
+      if (latestFirmwareSha256.length() == 64 && !latestFirmwareSha256.equalsIgnoreCase(digestHex)) {
+        failure = "Firmware checksum mismatch.";
+        Serial.printf("[ota] SHA-256 mismatch: expected %s, got %s\n", latestFirmwareSha256.c_str(), digestHex);
+        Update.abort();
+      } else if (!Update.end(true)) {
+        failure = "Update finalize failed: " + String(Update.errorString()) + ".";
+        Serial.printf("[ota] Update.end failed: %s\n", Update.errorString());
+      } else {
+        Serial.printf("[ota] verified %s; update ready\n", digestHex);
+        success = true;
+      }
+    } else {
+      Update.abort();
+    }
+
+    if (!success && attempt < MAX_ATTEMPTS) {
+      firmwareUpdateMessage = failure + " Retrying...";
+      if (redraw) showFirmwareUpdate();
+      delay(750);
+    }
   }
-  size_t written = Update.writeStream(http.getStream());
-  bool success = written == (size_t)size && Update.end(true);
-  http.end();
+
+  WiFi.setSleep(previousSleepMode);
   if (!success) {
-    firmwareUpdateMessage = "Update failed; current firmware is safe.";
+    firmwareUpdateMessage = failure;
     if (redraw) showFirmwareUpdate();
     return false;
   }
@@ -3068,17 +3185,17 @@ void drawEmotionChoicePanel(int y, const char* label, const String& value, uint1
 }
 
 void drawEmotionRecordsRow(int y, const char* label, const String& value) {
-  uint16_t fill = emotionPanel((y / 23 & 1) ? 10 : 14);
-  M5.Display.fillRoundRect(8, y, 304, 21, 5, fill);
-  M5.Display.drawRoundRect(8, y, 304, 21, 5, emotionTheme(30));
+  uint16_t fill = emotionPanel((y / 21 & 1) ? 10 : 14);
+  M5.Display.fillRoundRect(8, y, 304, 19, 5, fill);
+  M5.Display.drawRoundRect(8, y, 304, 19, 5, emotionTheme(30));
   useUIFont(1);
   M5.Display.setTextDatum(middle_left);
   M5.Display.setTextColor(emotionTheme(72), fill);
-  M5.Display.drawString(label, 15, y + 11);
-  M5.Display.setClipRect(136, y + 1, 168, 19);
+  M5.Display.drawString(label, 15, y + 10);
+  M5.Display.setClipRect(136, y + 1, 168, 17);
   M5.Display.setTextDatum(middle_right);
   M5.Display.setTextColor(TFT_WHITE, fill);
-  M5.Display.drawString(value, 303, y + 11);
+  M5.Display.drawString(value, 303, y + 10);
   M5.Display.clearClipRect();
 }
 
@@ -3112,13 +3229,14 @@ void drawEmotionRecords() {
     M5.Display.drawString(emotionRecordsError, 160, 132);
     M5.Display.clearClipRect();
   } else {
-    drawEmotionRecordsRow(38,  "學習天數", String(emotionRecordsLearningDays) + " 天");
-    drawEmotionRecordsRow(62,  "填寫張數", String(emotionRecordsSheetCount) + " 張");
-    drawEmotionRecordsRow(86,  "平均一天", emotionRecordsAverage + " 張");
-    drawEmotionRecordsRow(110, "最常身體反應", emotionRecordsTopBody);
-    drawEmotionRecordsRow(134, "最常出現情緒", emotionRecordsTopEmotion);
-    drawEmotionRecordsRow(158, "最強烈的情緒", emotionRecordsStrongest);
-    drawEmotionRecordsRow(182, "最常情緒落地", emotionRecordsTopGrounding);
+    drawEmotionRecordsRow(37,  "學習天數", String(emotionRecordsLearningDays) + " 天");
+    drawEmotionRecordsRow(58,  "填寫張數", String(emotionRecordsSheetCount) + " 張");
+    drawEmotionRecordsRow(79,  "今日張數", String(emotionRecordsTodaySheets) + " 張");
+    drawEmotionRecordsRow(100, "平均一天", emotionRecordsAverage + " 張");
+    drawEmotionRecordsRow(121, "最常身體反應", emotionRecordsTopBody);
+    drawEmotionRecordsRow(142, "最常出現情緒", emotionRecordsTopEmotion);
+    drawEmotionRecordsRow(163, "最強烈的情緒", emotionRecordsStrongest);
+    drawEmotionRecordsRow(184, "最常情緒落地", emotionRecordsTopGrounding);
   }
   drawEmotionBottomBar("重新整理", "", "返回");
 }
@@ -3532,6 +3650,7 @@ int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
     JsonObject summary = filter["data"].createNestedObject("summary");
     summary["learningDays"] = true;
     summary["filledSheets"] = true;
+    summary["todaySheets"] = true;
     summary["averagePerDay"] = true;
     summary["mostCommonBodyReaction"]["name"] = true;
     summary["mostCommonEmotion"]["name"] = true;
@@ -3596,6 +3715,7 @@ bool loadEmotionRecordStats() {
     return false;
   }
   emotionRecordsSheetCount = summary["filledSheets"] | 0UL;
+  emotionRecordsTodaySheets = summary["todaySheets"] | 0UL;
   emotionRecordsLearningDays = summary["learningDays"] | 0;
   char average[16];
   snprintf(average, sizeof(average), "%.1f", summary["averagePerDay"] | 0.0);
