@@ -11,7 +11,7 @@ touch-friendly clock, alarm, meditation and Bitfocus Companion interface.
 - Automatic Companion failover: local TCP 16622 first, Internet WSS/443 second
 - Meditation timer with two presets, reminders, ambience and Bottom2 lighting
 - Emotion observation wizard entered by long-pressing Companion on the clock; PocketBase API submission is confirmed on the final review page
-- Configurable emotion-entry reminders: disabled, interval-based, or up to three fixed times, with optional vibration/audio and a selectable reminder length
+- Configurable emotion-entry reminders: disabled, scheduled within a daily time window, or up to three fixed times, with optional vibration/audio and a selectable reminder length
 - NTP time, major-city time zones, 12/24-hour display and automatic brightness
 - Screen timeout with touch and motion wake
 - Long-press the clock's settings gear to toggle the Bottom2 night light; set its color and brightness in the web settings
@@ -41,21 +41,27 @@ uses local HTTP, so sign in only from a trusted Wi-Fi network and preferably use
 a dedicated account. The device does not enable ESP32 flash encryption, so its
 stored token is not protected against physical flash extraction.
 
-The form starts when you long-press the left **Companion** button on the clock.
+The Matrix-themed form starts when you long-press the left **Companion** button on the clock.
 Its top-left light is green only after the saved account has been authenticated
 against the database; editing stays locked while the light is yellow or red.
 It captures the device's local time and guides you through trigger, body
 reaction, emotion, intensity, observation duration and grounding. Short-press
 **Cancel** to return to the clock, or long-press it for on-device reminder
-settings. On the final review page, tap **Confirm** and then **Send** to create
-the PocketBase `entries` record over HTTPS. The API base URL defaults to
+settings. Pages 1–7 have a graphical reset control in the upper-right corner;
+the five date/time fields on page 1 change by swiping up or down. On the final
+review page, tap **Send** and then **Confirm send** to create the PocketBase
+`entries` record over HTTPS. After submission, **Withdraw** deletes that record,
+while **Sent** starts a fresh form. The API base URL defaults to
 `https://emotion.theoakhouse.org`. The HTTPS client validates the server against
 embedded ISRG Root X1 and Google Trust Services Root R4 trust anchors.
+The emotion picker provides ten detailed categories: anger, hurt, sadness,
+loss, despair, anxiety, stress, nostalgia, self-denial and failure.
 
-Reminder settings are saved independently in the same web tab. Interval mode
-supports 15, 30, 60, 120 or 240 minutes. Fixed mode supports three daily times;
-each can be enabled separately. The **Later** device action snoozes a reminder
-for ten minutes.
+Reminder settings are saved independently in the same web tab. Scheduled mode
+uses a daily start/end window and intervals of 10, 15, 30, 60, 120, 180 or 240
+minutes, anchored at the start time. Fixed mode supports three daily times; each
+can be enabled separately. The **Later** device action snoozes a reminder for ten
+minutes.
 
 ## Firmware update
 

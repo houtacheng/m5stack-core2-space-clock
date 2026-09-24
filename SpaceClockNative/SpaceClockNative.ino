@@ -168,8 +168,10 @@ String mqttBaseTopic = "spaceclock/core2";
 String deviceName = "Space Clock";
 // Emotion observation API and reminder configuration. Passwords are never
 // persisted; the short-lived login response token is kept on the device only.
-uint8_t emotionReminderMode = 0; // 0 off, 1 interval, 2 fixed times
+uint8_t emotionReminderMode = 0; // 0 off, 1 scheduled interval, 2 fixed times
 uint16_t emotionReminderIntervalMinutes = 60;
+uint16_t emotionReminderWindowStart = 300;
+uint16_t emotionReminderWindowEnd = 1410;
 uint16_t emotionReminderTimes[3] = {600, 900, 0xFFFF};
 bool emotionReminderVibration = true;
 bool emotionReminderSound = false;
@@ -183,7 +185,6 @@ String emotionApiToken;
 enum class EmotionApiState : uint8_t { Unknown, Checking, Connected, Disconnected };
 EmotionApiState emotionApiState = EmotionApiState::Unknown;
 uint32_t emotionApiLastChecked = 0;
-uint32_t emotionLastIntervalReminder = 0;
 uint32_t emotionReminderEnd = 0;
 uint32_t emotionReminderSnoozeUntil = 0;
 uint32_t emotionLastVibrationToggle = 0;
@@ -194,6 +195,7 @@ uint8_t emotionFormPage = 0;
 bool emotionSubmitArmed = false;
 bool emotionSubmitCompleted = false;
 String emotionSubmitMessage;
+String emotionLastSubmittedId;
 m5::rtc_datetime_t emotionFormTime;
 bool emotionTriggers[8] = {};
 uint8_t emotionHeartRate = 4, emotionBreathRate = 4, emotionSweating = 0;
@@ -204,6 +206,8 @@ uint8_t emotionObserveCount = 1, emotionObserveMinutes = 1;
 uint8_t emotionGroundingTiming = 1, emotionGroundingAction = 10;
 uint32_t emotionCancelPressedAt = 0;
 bool emotionCancelPressValid = false;
+int8_t emotionTimeSwipeField = -1;
+int16_t emotionTimeSwipeStartY = 0;
 uint8_t emotionSettingsPage = 0;
 uint32_t companionNavPressStarted = 0;
 bool companionNavPressValid = false;
@@ -303,13 +307,21 @@ static const char* const EMOTION_BEHAVIOR_CUES[] = {
   "不填", "沉默不語", "反覆確認", "逃避/離開", "提高音量", "哭泣", "發呆", "坐立不安",
   "尋求安慰", "過度解釋", "僵住不動", "急著完成", "退縮", "迎合他人", "衝動行動", "其他可觀察行為"
 };
-static const char* const EMOTION_CATEGORIES[] = {"憤怒/防禦", "悲傷/失落", "恐懼/焦慮", "羞愧/自責", "平靜/愉悅"};
-static const char* const EMOTION_CHOICES[5][10] = {
-  {"煩躁", "無奈", "懊惱", "悶悶不樂", "不喜歡", "厭煩", "生氣", "惱火", "焦躁", "委屈"},
-  {"難過", "沮喪", "憂鬱", "心碎", "寂寞", "孤單", "空虛", "無助", "失落", "灰心"},
-  {"緊張", "焦慮", "不安", "忐忑", "害怕", "恐慌", "驚恐", "迷惘", "不知所措", "缺乏安全感"},
-  {"羞愧", "羞恥", "覺得自己不好", "自責", "內疚", "虧欠感", "挫敗", "無能感", "不配得感", "後悔"},
-  {"安心", "平靜", "放鬆", "感謝", "滿足", "愉快", "喜悅", "有希望", "被理解", "有力量"}
+static const char* const EMOTION_CATEGORIES[] = {
+  "憤怒", "受傷", "悲傷", "失落", "絕望", "焦慮", "壓力", "懷念", "自我否定", "失敗感"
+};
+static const uint8_t EMOTION_CHOICE_COUNTS[] = {14, 5, 4, 5, 6, 8, 5, 4, 8, 3};
+static const char* const EMOTION_CHOICES[10][14] = {
+  {"煩躁", "無奈", "懊惱", "悶悶不樂", "不喜歡", "厭煩", "厭倦", "生氣", "惱火", "焦躁", "憤世嫉俗", "狂怒", "怒不可遏", "悲憤"},
+  {"被否定", "被忽視", "被誤解", "被背叛", "委屈"},
+  {"難過", "沮喪", "憂鬱", "心碎"},
+  {"寂寞", "孤單", "空虛", "無助", "失落"},
+  {"後悔", "惋惜", "灰心", "絕望", "身心俱疲", "無力"},
+  {"緊張", "焦慮", "不安", "忐忑", "心有餘悸", "害怕", "恐慌", "驚恐"},
+  {"壓抑", "迷惘", "不知所措", "窒息", "恐懼"},
+  {"懷念", "無常感", "擔心失去", "缺乏安全感"},
+  {"自責", "羞愧", "羞恥", "覺得自己不好", "內疚", "虧欠感", "後悔", "毀滅"},
+  {"挫敗", "無能感", "不配得感"}
 };
 static const char* const EMOTION_GROUNDING_TIMES[] = {"不填", "當下", "事後"};
 static const char* const EMOTION_GROUNDING_ACTIONS[] = {
@@ -405,6 +417,8 @@ void saveSettings() {
   prefs.putString("deviceName", deviceName);
   prefs.putUChar("emoMode", emotionReminderMode);
   prefs.putUShort("emoInterval", emotionReminderIntervalMinutes);
+  prefs.putUShort("emoWinStart", emotionReminderWindowStart);
+  prefs.putUShort("emoWinEnd", emotionReminderWindowEnd);
   for (int i = 0; i < 3; ++i) prefs.putUShort(("emoTime" + String(i)).c_str(), emotionReminderTimes[i]);
   prefs.putBool("emoVib", emotionReminderVibration);
   prefs.putBool("emoSound", emotionReminderSound);
@@ -487,7 +501,14 @@ void loadSettings() {
   deviceName.trim();
   if (!deviceName.length()) deviceName = "Space Clock";
   emotionReminderMode = constrain((int)prefs.getUChar("emoMode", 0), 0, 2);
-  emotionReminderIntervalMinutes = constrain((int)prefs.getUShort("emoInterval", 60), 15, 240);
+  emotionReminderIntervalMinutes = prefs.getUShort("emoInterval", 60);
+  const uint16_t validEmotionIntervals[] = {10, 15, 30, 60, 120, 180, 240};
+  bool emotionIntervalValid = false;
+  for (uint16_t interval : validEmotionIntervals) if (emotionReminderIntervalMinutes == interval) emotionIntervalValid = true;
+  if (!emotionIntervalValid) emotionReminderIntervalMinutes = 60;
+  emotionReminderWindowStart = min<uint16_t>(prefs.getUShort("emoWinStart", 300), 1439);
+  emotionReminderWindowEnd = min<uint16_t>(prefs.getUShort("emoWinEnd", 1410), 1439);
+  if (emotionReminderWindowEnd < emotionReminderWindowStart) emotionReminderWindowEnd = emotionReminderWindowStart;
   for (int i = 0; i < 3; ++i) emotionReminderTimes[i] = prefs.getUShort(("emoTime" + String(i)).c_str(), i == 0 ? 600 : (i == 1 ? 900 : 0xFFFF));
   emotionReminderVibration = prefs.getBool("emoVib", true);
   emotionReminderSound = prefs.getBool("emoSound", false);
@@ -2192,11 +2213,56 @@ bool emotionApiConnected() {
     && emotionApiToken.length() && emotionApiUserId.length();
 }
 
+uint16_t emotionTheme(uint8_t strength = 100) {
+  return matrixColor(strength);
+}
+
+uint16_t emotionPanel(uint8_t strength = 12) {
+  return emotionTheme(strength);
+}
+
+void drawEmotionMatrixBackground() {
+  M5.Display.fillScreen(TFT_BLACK);
+  useUIFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(emotionTheme(12), TFT_BLACK);
+  static const char matrixGlyphs[] = "01ABCDEFGHIJKLMNOPQRSTUVWXYZ<>[]{}+-";
+  const uint8_t glyphCount = sizeof(matrixGlyphs) - 1;
+  for (int i = 0; i < 30; ++i) {
+    char glyph[2] = {matrixGlyphs[(i * 11 + emotionFormPage * 7) % glyphCount], 0};
+    int x = (i * 47 + emotionFormPage * 23) % 316;
+    int y = 34 + ((i * 61 + emotionFormPage * 19) % 170);
+    M5.Display.drawString(glyph, x, y);
+  }
+  M5.Display.fillRect(0, 0, 320, 34, TFT_BLACK);
+  M5.Display.fillRect(0, 212, 320, 28, TFT_BLACK);
+}
+
 void drawEmotionConnectionIndicator() {
   uint16_t color = emotionApiConnected() ? TFT_GREEN
     : (emotionApiState == EmotionApiState::Checking ? TFT_YELLOW : TFT_RED);
-  M5.Display.fillCircle(9, 13, 6, 0x2124);
+  M5.Display.fillCircle(9, 13, 6, TFT_BLACK);
+  M5.Display.drawCircle(9, 13, 5, emotionTheme(55));
   M5.Display.fillCircle(9, 13, 4, color);
+}
+
+void drawEmotionResetIcon() {
+  if (emotionFormPage >= 7) return;
+  uint16_t color = emotionTheme(100);
+  M5.Display.drawCircle(300, 14, 9, color);
+  M5.Display.fillRect(299, 4, 10, 7, TFT_BLACK);
+  M5.Display.fillTriangle(307, 5, 313, 7, 309, 12, color);
+}
+
+void drawEmotionBottomBar(const char* left, const char* middle, const char* right) {
+  M5.Display.fillRect(0, 212, 320, 28, TFT_BLACK);
+  M5.Display.drawFastHLine(0, 214, 320, emotionTheme(32));
+  useUIFont(1);
+  M5.Display.setTextColor(emotionTheme(100), TFT_BLACK);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(left, 53, 228);
+  M5.Display.drawString(middle, 160, 228);
+  M5.Display.drawString(right, 267, 228);
 }
 
 String emotionTitleText() {
@@ -2206,10 +2272,11 @@ String emotionTitleText() {
 }
 
 void drawEmotionRow(int y, const String& label, const String& value, bool selected = false) {
-  uint16_t fill = selected ? 0x2A5D : (y / 32 & 1 ? 0x18E3 : 0x2124);
+  uint16_t fill = selected ? emotionPanel(20) : emotionPanel((y / 32 & 1) ? 10 : 14);
   M5.Display.fillRoundRect(10, y, 300, 28, 5, fill);
+  M5.Display.drawRoundRect(10, y, 300, 28, 5, selected ? emotionTheme(75) : emotionTheme(30));
   useUIFont(1);
-  M5.Display.setTextColor(TFT_WHITE, fill);
+  M5.Display.setTextColor(selected ? emotionTheme(100) : TFT_WHITE, fill);
   M5.Display.setTextDatum(middle_left);
   M5.Display.drawString(label, 18, y + 14);
   M5.Display.setTextDatum(middle_right);
@@ -2218,23 +2285,28 @@ void drawEmotionRow(int y, const String& label, const String& value, bool select
 
 void drawEmotionObservation() {
   if (screenNow != Screen::EmotionObservation) return;
-  M5.Display.fillScreen(BG);
+  drawEmotionMatrixBackground();
+  const uint16_t panel = emotionPanel(12);
+  const uint16_t selected = emotionPanel(22);
+  const uint16_t border = emotionTheme(55);
+  const uint16_t accent = emotionTheme(100);
   useUIFont(1);
-  M5.Display.setTextColor(TFT_WHITE, BG);
+  M5.Display.setTextColor(accent, TFT_BLACK);
   M5.Display.setTextDatum(top_left);
   drawEmotionConnectionIndicator();
   M5.Display.drawString(emotionTitleText(), 20, 5);
+  drawEmotionResetIcon();
 
   if (!emotionApiConnected()) {
-    M5.Display.fillRoundRect(17, 48, 286, 137, 14, 0x2124);
+    M5.Display.fillRoundRect(17, 48, 286, 137, 14, panel);
     M5.Display.drawRoundRect(17, 48, 286, 137, 14, TFT_RED);
-    useUIMediumFont(); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(TFT_WHITE, 0x2124);
+    useUIMediumFont(); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(TFT_WHITE, panel);
     M5.Display.drawString(emotionApiState == EmotionApiState::Checking ? "正在確認資料庫…" : "資料庫尚未連線", 160, 84);
-    useUIFont(1); M5.Display.setTextColor(0xBDF7, 0x2124);
+    useUIFont(1); M5.Display.setTextColor(emotionTheme(80), panel);
     M5.Display.drawString(WiFi.status() != WL_CONNECTED ? "請先連接 Wi-Fi" : "請先從網頁設定登入 API", 160, 126);
-    M5.Display.setTextColor(0x9DB2, 0x2124);
+    M5.Display.setTextColor(emotionTheme(55), panel);
     M5.Display.drawString("連線成功後才可開始填寫", 160, 156);
-    drawBottomBar("", "", "取消");
+    drawEmotionBottomBar("", "", "取消");
     return;
   }
 
@@ -2244,25 +2316,27 @@ void drawEmotionObservation() {
                     emotionFormTime.time.hours, emotionFormTime.time.minutes};
     for (int i = 0; i < 5; ++i) {
       int x = 5 + i * 63;
-      M5.Display.fillRoundRect(x, 55, 58, 94, 8, 0x2124);
-      M5.Display.drawRoundRect(x, 55, 58, 94, 8, 0x4A69);
-      useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2124);
-      M5.Display.drawString(labels[i], x + 29, 73);
-      M5.Display.setTextColor(TFT_WHITE, 0x2124);
+      M5.Display.fillRoundRect(x, 48, 58, 111, 8, panel);
+      M5.Display.drawRoundRect(x, 48, 58, 111, 8, border);
+      useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(emotionTheme(65), panel);
+      M5.Display.drawString(labels[i], x + 29, 67);
+      M5.Display.fillTriangle(x + 25, 83, x + 33, 83, x + 29, 77, accent);
+      M5.Display.setTextColor(TFT_WHITE, panel);
       char value[6];
       if (i == 0) snprintf(value, sizeof(value), "%04d", values[i]);
       else snprintf(value, sizeof(value), "%02d", values[i]);
-      M5.Display.drawString(value, x + 29, 112);
+      M5.Display.drawString(value, x + 29, 107);
+      M5.Display.fillTriangle(x + 25, 133, x + 33, 133, x + 29, 139, accent);
     }
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG); M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString("點一下各格調整；預設為現在時間", 160, 174);
+    useUIFont(1); M5.Display.setTextColor(emotionTheme(62), TFT_BLACK); M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString("在各格上下滑動調整數值", 160, 183);
   } else if (emotionFormPage == 1) {
     for (int i = 0; i < 8; ++i) {
       int x = (i % 2) ? 164 : 10, y = 39 + (i / 2) * 41;
-      uint16_t fill = emotionTriggers[i] ? 0x2A5D : 0x2124;
+      uint16_t fill = emotionTriggers[i] ? emotionPanel(30) : panel;
       M5.Display.fillRoundRect(x, y, 146, 35, 7, fill);
-      M5.Display.drawRoundRect(x, y, 146, 35, 7, emotionTriggers[i] ? 0x65D9 : 0x4A69);
-      useUIFont(1); M5.Display.setTextColor(TFT_WHITE, fill); M5.Display.setTextDatum(middle_center);
+      M5.Display.drawRoundRect(x, y, 146, 35, 7, emotionTriggers[i] ? accent : border);
+      useUIFont(1); M5.Display.setTextColor(emotionTriggers[i] ? accent : TFT_WHITE, fill); M5.Display.setTextDatum(middle_center);
       M5.Display.drawString(String(emotionTriggers[i] ? "✓ " : "") + EMOTION_TRIGGERS[i], x + 73, y + 18);
     }
   } else if (emotionFormPage == 2) {
@@ -2272,51 +2346,57 @@ void drawEmotionObservation() {
       emotionBodyPart < 0 ? "不填" : EMOTION_BODY_PARTS[(uint8_t)emotionBodyPart], EMOTION_BEHAVIOR_CUES[emotionBehaviorCue]};
     for (int i = 0; i < 6; ++i) {
       int x = 5 + (i % 3) * 105, y = 41 + (i / 3) * 79;
-      M5.Display.fillRoundRect(x, y, 100, 72, 8, 0x2124);
-      M5.Display.drawRoundRect(x, y, 100, 72, 8, 0x4A69);
-      useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2124);
+      M5.Display.fillRoundRect(x, y, 100, 72, 8, panel);
+      M5.Display.drawRoundRect(x, y, 100, 72, 8, border);
+      useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(emotionTheme(62), panel);
       M5.Display.drawString(labels[i], x + 50, y + 17);
-      M5.Display.setTextColor(TFT_WHITE, 0x2124);
+      M5.Display.setTextColor(TFT_WHITE, panel);
       M5.Display.drawString(values[i], x + 50, y + 47);
     }
   } else if (emotionFormPage == 3) {
-    M5.Display.fillRoundRect(12, 46, 296, 61, 10, 0x2A5D);
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, 0x2A5D); M5.Display.setTextDatum(middle_center);
+    M5.Display.fillRoundRect(12, 46, 296, 61, 10, selected);
+    M5.Display.drawRoundRect(12, 46, 296, 61, 10, accent);
+    useUIFont(1); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.setTextDatum(middle_center);
     M5.Display.drawString("類別　◀ / ▶", 160, 61);
-    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected);
     M5.Display.drawString(EMOTION_CATEGORIES[emotionCategory], 160, 87);
     String choiceText = emotionChoice < 0 ? "未選" : EMOTION_CHOICES[emotionCategory][emotionChoice];
-    M5.Display.fillRoundRect(12, 118, 296, 61, 10, 0x2A5D);
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, 0x2A5D); M5.Display.drawString("情緒　◀ / ▶", 160, 133);
-    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D); M5.Display.drawString(choiceText, 160, 159);
+    M5.Display.fillRoundRect(12, 118, 296, 61, 10, selected);
+    M5.Display.drawRoundRect(12, 118, 296, 61, 10, accent);
+    useUIFont(1); M5.Display.setTextColor(emotionTheme(70), selected); M5.Display.drawString("情緒　◀ / ▶", 160, 133);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected); M5.Display.drawString(choiceText, 160, 159);
   } else if (emotionFormPage == 4) {
-    useUILargeFont(); M5.Display.setTextColor(0xBDF7, BG); M5.Display.setTextDatum(middle_center);
+    M5.Display.fillRoundRect(16, 46, 288, 139, 12, panel);
+    M5.Display.drawRoundRect(16, 46, 288, 139, 12, border);
+    useUILargeFont(); M5.Display.setTextColor(TFT_WHITE, panel); M5.Display.setTextDatum(middle_center);
     M5.Display.drawString(String(emotionIndexPercent) + "%", 160, 88);
     const int sliderLeft = 28, sliderRight = 292, sliderY = 151;
     int thumbX = map(emotionIndexPercent, 5, 120, sliderLeft, sliderRight);
-    M5.Display.fillRoundRect(sliderLeft, sliderY - 5, sliderRight - sliderLeft, 10, 5, 0x2945);
-    M5.Display.fillRoundRect(sliderLeft, sliderY - 5, thumbX - sliderLeft, 10, 5, 0x65D9);
-    M5.Display.fillCircle(thumbX, sliderY, 12, TFT_WHITE); M5.Display.drawCircle(thumbX, sliderY, 12, 0x65D9);
-    useUIFont(1); M5.Display.setTextColor(0x9DB2, BG);
+    M5.Display.fillRoundRect(sliderLeft, sliderY - 5, sliderRight - sliderLeft, 10, 5, emotionTheme(20));
+    M5.Display.fillRoundRect(sliderLeft, sliderY - 5, thumbX - sliderLeft, 10, 5, accent);
+    M5.Display.fillCircle(thumbX, sliderY, 12, TFT_WHITE); M5.Display.drawCircle(thumbX, sliderY, 12, accent);
+    useUIFont(1); M5.Display.setTextColor(emotionTheme(65), panel);
     M5.Display.drawString("5", sliderLeft, 181); M5.Display.drawString("120", sliderRight, 181);
   } else if (emotionFormPage == 5) {
-    M5.Display.fillRoundRect(12, 48, 296, 61, 10, 0x2A5D);
-    M5.Display.fillRoundRect(12, 120, 296, 61, 10, 0x2A5D);
-    useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2A5D);
+    M5.Display.fillRoundRect(12, 48, 296, 61, 10, selected); M5.Display.drawRoundRect(12, 48, 296, 61, 10, accent);
+    M5.Display.fillRoundRect(12, 120, 296, 61, 10, selected); M5.Display.drawRoundRect(12, 120, 296, 61, 10, accent);
+    useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(emotionTheme(70), selected);
     M5.Display.drawString("觀察次數　◀ / ▶", 160, 63); M5.Display.drawString("觀察時長　◀ / ▶", 160, 135);
-    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected);
     M5.Display.drawString(String(emotionObserveCount) + " 次", 160, 89);
     M5.Display.drawString(String(emotionObserveMinutes) + " 分鐘", 160, 161);
   } else if (emotionFormPage == 6) {
-    M5.Display.fillRoundRect(12, 48, 296, 61, 10, 0x2A5D);
-    M5.Display.fillRoundRect(12, 120, 296, 61, 10, 0x2A5D);
-    useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(0x9DB2, 0x2A5D);
+    M5.Display.fillRoundRect(12, 48, 296, 61, 10, selected); M5.Display.drawRoundRect(12, 48, 296, 61, 10, accent);
+    M5.Display.fillRoundRect(12, 120, 296, 61, 10, selected); M5.Display.drawRoundRect(12, 120, 296, 61, 10, accent);
+    useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(emotionTheme(70), selected);
     M5.Display.drawString("落地時機　◀ / ▶", 160, 63); M5.Display.drawString("落地方式　◀ / ▶", 160, 135);
-    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2A5D);
+    useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, selected);
     M5.Display.drawString(EMOTION_GROUNDING_TIMES[emotionGroundingTiming], 160, 89);
     M5.Display.drawString(EMOTION_GROUNDING_ACTIONS[emotionGroundingAction], 160, 161);
   } else {
-    useUIFont(1); M5.Display.setTextColor(0xD6DF, BG); M5.Display.setTextDatum(top_left);
+    M5.Display.fillRoundRect(7, 34, 306, 174, 10, panel);
+    M5.Display.drawRoundRect(7, 34, 306, 174, 10, border);
+    useUIFont(1); M5.Display.setTextColor(TFT_WHITE, panel); M5.Display.setTextDatum(top_left);
     String triggerSummary;
     for (int i = 0; i < 8; ++i) if (emotionTriggers[i]) { if (triggerSummary.length()) triggerSummary += "、"; triggerSummary += EMOTION_TRIGGERS[i]; }
     if (!triggerSummary.length()) triggerSummary = "未選";
@@ -2327,28 +2407,72 @@ void drawEmotionObservation() {
     M5.Display.drawString("情緒  " + String(EMOTION_CATEGORIES[emotionCategory]) + " · " + selectedEmotion + " " + String(emotionIndexPercent) + "%", 13, 111);
     M5.Display.drawString("觀察  " + String(emotionObserveCount) + "次 / " + String(emotionObserveMinutes) + "分鐘", 13, 135);
     M5.Display.drawString("落地  " + String(EMOTION_GROUNDING_TIMES[emotionGroundingTiming]) + " · " + EMOTION_GROUNDING_ACTIONS[emotionGroundingAction], 13, 159);
-    M5.Display.setTextColor(emotionSubmitMessage.length() ? 0xFBE0 : 0x9DB2, BG);
-    M5.Display.drawString(emotionSubmitMessage.length() ? emotionSubmitMessage : (emotionSubmitArmed ? "再按一次送出，確認上傳這筆資料" : "按中鍵確認後送出至情緒觀察 API"), 13, 184);
+    M5.Display.setTextColor(emotionSubmitMessage.length() ? accent : emotionTheme(62), panel);
+    String prompt = emotionSubmitMessage.length() ? emotionSubmitMessage :
+      (emotionSubmitArmed ? "請再次確認送出；左鍵可取消" : "檢查內容後按中鍵送出");
+    M5.Display.drawString(prompt, 13, 184);
   }
-  if (emotionFormPage == 0) drawBottomBar("", "下一頁", "取消");
-  else if (emotionFormPage < 7) drawBottomBar("上一頁", "下一頁", "取消");
-  else drawBottomBar("上一頁", emotionSubmitCompleted ? "已送出" : (emotionSubmitArmed ? "送出" : "確認"), "取消");
+  if (emotionFormPage == 0) drawEmotionBottomBar("", "下一頁", "取消");
+  else if (emotionFormPage < 7) drawEmotionBottomBar("上一頁", "下一頁", "取消");
+  else if (emotionSubmitCompleted) drawEmotionBottomBar("撤回", "已送出", "取消");
+  else if (emotionSubmitArmed) drawEmotionBottomBar("取消送出", "確認送出", "取消");
+  else drawEmotionBottomBar("上一頁", "送出", "取消");
+}
+
+void resetEmotionPage(uint8_t page) {
+  if (page == 0) {
+    getClockDateTime(&emotionFormTime);
+  } else if (page == 1) {
+    memset(emotionTriggers, 0, sizeof(emotionTriggers));
+  } else if (page == 2) {
+    emotionHeartRate = 4; emotionBreathRate = 4; emotionSweating = 0;
+    emotionBodySignal = -1; emotionBodyPart = -1; emotionBehaviorCue = 0;
+  } else if (page == 3) {
+    emotionCategory = 0; emotionChoice = -1;
+  } else if (page == 4) {
+    emotionIndexPercent = 50;
+  } else if (page == 5) {
+    emotionObserveCount = 1; emotionObserveMinutes = 1;
+  } else if (page == 6) {
+    emotionGroundingTiming = 1; emotionGroundingAction = 10;
+  }
+  emotionSubmitArmed = false;
+  emotionSubmitMessage = "";
+}
+
+void adjustEmotionTimeField(uint8_t field, int direction) {
+  direction = direction >= 0 ? 1 : -1;
+  if (field == 0) {
+    int year = emotionFormTime.date.year + direction;
+    emotionFormTime.date.year = year > 2099 ? 2020 : (year < 2020 ? 2099 : year);
+  } else if (field == 1) {
+    int month = emotionFormTime.date.month + direction;
+    emotionFormTime.date.month = month > 12 ? 1 : (month < 1 ? 12 : month);
+  } else if (field == 2) {
+    int lastDay = emotionDaysInMonth(emotionFormTime.date.year, emotionFormTime.date.month);
+    int day = emotionFormTime.date.date + direction;
+    emotionFormTime.date.date = day > lastDay ? 1 : (day < 1 ? lastDay : day);
+  } else if (field == 3) {
+    int hour = emotionFormTime.time.hours + direction;
+    emotionFormTime.time.hours = hour > 23 ? 0 : (hour < 0 ? 23 : hour);
+  } else {
+    int minute = emotionFormTime.time.minutes + direction;
+    emotionFormTime.time.minutes = minute > 59 ? 0 : (minute < 0 ? 59 : minute);
+  }
+  emotionFormTime.date.date = min<int>((int)emotionFormTime.date.date,
+    (int)emotionDaysInMonth(emotionFormTime.date.year, emotionFormTime.date.month));
 }
 
 void showEmotionObservation(bool newEntry = false) {
   screenNow = Screen::EmotionObservation;
   if (newEntry) {
-    getClockDateTime(&emotionFormTime);
     emotionFormPage = 0;
     emotionSubmitArmed = false;
+    emotionTimeSwipeField = -1;
     emotionSubmitCompleted = false;
     emotionSubmitMessage = "";
-    memset(emotionTriggers, 0, sizeof(emotionTriggers));
-    emotionHeartRate = emotionBreathRate = 4; emotionSweating = 0;
-    emotionBodySignal = emotionBodyPart = -1; emotionBehaviorCue = 0;
-    emotionCategory = 2; emotionChoice = -1;
-    emotionIndexPercent = 50; emotionObserveCount = emotionObserveMinutes = 1;
-    emotionGroundingTiming = 1; emotionGroundingAction = 10;
+    emotionLastSubmittedId = "";
+    for (uint8_t page = 0; page < 7; ++page) resetEmotionPage(page);
   }
   drawEmotionObservation();
   if (newEntry) {
@@ -2365,20 +2489,25 @@ String emotionReminderTimeText(uint16_t minutes) {
 
 void showEmotionSettings() {
   screenNow = Screen::EmotionSettings;
-  M5.Display.fillScreen(BG);
+  drawEmotionMatrixBackground();
   drawEmotionConnectionIndicator();
-  useUIFont(1); M5.Display.setTextDatum(top_left); M5.Display.setTextColor(TFT_WHITE, BG);
+  useUIFont(1); M5.Display.setTextDatum(top_left); M5.Display.setTextColor(emotionTheme(100), TFT_BLACK);
   M5.Display.drawString("情緒觀察設定 " + String(emotionSettingsPage + 1) + "/2", 20, 5);
-  M5.Display.setTextColor(0xBDF7, BG);
+  M5.Display.setTextColor(emotionTheme(70), TFT_BLACK);
   M5.Display.drawString(emotionSettingsPage ? "提醒方式" : "填寫提醒", 12, 31);
   if (!emotionSettingsPage) {
-    const char* modes[] = {"關閉", "間隔提醒", "固定鬧鐘提醒"};
+    const char* modes[] = {"關閉", "整點提醒", "固定鬧鐘提醒"};
     drawEmotionRow(53, "提醒模式", modes[emotionReminderMode], true);
-    drawEmotionRow(84, "間隔", String(emotionReminderIntervalMinutes) + " 分鐘", true);
-    drawEmotionRow(115, "固定時間 1", emotionReminderTimeText(emotionReminderTimes[0]), true);
-    drawEmotionRow(146, "固定時間 2", emotionReminderTimeText(emotionReminderTimes[1]), true);
-    drawEmotionRow(177, "固定時間 3", emotionReminderTimeText(emotionReminderTimes[2]), true);
-    drawBottomBar("", "下一頁", "完成");
+    if (emotionReminderMode == 1) {
+      drawEmotionRow(84, "開始時間", emotionReminderTimeText(emotionReminderWindowStart), true);
+      drawEmotionRow(115, "結束時間", emotionReminderTimeText(emotionReminderWindowEnd), true);
+      drawEmotionRow(146, "提醒間隔", String(emotionReminderIntervalMinutes) + " 分鐘", true);
+    } else if (emotionReminderMode == 2) {
+      drawEmotionRow(84, "固定時間 1", emotionReminderTimeText(emotionReminderTimes[0]), true);
+      drawEmotionRow(115, "固定時間 2", emotionReminderTimeText(emotionReminderTimes[1]), true);
+      drawEmotionRow(146, "固定時間 3", emotionReminderTimeText(emotionReminderTimes[2]), true);
+    }
+    drawEmotionBottomBar("", "下一頁", "完成");
   } else {
     const char* sounds[] = {"打版", "磬聲", "流水聲", "水滴聲"};
     drawEmotionRow(53, "振動", emotionReminderVibration ? "開" : "關", true);
@@ -2386,7 +2515,7 @@ void showEmotionSettings() {
     drawEmotionRow(115, "提醒時間", String(emotionReminderDurationSeconds) + " 秒", true);
     drawEmotionRow(146, "鬧鐘鈴聲", sounds[emotionReminderSoundChoice], true);
     drawEmotionRow(177, "音量", String(emotionReminderVolume) + "%", true);
-    drawBottomBar("上一頁", "", "完成");
+    drawEmotionBottomBar("上一頁", "", "完成");
   }
 }
 
@@ -2617,7 +2746,11 @@ bool submitEmotionObservation() {
     emotionApiState = EmotionApiState::Connected; emotionApiLastChecked = millis();
     emotionSubmitMessage = "已成功送出。";
     DynamicJsonDocument reply(1024);
-    if (!deserializeJson(reply, response) && reply["id"].is<const char*>()) emotionSubmitMessage = "已成功送出，紀錄編號 " + reply["id"].as<String>();
+    emotionLastSubmittedId = "";
+    if (!deserializeJson(reply, response) && reply["id"].is<const char*>()) {
+      emotionLastSubmittedId = reply["id"].as<String>();
+      emotionSubmitMessage = "已成功送出，可按左鍵撤回。";
+    }
     drawEmotionObservation();
     return true;
   }
@@ -2629,17 +2762,67 @@ bool submitEmotionObservation() {
   return false;
 }
 
+bool withdrawEmotionObservation() {
+  if (!emotionLastSubmittedId.length()) {
+    emotionSubmitMessage = "找不到剛送出的紀錄，無法撤回。";
+    drawEmotionObservation();
+    return false;
+  }
+  if (!emotionApiConnected() && !verifyEmotionApiConnection(true)) {
+    emotionSubmitMessage = "資料庫未連線，暫時無法撤回。";
+    drawEmotionObservation();
+    return false;
+  }
+  emotionSubmitMessage = "正在撤回…";
+  drawEmotionObservation();
+  String base = normalizeEmotionApiBase(emotionApiBase);
+  String endpoint = base + "/api/collections/entries/records/" + emotionLastSubmittedId;
+  WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
+  HTTPClient http; http.setTimeout(15000);
+  int code = -1;
+  if (base.length() && http.begin(secure, endpoint)) {
+    http.addHeader("Authorization", "Bearer " + emotionApiToken);
+    code = http.sendRequest("DELETE");
+    http.end(); secure.stop();
+  }
+  if (code == 401 && refreshEmotionApiToken()) {
+    WiFiClientSecure retrySecure; retrySecure.setCACert(EMOTION_API_ROOT_CA);
+    HTTPClient retry; retry.setTimeout(15000);
+    if (retry.begin(retrySecure, endpoint)) {
+      retry.addHeader("Authorization", "Bearer " + emotionApiToken);
+      code = retry.sendRequest("DELETE");
+      retry.end(); retrySecure.stop();
+    }
+  }
+  if (code == 200 || code == 204) {
+    emotionLastSubmittedId = "";
+    emotionSubmitCompleted = false;
+    emotionSubmitArmed = false;
+    emotionSubmitMessage = "已撤回，可修改後重新送出。";
+    emotionApiState = EmotionApiState::Connected;
+    emotionApiLastChecked = millis();
+    drawEmotionObservation();
+    return true;
+  }
+  if (code == 404) emotionSubmitMessage = "這筆紀錄已不存在。";
+  else if (code == 401) emotionSubmitMessage = "登入已過期，請重新登入後撤回。";
+  else emotionSubmitMessage = "撤回失敗（HTTP " + String(code) + "）。";
+  drawEmotionObservation();
+  return false;
+}
+
 void drawEmotionReminder() {
   screenNow = Screen::EmotionReminder;
-  M5.Display.fillScreen(BG);
-  M5.Display.fillRoundRect(18, 28, 284, 159, 18, 0x2124);
-  M5.Display.drawRoundRect(18, 28, 284, 159, 18, 0x4A69);
-  useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, 0x2124); M5.Display.setTextDatum(middle_center);
+  drawEmotionMatrixBackground();
+  uint16_t panel = emotionPanel(14);
+  M5.Display.fillRoundRect(18, 28, 284, 159, 18, panel);
+  M5.Display.drawRoundRect(18, 28, 284, 159, 18, emotionTheme(85));
+  useUIMediumFont(); M5.Display.setTextColor(emotionTheme(100), panel); M5.Display.setTextDatum(middle_center);
   M5.Display.drawString("情緒觀察提醒", 160, 63);
-  useUIFont(1); M5.Display.setTextColor(0xBDF7, 0x2124);
+  useUIFont(1); M5.Display.setTextColor(TFT_WHITE, panel);
   M5.Display.drawString("停一下，留意此刻的感受", 160, 102);
   M5.Display.drawString("填寫約需 1 分鐘，可隨時取消", 160, 130);
-  drawBottomBar("開始填寫", "稍後", "關閉");
+  drawEmotionBottomBar("開始填寫", "稍後", "關閉");
 }
 
 void startEmotionReminder(uint32_t nowMs) {
@@ -2664,6 +2847,7 @@ void stopEmotionReminder(bool redraw = true) {
     else if (screenNow == Screen::Companion) drawCompanionButtons();
     else if (screenNow == Screen::Meditation) drawMeditation();
     else if (screenNow == Screen::EmotionObservation) drawEmotionObservation();
+    else if (screenNow == Screen::EmotionSettings) showEmotionSettings();
     else showMenu();
   }
 }
@@ -2684,9 +2868,13 @@ void checkEmotionReminder(uint32_t nowMs, const m5::rtc_datetime_t& dt) {
     return;
   }
   if (emotionReminderMode == 1) {
-    if (!emotionLastIntervalReminder) emotionLastIntervalReminder = nowMs;
-    if (nowMs - emotionLastIntervalReminder >= (uint32_t)emotionReminderIntervalMinutes * 60000UL) {
-      emotionLastIntervalReminder = nowMs;
+    int32_t day = dt.date.year * 512 + dt.date.month * 32 + dt.date.date;
+    uint16_t minuteOfDay = dt.time.hours * 60 + dt.time.minutes;
+    int32_t minuteKey = day * 1440L + minuteOfDay;
+    bool inWindow = minuteOfDay >= emotionReminderWindowStart && minuteOfDay <= emotionReminderWindowEnd;
+    bool onInterval = inWindow && ((minuteOfDay - emotionReminderWindowStart) % emotionReminderIntervalMinutes == 0);
+    if (onInterval && minuteKey != emotionLastReminderMinuteKey) {
+      emotionLastReminderMinuteKey = minuteKey;
       startEmotionReminder(nowMs);
     }
   } else if (emotionReminderMode == 2) {
@@ -2722,13 +2910,20 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     if (t.y < 53 || t.y >= 208) return;
     int row = constrain((t.y - 53) / 31, 0, 4);
     if (!emotionSettingsPage) {
-      if (row == 0) emotionReminderMode = (emotionReminderMode + 1) % 3;
-      else if (row == 1) {
-        const uint16_t choices[] = {15, 30, 60, 120, 240};
-        int index = 0; while (index < 5 && choices[index] != emotionReminderIntervalMinutes) ++index;
-        emotionReminderIntervalMinutes = choices[(index + 1) % 5];
-      } else {
-        int slot = row - 2;
+      if (row == 0) {
+        emotionReminderMode = (emotionReminderMode + 1) % 3;
+      } else if (emotionReminderMode == 1 && row == 1) {
+        emotionReminderWindowStart = (emotionReminderWindowStart + 10) % 1440;
+        if (emotionReminderWindowEnd < emotionReminderWindowStart) emotionReminderWindowEnd = emotionReminderWindowStart;
+      } else if (emotionReminderMode == 1 && row == 2) {
+        emotionReminderWindowEnd = (emotionReminderWindowEnd + 10) % 1440;
+        if (emotionReminderWindowEnd < emotionReminderWindowStart) emotionReminderWindowEnd = emotionReminderWindowStart;
+      } else if (emotionReminderMode == 1 && row == 3) {
+        const uint16_t choices[] = {10, 15, 30, 60, 120, 180, 240};
+        int index = 0; while (index < 7 && choices[index] != emotionReminderIntervalMinutes) ++index;
+        emotionReminderIntervalMinutes = choices[(index + 1) % 7];
+      } else if (emotionReminderMode == 2 && row >= 1 && row <= 3) {
+        int slot = row - 1;
         uint16_t fallback[] = {600, 900, 1200};
         if (emotionReminderTimes[slot] == 0xFFFF) emotionReminderTimes[slot] = fallback[slot];
         else if (emotionReminderTimes[slot] >= 1410) emotionReminderTimes[slot] = 0xFFFF;
@@ -2749,13 +2944,17 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
         playSoundChoice(emotionReminderSoundChoice, emotionReminderVolume, 1);
       }
     }
-    emotionLastIntervalReminder = millis();
+    emotionLastReminderMinuteKey = -1;
     saveSettings(); showEmotionSettings();
     return;
   }
   if (t.wasPressed()) {
     emotionCancelPressValid = t.y >= 210 && t.x >= 214;
     emotionCancelPressedAt = emotionCancelPressValid ? millis() : 0;
+    if (emotionApiConnected() && emotionFormPage == 0 && t.y >= 48 && t.y < 160) {
+      emotionTimeSwipeField = constrain((int)t.x / 63, 0, 4);
+      emotionTimeSwipeStartY = t.y;
+    }
   }
   if (emotionApiConnected() && emotionFormPage == 4 && t.isPressed() && t.y >= 115 && t.y < 195) {
     int next = constrain((int)map(constrain((int)t.x, 28, 292), 28, 292, 5, 120), 5, 120);
@@ -2764,7 +2963,23 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     return;
   }
   if (!t.wasReleased()) return;
+  if (emotionTimeSwipeField >= 0) {
+    int8_t field = emotionTimeSwipeField;
+    int delta = emotionTimeSwipeStartY - t.y;
+    emotionTimeSwipeField = -1;
+    if (abs(delta) >= 8) {
+      haptic(12);
+      adjustEmotionTimeField(field, delta > 0 ? 1 : -1);
+      drawEmotionObservation();
+    }
+    return;
+  }
   haptic(12);
+  if (emotionApiConnected() && emotionFormPage < 7 && t.x >= 282 && t.y < 34) {
+    resetEmotionPage(emotionFormPage);
+    drawEmotionObservation();
+    return;
+  }
   if (t.y >= 210) {
     if (t.x >= 214) {
       bool longPress = emotionCancelPressValid && emotionCancelPressedAt && millis() - emotionCancelPressedAt >= 700UL;
@@ -2773,18 +2988,22 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
       if (emotionReminderEnd) stopEmotionReminder();
       else if (longPress) { emotionSettingsPage = 0; showEmotionSettings(); }
       else { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); }
+    } else if (t.x < 107 && emotionFormPage == 7 && emotionSubmitCompleted) {
+      withdrawEmotionObservation();
+    } else if (t.x < 107 && emotionFormPage == 7 && emotionSubmitArmed) {
+      emotionSubmitArmed = false; emotionSubmitMessage = ""; drawEmotionObservation();
     } else if (!emotionApiConnected()) {
       return;
     } else if (t.x < 107 && emotionFormPage > 0) {
-      --emotionFormPage; emotionSubmitArmed = false; drawEmotionObservation();
+      --emotionFormPage; emotionSubmitArmed = false; emotionSubmitMessage = ""; drawEmotionObservation();
     } else if (t.x >= 107 && t.x < 214) {
       if (emotionFormPage < 7) {
         ++emotionFormPage; emotionSubmitArmed = false; emotionSubmitMessage = "";
         drawEmotionObservation();
       } else if (emotionSubmitCompleted) {
-        return;
+        showEmotionObservation(true);
       } else if (!emotionSubmitArmed) {
-        emotionSubmitArmed = true; emotionSubmitMessage = ""; drawEmotionObservation();
+        emotionSubmitArmed = true; emotionSubmitMessage = "請再次確認送出。"; drawEmotionObservation();
       } else {
         emotionSubmitArmed = false;
         if (submitEmotionObservation()) { emotionSubmitCompleted = true; emotionSubmitArmed = false; drawEmotionObservation(); }
@@ -2795,17 +3014,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
   emotionCancelPressValid = false; emotionCancelPressedAt = 0;
   if (!emotionApiConnected()) return;
   if (emotionFormPage == 0) {
-    if (t.y >= 55 && t.y < 149) {
-      int field = constrain(t.x / 63, 0, 4);
-      if (field == 0) emotionFormTime.date.year = emotionFormTime.date.year >= 2099 ? 2020 : emotionFormTime.date.year + 1;
-      else if (field == 1) emotionFormTime.date.month = emotionFormTime.date.month >= 12 ? 1 : emotionFormTime.date.month + 1;
-      else if (field == 2) emotionFormTime.date.date = emotionFormTime.date.date >= emotionDaysInMonth(emotionFormTime.date.year, emotionFormTime.date.month) ? 1 : emotionFormTime.date.date + 1;
-      else if (field == 3) emotionFormTime.time.hours = (emotionFormTime.time.hours + 1) % 24;
-      else emotionFormTime.time.minutes = (emotionFormTime.time.minutes + 5) % 60;
-      emotionFormTime.date.date = min<int>((int)emotionFormTime.date.date,
-        (int)emotionDaysInMonth(emotionFormTime.date.year, emotionFormTime.date.month));
-    }
-    drawEmotionObservation();
+    return;
   } else if (emotionFormPage == 1) {
     if (t.y >= 39 && t.y < 203) {
       int col = t.x >= 160 ? 1 : 0, row = constrain((t.y - 39) / 41, 0, 3);
@@ -2825,8 +3034,14 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     else emotionBehaviorCue = (emotionBehaviorCue + 1) % (sizeof(EMOTION_BEHAVIOR_CUES) / sizeof(EMOTION_BEHAVIOR_CUES[0]));
     drawEmotionObservation();
   } else if (emotionFormPage == 3) {
-    if (t.y >= 46 && t.y < 107) { emotionCategory = (emotionCategory + (t.x >= 160 ? 1 : 4)) % 5; emotionChoice = -1; }
-    else if (t.y >= 118 && t.y < 179) emotionChoice = (emotionChoice + (t.x >= 160 ? 1 : 9)) % 10;
+    const uint8_t categoryCount = sizeof(EMOTION_CATEGORIES) / sizeof(EMOTION_CATEGORIES[0]);
+    if (t.y >= 46 && t.y < 107) {
+      emotionCategory = (emotionCategory + (t.x >= 160 ? 1 : categoryCount - 1)) % categoryCount;
+      emotionChoice = -1;
+    } else if (t.y >= 118 && t.y < 179) {
+      const uint8_t choiceCount = EMOTION_CHOICE_COUNTS[emotionCategory];
+      emotionChoice = (emotionChoice + (t.x >= 160 ? 1 : choiceCount - 1)) % choiceCount;
+    }
     drawEmotionObservation();
   } else if (emotionFormPage == 4) {
     return;
@@ -3308,6 +3523,16 @@ void publishMqttSettings() {
   meditation["end_sound"] = meditationEndSound; meditation["end_volume"] = meditationEndVolume;
   meditation["light_enabled"] = meditationLightEnabled;
   meditation["noise_enabled"] = meditationNoiseEnabled; meditation["noise"] = meditationNoise; meditation["noise_volume"] = meditationNoiseVolume;
+  JsonObject emotionReminder = doc["emotion_reminder"].to<JsonObject>();
+  emotionReminder["mode"] = emotionReminderMode;
+  emotionReminder["interval_minutes"] = emotionReminderIntervalMinutes;
+  emotionReminder["window_start_minutes"] = emotionReminderWindowStart;
+  emotionReminder["window_end_minutes"] = emotionReminderWindowEnd;
+  emotionReminder["vibration"] = emotionReminderVibration;
+  emotionReminder["sound_enabled"] = emotionReminderSound;
+  emotionReminder["duration_seconds"] = emotionReminderDurationSeconds;
+  emotionReminder["sound"] = emotionReminderSoundChoice;
+  emotionReminder["volume"] = emotionReminderVolume;
   JsonArray alarmList = doc["alarms"].to<JsonArray>();
   for (int i = 0; i < ALARM_COUNT; ++i) {
     JsonObject a = alarmList.add<JsonObject>();
@@ -3380,6 +3605,27 @@ bool applyMqttSettings(const String& payload, String& error) {
     if (meditation["noise_enabled"].is<bool>()) meditationNoiseEnabled = meditation["noise_enabled"];
     if (meditation["noise"].is<int>()) meditationNoise = constrain(meditation["noise"].as<int>(), 0, 2);
     if (meditation["noise_volume"].is<int>()) meditationNoiseVolume = constrain(meditation["noise_volume"].as<int>(), 5, 80);
+  }
+  JsonObjectConst emotionReminder = root["emotion_reminder"];
+  if (!emotionReminder.isNull()) {
+    if (emotionReminder["mode"].is<int>()) emotionReminderMode = constrain(emotionReminder["mode"].as<int>(), 0, 2);
+    if (emotionReminder["interval_minutes"].is<int>()) {
+      int requested = emotionReminder["interval_minutes"].as<int>();
+      const uint16_t validIntervals[] = {10, 15, 30, 60, 120, 180, 240};
+      for (uint16_t interval : validIntervals) if (requested == interval) emotionReminderIntervalMinutes = interval;
+    }
+    if (emotionReminder["window_start_minutes"].is<int>()) emotionReminderWindowStart = constrain(emotionReminder["window_start_minutes"].as<int>(), 0, 1439);
+    if (emotionReminder["window_end_minutes"].is<int>()) emotionReminderWindowEnd = constrain(emotionReminder["window_end_minutes"].as<int>(), 0, 1439);
+    if (emotionReminderWindowEnd < emotionReminderWindowStart) emotionReminderWindowEnd = emotionReminderWindowStart;
+    if (emotionReminder["vibration"].is<bool>()) emotionReminderVibration = emotionReminder["vibration"];
+    if (emotionReminder["sound_enabled"].is<bool>()) emotionReminderSound = emotionReminder["sound_enabled"];
+    if (emotionReminder["duration_seconds"].is<int>()) {
+      int duration = emotionReminder["duration_seconds"].as<int>();
+      if (duration == 10 || duration == 30 || duration == 60 || duration == 120) emotionReminderDurationSeconds = duration;
+    }
+    if (emotionReminder["sound"].is<int>()) emotionReminderSoundChoice = constrain(emotionReminder["sound"].as<int>(), 0, 3);
+    if (emotionReminder["volume"].is<int>()) emotionReminderVolume = constrain(emotionReminder["volume"].as<int>(), 5, 100);
+    emotionLastReminderMinuteKey = -1;
   }
   JsonArrayConst alarmList = root["alarms"];
   for (JsonObjectConst item : alarmList) {
@@ -3604,13 +3850,19 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<h2>" + tr("API connection", "API 連線") + "</h2><p class='muted'>" + tr("PocketBase API used by the provided emotion journal specification. HTTPS is required.", "依照情緒觀察規格使用 PocketBase API，必須使用 HTTPS。") + "</p>";
     page += "<label class='field'>" + tr("API base URL", "API 基礎網址") + "<input type='url' name='emotionApiBase' value='" + htmlEscape(emotionApiBase) + "' placeholder='https://emotion.theoakhouse.org' required></label>";
     page += "<h2>" + tr("Fill-in reminders", "填寫提醒") + "</h2><label class='field'>" + tr("Reminder schedule", "提醒排程") + "<select name='emotionReminderMode'>";
-    const char* reminderModesEn[] = {"Disabled", "At a recurring interval", "At fixed alarm times"};
-    const char* reminderModesZh[] = {"關閉", "間隔提醒", "固定時間提醒"};
+    const char* reminderModesEn[] = {"Disabled", "Scheduled interval", "At fixed alarm times"};
+    const char* reminderModesZh[] = {"關閉", "整點提醒", "固定時間提醒"};
     for (int i = 0; i < 3; ++i) page += "<option value='" + String(i) + "'" + String(emotionReminderMode == i ? " selected" : "") + ">" + tr(reminderModesEn[i], reminderModesZh[i]) + "</option>";
-    page += "</select></label><label class='field'>" + tr("Interval", "間隔") + "<select name='emotionInterval'>";
-    const uint16_t reminderIntervals[] = {15, 30, 60, 120, 240};
-    for (uint16_t interval : reminderIntervals) page += "<option value='" + String(interval) + "'" + String(emotionReminderIntervalMinutes == interval ? " selected" : "") + ">" + String(interval) + " " + tr("minutes", "分鐘") + "</option>";
-    page += "</select></label><p class='muted'>" + tr("Fixed-time reminders support up to three times per day. Leave a time unchecked to disable that slot.", "固定時間每天最多三個時段；取消勾選即可停用該時段。") + "</p>";
+    page += "</select></label><h3>" + tr("Scheduled interval window", "整點提醒區間") + "</h3><div class='grid'>";
+    page += "<label class='field'>" + tr("Start time", "開始時間") + "<input type='time' name='emotionWindowStart' value='" + emotionReminderTimeText(emotionReminderWindowStart) + "'></label>";
+    page += "<label class='field'>" + tr("End time", "結束時間") + "<input type='time' name='emotionWindowEnd' value='" + emotionReminderTimeText(emotionReminderWindowEnd) + "'></label></div>";
+    page += "<label class='field'>" + tr("Reminder interval", "提醒間隔") + "<select name='emotionInterval'>";
+    const uint16_t reminderIntervals[] = {10, 15, 30, 60, 120, 180, 240};
+    const char* reminderIntervalsEn[] = {"10 minutes", "15 minutes", "30 minutes", "1 hour", "2 hours", "3 hours", "4 hours"};
+    const char* reminderIntervalsZh[] = {"10 分鐘", "15 分鐘", "30 分鐘", "1 小時", "2 小時", "3 小時", "4 小時"};
+    for (int i = 0; i < 7; ++i) page += "<option value='" + String(reminderIntervals[i]) + "'" + String(emotionReminderIntervalMinutes == reminderIntervals[i] ? " selected" : "") + ">" + tr(reminderIntervalsEn[i], reminderIntervalsZh[i]) + "</option>";
+    page += "</select></label><p class='muted'>" + tr("The schedule starts at the selected start time and repeats by the chosen interval until the end time, inclusive.", "從開始時間起，依選定間隔提醒，直到結束時間（含）為止。") + "</p>";
+    page += "<h3>" + tr("Fixed alarm times", "固定時間提醒") + "</h3><p class='muted'>" + tr("Fixed-time reminders support up to three times per day. Leave a time unchecked to disable that slot.", "固定時間每天最多三個時段；取消勾選即可停用該時段。") + "</p>";
     for (int i = 0; i < 3; ++i) {
       bool enabled = emotionReminderTimes[i] != 0xFFFF;
       uint16_t minutes = enabled ? emotionReminderTimes[i] : (i == 0 ? 600 : (i == 1 ? 900 : 1200));
@@ -3825,7 +4077,16 @@ void setupSettingsServer() {
         emotionApiBase = requestedBase;
       } else if (settingsServer.arg("emotionApiBase") != emotionApiBase) emotionBaseRejected = true;
       emotionReminderMode = constrain(settingsServer.arg("emotionReminderMode").toInt(), 0, 2);
-      emotionReminderIntervalMinutes = constrain(settingsServer.arg("emotionInterval").toInt(), 15, 240);
+      int requestedEmotionInterval = settingsServer.arg("emotionInterval").toInt();
+      const uint16_t validIntervals[] = {10, 15, 30, 60, 120, 180, 240};
+      bool intervalAccepted = false;
+      for (uint16_t interval : validIntervals) if (requestedEmotionInterval == interval) intervalAccepted = true;
+      emotionReminderIntervalMinutes = intervalAccepted ? requestedEmotionInterval : 60;
+      String windowStart = settingsServer.arg("emotionWindowStart");
+      String windowEnd = settingsServer.arg("emotionWindowEnd");
+      if (windowStart.length() >= 5) emotionReminderWindowStart = constrain(windowStart.substring(0, 2).toInt(), 0, 23) * 60 + constrain(windowStart.substring(3, 5).toInt(), 0, 59);
+      if (windowEnd.length() >= 5) emotionReminderWindowEnd = constrain(windowEnd.substring(0, 2).toInt(), 0, 23) * 60 + constrain(windowEnd.substring(3, 5).toInt(), 0, 59);
+      if (emotionReminderWindowEnd < emotionReminderWindowStart) emotionReminderWindowEnd = emotionReminderWindowStart;
       for (int i = 0; i < 3; ++i) {
         if (!settingsServer.hasArg("emotionTimeOn" + String(i))) emotionReminderTimes[i] = 0xFFFF;
         else {
@@ -3839,7 +4100,7 @@ void setupSettingsServer() {
       emotionReminderDurationSeconds = (duration == 10 || duration == 30 || duration == 60 || duration == 120) ? duration : 30;
       emotionReminderSoundChoice = constrain(settingsServer.arg("emotionSoundChoice").toInt(), 0, 3);
       emotionReminderVolume = constrain(settingsServer.arg("emotionVolume").toInt(), 5, 100);
-      emotionLastIntervalReminder = millis();
+      emotionLastReminderMinuteKey = -1;
     } else if (pageId == "mqtt") {
       mqttEnabled = settingsServer.hasArg("mqttEnabled");
       mqttHost = settingsServer.arg("mqttHost");
@@ -3928,7 +4189,6 @@ void setup() {
   Serial.printf("[display] Matrix canvas: %s (%d bpp)\n", matrixCanvasReady ? "ready" : "FAILED", matrixCanvas.getColorDepth());
   loadSettings();
   lastUserActivity = millis();
-  emotionLastIntervalReminder = millis();
   m5::rtc_datetime_t startupTime; getClockDateTime(&startupTime); applyDisplayBrightness(startupTime);
   WiFi.mode(WIFI_STA); applyNetworkHostname(); WiFi.setAutoReconnect(true); WiFi.setSleep(true); WiFi.begin();
   wifiRecoveryPhase = WifiRecoveryPhase::Primary;

@@ -99,20 +99,28 @@ $(mqtt:remaining_text)</pre>
 }}</pre>
 <p>preset_minutes 各為 1–180 分鐘；提示音 0 打版、1 磬聲、2 流水、3 水滴；start/end_volume 為 5–100。背景音 noise：0 流水、1 雨聲、2 夏夜蟲鳴；noise_volume 為 5–80。</p>
 
-<h2>10. Companion 四頁</h2><pre>{"companion":[
+<h2>10. 情緒觀察提醒</h2><pre>{"emotion_reminder":{
+  "mode":1,"interval_minutes":15,
+  "window_start_minutes":300,"window_end_minutes":1410,
+  "vibration":true,"sound_enabled":false,
+  "duration_seconds":30,"sound":1,"volume":60
+}}</pre>
+<p>mode：0 關閉、1 整點提醒、2 固定時間提醒。整點提醒從 window_start_minutes 起，依 10、15、30、60、120、180 或 240 分鐘間隔執行，直到 window_end_minutes（含）為止；300 代表 05:00，1410 代表 23:30。</p>
+
+<h2>11. Companion 四頁</h2><pre>{"companion":[
   {"page":1,"host":"10.41.10.5","port":16622},
   {"page":2,"host":"10.41.10.6","port":16622},
   {"page":3,"host":"","port":16622},
   {"page":4,"host":"","port":16622}
 ]}</pre><p>page 為 1–4。設定改變後會自動重新連接 Companion。</p>
 
-<h2>11. 修改 MQTT／Wi-Fi</h2><pre>{"mqtt":{
+<h2>12. 修改 MQTT／Wi-Fi</h2><pre>{"mqtt":{
   "enabled":true,"host":"10.41.10.10","port":1883,
   "username":"core2","password":"密碼","base_topic":"spaceclock/core2"
 }}</pre><p>修改 Broker 或 Base Topic 後，Core2 會使用新設定重新連線。</p>
 <pre>{"wifi":{"ssid":"your-ssid","password":"Wi-Fi密碼"}}</pre><p class="note">修改 Wi-Fi 後舊 IP 可能失效，MQTT 也會暫時離線。建議 Wi-Fi 優先從設定網頁修改。</p>
 
-<h2>12. 即時控制</h2><table><tr><th>Topic</th><th>Payload</th><th>功能</th></tr>
+<h2>13. 即時控制</h2><table><tr><th>Topic</th><th>Payload</th><th>功能</th></tr>
 <tr><td>command/screen</td><td>on、wake、off</td><td>喚醒／關閉螢幕</td></tr>
 <tr><td>command/brightness</td><td>10–100</td><td>關閉自動亮度並設定亮度</td></tr>
 <tr><td>command/page</td><td>clock、meditation、companion1–4</td><td>切換畫面</td></tr>
@@ -120,7 +128,7 @@ $(mqtt:remaining_text)</pre>
 <tr><td>command/alarm</td><td>stop、dismiss、snooze</td><td>停止或貪睡正在響的鬧鐘</td></tr>
 <tr><td>command/settings</td><td>get</td><td>重新發布完整設定</td></tr></table><p>表中的 Topic 前方均需加上 Base Topic，例如 <code>spaceclock/core2/command/screen</code>。</p>
 
-<h2>13. Mosquitto 範例</h2><pre>mosquitto_sub -h 10.41.10.10 -u core2 -P '密碼' \
+<h2>14. Mosquitto 範例</h2><pre>mosquitto_sub -h 10.41.10.10 -u core2 -P '密碼' \
   -t 'spaceclock/core2/#' -v</pre>
 <pre>mosquitto_pub -h 10.41.10.10 -u core2 -P '密碼' \
   -t 'spaceclock/core2/command/meditation' -m 'start1'</pre>
@@ -128,7 +136,7 @@ $(mqtt:remaining_text)</pre>
   -t 'spaceclock/core2/set' \
   -m '{"alarms":[{"index":0,"hour":7,"minute":30,"enabled":true,"weekdays":62}]}'</pre>
 
-<h2>14. 完整設定範例</h2><pre>{
+<h2>15. 完整設定範例</h2><pre>{
   "timezone_index":18,"clock_face":1,"time_format":24,
   "flat_virtual_buttons":false,"adaptive_brightness":true,
   "day_brightness":80,"night_brightness":20,"screen_off_seconds":300,
@@ -136,6 +144,7 @@ $(mqtt:remaining_text)</pre>
   "night_light":{"enabled":true,"color":"#FFF0C8","brightness":18,"mode":2,"seconds":60},
   "alarm_light":{"enabled":true,"color":"#FFFFFF","brightness":35,"mode":0},
   "meditation":{"preset_minutes":[5,15],"sound_enabled":true,"start_sound":1,"start_volume":55,"end_sound":1,"end_volume":70,"light_enabled":true,"noise_enabled":false,"noise":0,"noise_volume":25},
+  "emotion_reminder":{"mode":1,"interval_minutes":15,"window_start_minutes":300,"window_end_minutes":1410,"vibration":true,"sound_enabled":false,"duration_seconds":30,"sound":1,"volume":60},
   "alarms":[{"index":0,"hour":7,"minute":30,"enabled":true,"weekdays":62}],
   "companion":[{"page":1,"host":"10.41.10.5","port":16622}]
 }</pre>

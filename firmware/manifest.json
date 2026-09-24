@@ -1,7 +1,7 @@
 {
-  "version": "2.9.8",
+  "version": "2.9.9",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "14f256c570b5a1fc85fb2fa20637cb8556a3ac08eeea9f7997b8b811277a68b9",
-  "size": 4786800,
-  "notes": "Restores verified HTTPS login to the emotion database with the current Google Trust Services root, adds a live connection indicator and prevents entry until authentication succeeds. Refines all eight emotion-observation pages, defaults and on-device reminder settings. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "91406cd45a2a7c8c485774f82a60a0830fca9572453c4e6a19e3a4cc73651f8c",
+  "size": 4799056,
+  "notes": "Adds a Matrix-themed emotion-observation interface, per-page graphical reset controls, swipe-based date/time entry, theme-matched selections, confirmation plus withdrawal after submission, ten detailed emotion categories, and scheduled reminders within a daily window. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
 }
