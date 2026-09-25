@@ -186,7 +186,7 @@ String hassAssistPipelineNames[HASS_ASSIST_MAX_PIPELINES];
 uint8_t hassAssistPipelineCount = 0;
 String hassAssistPreferredPipeline;
 String hassAssistDiscoveryError;
-enum class HassAssistState : uint8_t { Disabled, Disconnected, Connecting, Authenticating, Ready, WaitingWakeWord, Starting, Listening, Processing, Downloading, Speaking, Error };
+enum class HassAssistState : uint8_t { Disabled, Disconnected, Connecting, Authenticating, Ready, Paused, WaitingWakeWord, Starting, Listening, Processing, Downloading, Speaking, Error };
 HassAssistState hassAssistState = HassAssistState::Disabled;
 WebSocketsClient hassAssistWebSocket;
 bool hassAssistSocketStarted = false;
@@ -1827,6 +1827,7 @@ const char* hassAssistStateText() {
     case HassAssistState::Connecting: return "Connecting...";
     case HassAssistState::Authenticating: return "Authenticating...";
     case HassAssistState::Ready: return "Hold to talk";
+    case HassAssistState::Paused: return "Wake listening paused";
     case HassAssistState::WaitingWakeWord: return "Waiting for wake word...";
     case HassAssistState::Starting: return "Starting Assist...";
     case HassAssistState::Listening: return hassAssistToggleListen ? "Listening... tap to send" : "Listening... release to send";
@@ -1840,6 +1841,7 @@ const char* hassAssistStateText() {
 
 uint16_t hassAssistStateColor() {
   if (hassAssistState == HassAssistState::Ready) return 0x07E0;
+  if (hassAssistState == HassAssistState::Paused) return 0x8410;
   if (hassAssistState == HassAssistState::WaitingWakeWord) return TFT_CYAN;
   if (hassAssistState == HassAssistState::Listening) return TFT_CYAN;
   if (hassAssistState == HassAssistState::Speaking) return 0xFD20;
@@ -2110,6 +2112,9 @@ void processHassAssistEvent(JsonObject event) {
     }
     if (wasWakeSession) hassAssistRestartAt = millis() + 350UL;
   }
+  if (hassAssistWakeWordPaused && hassAssistState != HassAssistState::Error) {
+    hassAssistState = HassAssistState::Paused;
+  }
   drawHassAssist();
 }
 
@@ -2157,7 +2162,8 @@ void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
     hassAssistWakeSessionActive = false;
     hassAssistWakeDetected = false;
     hassAssistRestartAt = 0;
-    hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
+    hassAssistState = !hassAssistEnabled ? HassAssistState::Disabled
+      : (hassAssistWakeWordPaused ? HassAssistState::Paused : HassAssistState::Disconnected);
     drawHassAssist();
     return;
   }
@@ -2174,7 +2180,7 @@ void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
     hassAssistWebSocket.sendTXT(authPayload);
   } else if (messageType == "auth_ok") {
     hassAssistAuthenticated = true;
-    hassAssistState = HassAssistState::Ready;
+    hassAssistState = hassAssistWakeWordPaused ? HassAssistState::Paused : HassAssistState::Ready;
     hassAssistError = "";
     requestHassAssistPipelines();
     drawHassAssist();
@@ -2255,6 +2261,7 @@ void showHassAssist() {
   hassAssistReply = "";
   hassAssistError = "";
   if (!hassAssistEnabled) hassAssistState = HassAssistState::Disabled;
+  else if (hassAssistWakeWordEnabled && hassAssistWakeWordPaused) hassAssistState = HassAssistState::Paused;
   else if (!hassAssistAuthenticated) hassAssistState = HassAssistState::Disconnected;
   else if (hassAssistWakeSessionActive) {
     hassAssistState = hassAssistWakeDetected ? HassAssistState::Listening : HassAssistState::WaitingWakeWord;
@@ -2420,7 +2427,8 @@ void maintainHassAssist(uint32_t nowMs) {
   if (hassAssistMp3Decoder && !hassAssistAudioDecodeDone) decodeNextHassAssistMp3Frame();
   if (hassAssistAudioData && hassAssistAudioDecodeDone && !M5.Speaker.isPlaying(2)) {
     cleanupHassAssistAudio();
-    hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
+    hassAssistState = !hassAssistAuthenticated ? HassAssistState::Disconnected
+      : (hassAssistWakeWordEnabled && hassAssistWakeWordPaused ? HassAssistState::Paused : HassAssistState::Ready);
     drawHassAssist();
   }
   if (hassAssistWakeWordEnabled && !hassAssistWakeWordPaused && hassAssistAuthenticated && hassAssistWakeWordAllowed()
@@ -4578,6 +4586,9 @@ void handleTouch() {
       haptic(12);
       if (hassAssistWakeWordEnabled) {
         hassAssistWakeWordPaused = false;
+        if (hassAssistSocketConnected && hassAssistAuthenticated && !hassAssistPipelineActive) {
+          startHassAssistPipeline(true);
+        }
         drawHassAssist();
       } else {
         hassAssistHolding = true;
@@ -4593,7 +4604,17 @@ void handleTouch() {
         }
       } else if (hassAssistWakeWordEnabled) {
         hassAssistWakeWordPaused = !hassAssistWakeWordPaused;
-        if (hassAssistWakeWordPaused) stopHassAssist();
+        if (hassAssistWakeWordPaused) {
+          hassAssistRestartAt = 0;
+          if (hassAssistMicRunning) {
+            hassAssistHolding = false;
+            hassAssistStopRequested = true;
+          } else if (hassAssistPipelineActive && hassAssistAudioHandlerId >= 0) {
+            uint8_t endMarker = (uint8_t)hassAssistAudioHandlerId;
+            hassAssistWebSocket.sendBIN(&endMarker, 1);
+          }
+          hassAssistState = HassAssistState::Paused;
+        }
         else if (hassAssistSocketConnected) startHassAssistPipeline(true);
         drawHassAssist();
       } else if (hassAssistToggleListen) {
