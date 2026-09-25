@@ -13,6 +13,7 @@
 #include <mp3dec.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
+#include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
 #include <math.h>
 #include <time.h>
@@ -177,7 +178,14 @@ String hassAssistBaseUrl;
 String hassAssistToken;
 String hassAssistPipeline;
 uint8_t hassAssistVolume = 70;
-enum class HassAssistState : uint8_t { Disabled, Disconnected, Connecting, Authenticating, Ready, Starting, Listening, Processing, Downloading, Speaking, Error };
+bool hassAssistWakeWordEnabled = false;
+static constexpr uint8_t HASS_ASSIST_MAX_PIPELINES = 10;
+String hassAssistPipelineIds[HASS_ASSIST_MAX_PIPELINES];
+String hassAssistPipelineNames[HASS_ASSIST_MAX_PIPELINES];
+uint8_t hassAssistPipelineCount = 0;
+String hassAssistPreferredPipeline;
+String hassAssistDiscoveryError;
+enum class HassAssistState : uint8_t { Disabled, Disconnected, Connecting, Authenticating, Ready, WaitingWakeWord, Starting, Listening, Processing, Downloading, Speaking, Error };
 HassAssistState hassAssistState = HassAssistState::Disabled;
 WebSocketsClient hassAssistWebSocket;
 bool hassAssistSocketStarted = false;
@@ -185,6 +193,11 @@ bool hassAssistSocketConnected = false;
 bool hassAssistAuthenticated = false;
 uint32_t hassAssistCommandId = 400;
 uint32_t hassAssistActiveCommandId = 0;
+uint32_t hassAssistPipelineListCommandId = 0;
+bool hassAssistPipelineActive = false;
+bool hassAssistWakeSessionActive = false;
+bool hassAssistWakeDetected = false;
+uint32_t hassAssistRestartAt = 0;
 int hassAssistAudioHandlerId = -1;
 bool hassAssistHolding = false;
 bool hassAssistStopRequested = false;
@@ -310,8 +323,10 @@ M5Canvas astronautCanvas(&M5.Display);
 M5Canvas companionButtonCanvas(&M5.Display);
 M5Canvas meditationCardCanvas(&M5.Display);
 M5Canvas matrixCanvas(&M5.Display);
+M5Canvas firmwareProgressCanvas(&M5.Display);
 bool matrixCanvasReady = false;
 bool matrixMemoryErrorDrawn = false;
+bool firmwareProgressCanvasReady = false;
 static constexpr uint8_t BOTTOM_LED_PIN = 25;
 static constexpr uint8_t BOTTOM_LED_COUNT = 10;
 Adafruit_NeoPixel bottomLeds(BOTTOM_LED_COUNT, BOTTOM_LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -512,6 +527,7 @@ void saveSettings() {
   prefs.putString("hassToken", hassAssistToken);
   prefs.putString("hassPipe", hassAssistPipeline);
   prefs.putUChar("hassVol", hassAssistVolume);
+  prefs.putBool("hassWake", hassAssistWakeWordEnabled);
   prefs.putUChar("emoMode", emotionReminderMode);
   prefs.putUShort("emoInterval", emotionReminderIntervalMinutes);
   prefs.putUShort("emoWinStart", emotionReminderWindowStart);
@@ -605,6 +621,7 @@ void loadSettings() {
   hassAssistPipeline = prefs.getString("hassPipe", "");
   hassAssistPipeline.trim();
   hassAssistVolume = constrain((int)prefs.getUChar("hassVol", 70), 5, 100);
+  hassAssistWakeWordEnabled = prefs.getBool("hassWake", false);
   hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
   emotionReminderMode = constrain((int)prefs.getUChar("emoMode", 0), 0, 2);
   emotionReminderIntervalMinutes = prefs.getUShort("emoInterval", 60);
@@ -1805,6 +1822,7 @@ const char* hassAssistStateText() {
     case HassAssistState::Connecting: return "Connecting...";
     case HassAssistState::Authenticating: return "Authenticating...";
     case HassAssistState::Ready: return "Hold to talk";
+    case HassAssistState::WaitingWakeWord: return "Waiting for wake word...";
     case HassAssistState::Starting: return "Starting Assist...";
     case HassAssistState::Listening: return "Listening... release to send";
     case HassAssistState::Processing: return "Thinking...";
@@ -1817,6 +1835,7 @@ const char* hassAssistStateText() {
 
 uint16_t hassAssistStateColor() {
   if (hassAssistState == HassAssistState::Ready) return 0x07E0;
+  if (hassAssistState == HassAssistState::WaitingWakeWord) return TFT_CYAN;
   if (hassAssistState == HassAssistState::Listening) return TFT_CYAN;
   if (hassAssistState == HassAssistState::Speaking) return 0xFD20;
   if (hassAssistState == HassAssistState::Error || hassAssistState == HassAssistState::Disabled) return 0xF986;
@@ -1861,7 +1880,7 @@ void drawHassAssist() {
     M5.Display.drawString(hassAssistTranscript, 14, 168);
   } else {
     M5.Display.setTextColor(0x7BEF, TFT_BLACK);
-    M5.Display.drawString("Press and hold the microphone", 43, 174);
+    M5.Display.drawString(hassAssistWakeWordEnabled ? "Say the configured wake word" : "Press and hold the microphone", hassAssistWakeWordEnabled ? 46 : 43, 174);
   }
   M5.Display.clearClipRect();
   drawBottomBar("", "", "Close");
@@ -1895,6 +1914,14 @@ void stopHassAssist() {
   hassAssistSocketConnected = false;
   hassAssistAuthenticated = false;
   hassAssistAudioHandlerId = -1;
+  hassAssistPipelineActive = false;
+  hassAssistWakeSessionActive = false;
+  hassAssistWakeDetected = false;
+  hassAssistRestartAt = 0;
+  hassAssistPipelineListCommandId = 0;
+  hassAssistPipelineCount = 0;
+  hassAssistPreferredPipeline = "";
+  hassAssistDiscoveryError = "";
   hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
 }
 
@@ -1919,7 +1946,8 @@ void beginHassAssistMic() {
   }
   hassAssistMicRunning = true;
   hassAssistListenStarted = millis();
-  hassAssistState = HassAssistState::Listening;
+  hassAssistState = hassAssistWakeSessionActive && !hassAssistWakeDetected
+    ? HassAssistState::WaitingWakeWord : HassAssistState::Listening;
   drawHassAssist();
 }
 
@@ -1948,7 +1976,10 @@ void finishHassAssistMic() {
 
 void maintainHassAssistMic(uint32_t nowMs) {
   if (!hassAssistMicRunning) return;
-  if (nowMs - hassAssistListenStarted >= 15000UL) { hassAssistHolding = false; hassAssistStopRequested = true; }
+  if (!hassAssistWakeSessionActive && nowMs - hassAssistListenStarted >= 15000UL) {
+    hassAssistHolding = false;
+    hassAssistStopRequested = true;
+  }
   uint8_t active = min<size_t>(M5.Mic.isRecording(), hassAssistMicOutstanding);
   uint8_t completed = hassAssistMicOutstanding - active;
   while (completed--) {
@@ -1967,26 +1998,35 @@ void maintainHassAssistMic(uint32_t nowMs) {
   }
 }
 
-void startHassAssistPipeline() {
+void startHassAssistPipeline(bool wakeWordMode = false) {
   if (!hassAssistEnabled || !hassAssistAuthenticated || !hassAssistSocketConnected) {
     hassAssistError = hassAssistEnabled ? "Home Assistant is not connected" : "Configure HASS Assist in the web settings";
     hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
     drawHassAssist();
     return;
   }
-  if (hassAssistMicRunning || hassAssistMp3Decoder || hassAssistAudioData || hassAssistTtsPending) return;
+  if (hassAssistPipelineActive || hassAssistMicRunning || hassAssistMp3Decoder || hassAssistAudioData || hassAssistTtsPending) return;
   hassAssistError = "";
   hassAssistTranscript = "";
   hassAssistReply = "";
   hassAssistAudioHandlerId = -1;
   hassAssistStopRequested = false;
+  hassAssistWakeSessionActive = wakeWordMode;
+  hassAssistWakeDetected = false;
+  hassAssistPipelineActive = true;
   hassAssistActiveCommandId = ++hassAssistCommandId;
   JsonDocument command;
   command["id"] = hassAssistActiveCommandId;
   command["type"] = "assist_pipeline/run";
-  command["start_stage"] = "stt";
+  command["start_stage"] = wakeWordMode ? "wake_word" : "stt";
   command["end_stage"] = "tts";
   command["input"]["sample_rate"] = 16000;
+  if (wakeWordMode) {
+    command["input"]["timeout"] = 30;
+    command["input"]["noise_suppression_level"] = 2;
+    command["input"]["auto_gain_dbfs"] = 31;
+    command["input"]["volume_multiplier"] = 2.0;
+  }
   if (hassAssistPipeline.length()) command["pipeline"] = hassAssistPipeline;
   String payload;
   serializeJson(command, payload);
@@ -2000,13 +2040,28 @@ void processHassAssistEvent(JsonObject event) {
   JsonVariant data = event["data"];
   if (eventType == "run-start") {
     hassAssistAudioHandlerId = data["runner_data"]["stt_binary_handler_id"] | -1;
+    if (hassAssistWakeSessionActive) beginHassAssistMic();
+  } else if (eventType == "wake_word-start") {
+    hassAssistState = HassAssistState::WaitingWakeWord;
+    if (hassAssistWakeSessionActive && !hassAssistMicRunning) beginHassAssistMic();
+  } else if (eventType == "wake_word-end") {
+    hassAssistWakeDetected = true;
+    hassAssistState = HassAssistState::Listening;
   } else if (eventType == "stt-start") {
-    if (hassAssistHolding) beginHassAssistMic();
+    if (hassAssistWakeSessionActive) {
+      hassAssistWakeDetected = true;
+      hassAssistState = HassAssistState::Listening;
+      if (!hassAssistMicRunning) beginHassAssistMic();
+    } else if (hassAssistHolding) beginHassAssistMic();
     else {
       uint8_t endMarker = (uint8_t)max(hassAssistAudioHandlerId, 0);
       if (hassAssistAudioHandlerId >= 0) hassAssistWebSocket.sendBIN(&endMarker, 1);
       hassAssistState = HassAssistState::Processing;
     }
+  } else if (eventType == "stt-vad-end" && hassAssistWakeSessionActive) {
+    // Home Assistant detected the end of the spoken command after the wake
+    // word. Finish the binary stream so Sherpa can transcribe immediately.
+    hassAssistStopRequested = true;
   } else if (eventType == "stt-end") {
     hassAssistTranscript = data["stt_output"]["text"] | "";
     hassAssistState = HassAssistState::Processing;
@@ -2021,13 +2076,55 @@ void processHassAssistEvent(JsonObject event) {
     hassAssistTtsPending = hassAssistTtsUrl.length();
     if (hassAssistTtsPending) hassAssistState = HassAssistState::Downloading;
   } else if (eventType == "error") {
-    hassAssistError = data["message"] | "Assist pipeline failed";
-    hassAssistState = HassAssistState::Error;
+    String errorCode = data["code"] | "";
+    bool wakeTimeout = hassAssistWakeSessionActive && errorCode == "wake-word-timeout";
+    hassAssistError = wakeTimeout ? "" : String(data["message"] | "Assist pipeline failed");
+    hassAssistState = wakeTimeout ? HassAssistState::Ready : HassAssistState::Error;
     abortHassAssistMic();
-  } else if (eventType == "run-end" && !hassAssistTtsPending && !hassAssistMp3Decoder && !hassAssistAudioData) {
-    hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
+    hassAssistPipelineActive = false;
+    hassAssistWakeSessionActive = false;
+    hassAssistWakeDetected = false;
+    if (wakeTimeout) hassAssistRestartAt = millis() + 350UL;
+  } else if (eventType == "run-end") {
+    bool wasWakeSession = hassAssistWakeSessionActive;
+    if (hassAssistMicRunning) abortHassAssistMic();
+    hassAssistPipelineActive = false;
+    hassAssistWakeSessionActive = false;
+    hassAssistWakeDetected = false;
+    if (!hassAssistTtsPending && !hassAssistMp3Decoder && !hassAssistAudioData) {
+      hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
+    }
+    if (wasWakeSession) hassAssistRestartAt = millis() + 350UL;
   }
   drawHassAssist();
+}
+
+void requestHassAssistPipelines() {
+  if (!hassAssistSocketConnected || !hassAssistAuthenticated) return;
+  hassAssistPipelineListCommandId = ++hassAssistCommandId;
+  JsonDocument command;
+  command["id"] = hassAssistPipelineListCommandId;
+  command["type"] = "assist_pipeline/pipeline/list";
+  String payload;
+  serializeJson(command, payload);
+  hassAssistDiscoveryError = "";
+  hassAssistWebSocket.sendTXT(payload);
+}
+
+void processHassAssistPipelineList(JsonVariantConst result) {
+  hassAssistPipelineCount = 0;
+  hassAssistPreferredPipeline = result["preferred_pipeline"] | "";
+  JsonArrayConst pipelines = result["pipelines"].as<JsonArrayConst>();
+  for (JsonObjectConst pipeline : pipelines) {
+    if (hassAssistPipelineCount >= HASS_ASSIST_MAX_PIPELINES) break;
+    String id = pipeline["id"] | "";
+    if (!id.length()) continue;
+    String name = pipeline["name"] | id;
+    hassAssistPipelineIds[hassAssistPipelineCount] = id;
+    hassAssistPipelineNames[hassAssistPipelineCount] = name;
+    ++hassAssistPipelineCount;
+  }
+  hassAssistDiscoveryError = hassAssistPipelineCount ? "" : "No Assist pipelines were found";
 }
 
 void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
@@ -2042,6 +2139,10 @@ void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
     hassAssistSocketConnected = false;
     hassAssistAuthenticated = false;
     if (hassAssistMicRunning) abortHassAssistMic();
+    hassAssistPipelineActive = false;
+    hassAssistWakeSessionActive = false;
+    hassAssistWakeDetected = false;
+    hassAssistRestartAt = 0;
     hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
     drawHassAssist();
     return;
@@ -2061,17 +2162,27 @@ void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
     hassAssistAuthenticated = true;
     hassAssistState = HassAssistState::Ready;
     hassAssistError = "";
+    requestHassAssistPipelines();
     drawHassAssist();
   } else if (messageType == "auth_invalid") {
     hassAssistAuthenticated = false;
     hassAssistError = "Home Assistant token was rejected";
     hassAssistState = HassAssistState::Error;
     drawHassAssist();
+  } else if (messageType == "result" && (uint32_t)(message["id"] | 0) == hassAssistPipelineListCommandId) {
+    if (message["success"].as<bool>()) {
+      processHassAssistPipelineList(message["result"].as<JsonVariantConst>());
+    } else {
+      hassAssistDiscoveryError = message["error"]["message"] | "Could not list Assist pipelines";
+    }
   } else if (messageType == "event" && (uint32_t)(message["id"] | 0) == hassAssistActiveCommandId) {
     processHassAssistEvent(message["event"].as<JsonObject>());
   } else if (messageType == "result" && !message["success"].as<bool>() && (uint32_t)(message["id"] | 0) == hassAssistActiveCommandId) {
     hassAssistError = message["error"]["message"] | "Assist request was rejected";
     hassAssistState = HassAssistState::Error;
+    hassAssistPipelineActive = false;
+    hassAssistWakeSessionActive = false;
+    hassAssistWakeDetected = false;
     drawHassAssist();
   }
 }
@@ -2129,7 +2240,11 @@ void showHassAssist() {
   hassAssistTranscript = "";
   hassAssistReply = "";
   hassAssistError = "";
-  hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
+  if (!hassAssistEnabled) hassAssistState = HassAssistState::Disabled;
+  else if (!hassAssistAuthenticated) hassAssistState = HassAssistState::Disconnected;
+  else if (hassAssistWakeSessionActive) {
+    hassAssistState = hassAssistWakeDetected ? HassAssistState::Listening : HassAssistState::WaitingWakeWord;
+  } else hassAssistState = HassAssistState::Ready;
   drawHassAssist();
   connectHassAssist();
 }
@@ -2258,10 +2373,26 @@ void decodeNextHassAssistMp3Frame() {
   hassAssistMp3BufferIndex = (hassAssistMp3BufferIndex + 1) % 3;
 }
 
+bool hassAssistWakeWordAllowed() {
+  return alarmActive < 0
+    && meditationState != MeditationState::Running
+    && screenNow != Screen::FirmwareUpdate;
+}
+
 void maintainHassAssist(uint32_t nowMs) {
-  if (!hassAssistEnabled || screenNow != Screen::HassAssist) return;
+  if (!hassAssistEnabled) return;
   if (!hassAssistSocketStarted) connectHassAssist();
   if (hassAssistSocketStarted) hassAssistWebSocket.loop();
+  // Keep the authenticated WebSocket alive in the background so the local
+  // settings page can discover Home Assistant pipelines (including Wyoming
+  // pipelines backed by Sherpa ONNX) without exposing the access token.
+  if (hassAssistWakeSessionActive && !hassAssistWakeWordAllowed()) {
+    // Alarm audio, meditation audio and firmware installation take priority.
+    // Closing the socket cancels the active pipeline cleanly; background
+    // listening is started again when the device becomes available.
+    stopHassAssist();
+    return;
+  }
   maintainHassAssistMic(nowMs);
   if (hassAssistTtsPending && !hassAssistMicRunning && !hassAssistAudioData) {
     hassAssistTtsPending = false;
@@ -2277,6 +2408,14 @@ void maintainHassAssist(uint32_t nowMs) {
     cleanupHassAssistAudio();
     hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
     drawHassAssist();
+  }
+  if (hassAssistWakeWordEnabled && hassAssistAuthenticated && hassAssistWakeWordAllowed()
+      && hassAssistState != HassAssistState::Error
+      && !hassAssistPipelineActive && !hassAssistMicRunning && !hassAssistTtsPending
+      && !hassAssistAudioData && !hassAssistMp3Decoder
+      && (!hassAssistRestartAt || (int32_t)(nowMs - hassAssistRestartAt) >= 0)) {
+    hassAssistRestartAt = 0;
+    startHassAssistPipeline(true);
   }
 }
 
@@ -2739,6 +2878,70 @@ void showFirmwareUpdate() {
   drawBottomBar("Check", firmwareUpdateAvailable ? "Install" : "", "Close");
 }
 
+void drawFirmwareDownloadProgress(uint8_t percent, uint8_t attempt, uint8_t attempts) {
+  if (screenNow != Screen::FirmwareUpdate) return;
+  percent = min((uint8_t)100, percent);
+  String attemptText = String(attempt) + "/" + String(attempts);
+  if (firmwareProgressCanvasReady) {
+    firmwareProgressCanvas.fillSprite(BG);
+    firmwareProgressCanvas.setFont(&SourceHanSansTC_UI8pt8b);
+    firmwareProgressCanvas.setTextSize(1);
+    firmwareProgressCanvas.setTextColor(TFT_GREEN, BG);
+    firmwareProgressCanvas.setTextDatum(top_left);
+    firmwareProgressCanvas.drawString("Downloading " + String(percent) + "%", 0, 1);
+    firmwareProgressCanvas.setTextColor(UI_MUTED, BG);
+    firmwareProgressCanvas.setTextDatum(top_right);
+    firmwareProgressCanvas.drawString(attemptText, 291, 1);
+    firmwareProgressCanvas.drawRoundRect(0, 27, 292, 13, 4, UI_BORDER);
+    if (percent) firmwareProgressCanvas.fillRoundRect(2, 29, (288 * percent) / 100, 9, 3, TFT_GREEN);
+    firmwareProgressCanvas.pushSprite(14, 162);
+    return;
+  }
+
+  // Low-memory fallback still updates only the progress area instead of
+  // clearing and redrawing the entire screen.
+  M5.Display.fillRect(14, 162, 292, 44, BG);
+  useUIFont(1);
+  M5.Display.setTextColor(TFT_GREEN, BG);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.drawString("Downloading " + String(percent) + "%", 14, 163);
+  M5.Display.setTextColor(UI_MUTED, BG);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.drawString(attemptText, 305, 163);
+  M5.Display.drawRoundRect(14, 189, 292, 13, 4, UI_BORDER);
+  if (percent) M5.Display.fillRoundRect(16, 191, (288 * percent) / 100, 9, 3, TFT_GREEN);
+}
+
+void drawFirmwareVerificationStatus(uint8_t attempt, uint8_t attempts) {
+  if (screenNow != Screen::FirmwareUpdate) return;
+  String attemptText = String(attempt) + "/" + String(attempts);
+  if (firmwareProgressCanvasReady) {
+    firmwareProgressCanvas.fillSprite(BG);
+    firmwareProgressCanvas.setFont(&SourceHanSansTC_UI8pt8b);
+    firmwareProgressCanvas.setTextSize(1);
+    firmwareProgressCanvas.setTextColor(TFT_YELLOW, BG);
+    firmwareProgressCanvas.setTextDatum(top_left);
+    firmwareProgressCanvas.drawString("Verifying firmware...", 0, 1);
+    firmwareProgressCanvas.setTextColor(UI_MUTED, BG);
+    firmwareProgressCanvas.setTextDatum(top_right);
+    firmwareProgressCanvas.drawString(attemptText, 291, 1);
+    firmwareProgressCanvas.drawRoundRect(0, 27, 292, 13, 4, UI_BORDER);
+    firmwareProgressCanvas.fillRoundRect(2, 29, 288, 9, 3, TFT_YELLOW);
+    firmwareProgressCanvas.pushSprite(14, 162);
+    return;
+  }
+  M5.Display.fillRect(14, 162, 292, 44, BG);
+  useUIFont(1);
+  M5.Display.setTextColor(TFT_YELLOW, BG);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.drawString("Verifying firmware...", 14, 163);
+  M5.Display.setTextColor(UI_MUTED, BG);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.drawString(attemptText, 305, 163);
+  M5.Display.drawRoundRect(14, 189, 292, 13, 4, UI_BORDER);
+  M5.Display.fillRoundRect(16, 191, 288, 9, 3, TFT_YELLOW);
+}
+
 bool readFirmwareManifest(bool redraw = true) {
   if (WiFi.status() != WL_CONNECTED) {
     firmwareUpdateMessage = "Wi-Fi is not connected.";
@@ -2781,6 +2984,32 @@ bool readFirmwareManifest(bool redraw = true) {
   firmwareUpdateMessage = firmwareUpdateAvailable ? "New firmware is ready. Tap Install." : "This firmware is up to date.";
   if (redraw) showFirmwareUpdate();
   return true;
+}
+
+bool finalizeFirmwareUpdateSafely() {
+  // esp_ota_set_boot_partition() verifies the complete image while the flash
+  // cache is paused. Give that bounded operation enough CPU and watchdog time
+  // for both GitHub OTA and uploads made through the local settings page.
+  uint32_t previousCpuMHz = getCpuFrequencyMhz();
+  setCpuFrequencyMhz(240);
+  const esp_task_wdt_config_t verifyWdt = {
+    .timeout_ms = 120000,
+    .idle_core_mask = 1U << 0,
+    .trigger_panic = true,
+  };
+  esp_err_t verifyWdtResult = esp_task_wdt_reconfigure(&verifyWdt);
+  Serial.printf("[ota] watchdog verification window: %s\n", esp_err_to_name(verifyWdtResult));
+  delay(1);
+  bool updateEnded = Update.end(true);
+  const esp_task_wdt_config_t normalWdt = {
+    .timeout_ms = 5000,
+    .idle_core_mask = 1U << 0,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&normalWdt);
+  setCpuFrequencyMhz(previousCpuMHz);
+  delay(1);
+  return updateEnded;
 }
 
 bool installLatestFirmware(bool redraw = true) {
@@ -2864,7 +3093,7 @@ bool installLatestFirmware(bool redraw = true) {
             lastPercent = percent;
             lastDrawAt = millis();
             firmwareUpdateMessage = "Downloading " + String(percent) + "% (" + String(attempt) + "/" + String(MAX_ATTEMPTS) + ")";
-            if (redraw) showFirmwareUpdate();
+            if (redraw) drawFirmwareDownloadProgress((uint8_t)percent, attempt, MAX_ATTEMPTS);
             Serial.printf("[ota] %d%% (%u/%d bytes)\n", percent, (unsigned)written, imageSize);
           }
           continue;
@@ -2899,12 +3128,19 @@ bool installLatestFirmware(bool redraw = true) {
         failure = "Firmware checksum mismatch.";
         Serial.printf("[ota] SHA-256 mismatch: expected %s, got %s\n", latestFirmwareSha256.c_str(), digestHex);
         Update.abort();
-      } else if (!Update.end(true)) {
-        failure = "Update finalize failed: " + String(Update.errorString()) + ".";
-        Serial.printf("[ota] Update.end failed: %s\n", Update.errorString());
       } else {
-        Serial.printf("[ota] verified %s; update ready\n", digestHex);
-        success = true;
+        // Show a distinct state so 100% no longer looks frozen while the
+        // complete image and boot partition are validated.
+        if (redraw) drawFirmwareVerificationStatus(attempt, MAX_ATTEMPTS);
+        Serial.println("[ota] download verified; validating boot partition");
+        bool updateEnded = finalizeFirmwareUpdateSafely();
+        if (!updateEnded) {
+          failure = "Update finalize failed: " + String(Update.errorString()) + ".";
+          Serial.printf("[ota] Update.end failed: %s\n", Update.errorString());
+        } else {
+          Serial.printf("[ota] verified %s; update ready\n", digestHex);
+          success = true;
+        }
       }
     } else {
       Update.abort();
@@ -4308,7 +4544,7 @@ void handleTouch() {
   if (t.wasPressed() || t.isPressed() || t.wasReleased()) lastUserActivity = millis();
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
   if (screenNow == Screen::HassAssist) {
-    if (t.wasPressed() && t.y < 210 && sq((int)t.x - 160) + sq((int)t.y - 117) <= 60 * 60) {
+    if (!hassAssistWakeWordEnabled && t.wasPressed() && t.y < 210 && sq((int)t.x - 160) + sq((int)t.y - 117) <= 60 * 60) {
       hassAssistTouchActive = true;
       hassAssistHolding = true;
       haptic(12);
@@ -4321,7 +4557,6 @@ void handleTouch() {
       if (hassAssistState == HassAssistState::Listening) drawHassAssist();
     } else if (t.wasReleased() && t.y >= 210 && t.x >= 214) {
       haptic(15);
-      stopHassAssist();
       screenNow = Screen::Clock;
       drawClock(true); drawAstronaut();
     }
@@ -5066,11 +5301,23 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<label class='field'>" + tr("Username", "使用者名稱") + "<input name='mqttUsername' value='" + htmlEscape(mqttUsername) + "'></label><label class='field'>" + tr("Password", "密碼") + "<input type='password' name='mqttPassword' placeholder='" + tr("Leave blank to keep current", "留白以保留目前密碼") + "'></label>";
   } else if (pageId == "hass") {
     page += "<h2>Home Assistant Assist</h2><p class='muted'>" + tr("Use this Core2's microphone and speaker as a push-to-talk Home Assistant voice terminal. On the clock, long-press the middle Meditation icon, then hold the microphone while speaking and release it to send.", "使用 Core2 的麥克風與喇叭作為 Home Assistant 按住說話語音終端。在時鐘首頁長按中間的靜心圖示進入；按住麥克風說話，放開後送出。") + "</p>";
+    page += "<div class='card'><b>Sherpa ONNX TTS/STT · Wyoming</b><p class='muted'>" + tr("Supported through Home Assistant's Assist Pipeline. In Home Assistant, finish adding the automatically discovered Wyoming service, then create or edit a Voice Assistant pipeline that uses Sherpa for both speech-to-text and text-to-speech. The Core2 must still use the Home Assistant URL below; do not enter ports 10400 or 10500 here.", "已透過 Home Assistant Assist Pipeline 支援。請先在 Home Assistant 完成加入自動探索到的 Wyoming 服務，再建立或編輯語音助理 Pipeline，將語音轉文字與文字轉語音都選為 Sherpa。Core2 下方仍應填 Home Assistant 網址；請勿在這裡填入 10400 或 10500 連接埠。") + "</p><p id='hassLiveStatus' class='muted'>" + tr("Checking Home Assistant connection...", "正在檢查 Home Assistant 連線……") + "</p><button class='btn secondary' type='button' onclick='refreshHassStatus(true)'>" + tr("Refresh connection and pipelines", "重新偵測連線與 Pipeline") + "</button></div>";
     page += "<label class='check'><input type='checkbox' name='hassEnabled'" + String(hassAssistEnabled ? " checked" : "") + ">" + tr("Enable HASS Assist", "啟用 HASS Assist") + "</label>";
     page += "<label class='field'>" + tr("Home Assistant base URL", "Home Assistant 基礎網址") + "<input name='hassBaseUrl' inputmode='url' placeholder='http://homeassistant.local:8123' value='" + htmlEscape(hassAssistBaseUrl) + "'></label>";
     page += "<label class='field'>" + tr("Long-lived access token", "長期存取權杖") + "<input type='password' name='hassToken' autocomplete='new-password' placeholder='" + tr(hassAssistToken.length() ? "Saved — leave blank to keep current" : "Paste a Home Assistant long-lived token", hassAssistToken.length() ? "已儲存—留白即可保留目前權杖" : "貼上 Home Assistant 長期存取權杖") + "'></label>";
     page += "<label class='check'><input type='checkbox' name='hassClearToken'>" + tr("Forget the saved token", "清除已儲存的權杖") + "</label>";
-    page += "<label class='field'>" + tr("Assist pipeline ID (optional)", "Assist Pipeline ID（選填）") + "<input name='hassPipeline' placeholder='" + tr("Blank uses Home Assistant's preferred pipeline", "留白則使用 Home Assistant 的偏好 Pipeline") + "' value='" + htmlEscape(hassAssistPipeline) + "'></label>";
+    page += "<label class='check'><input type='checkbox' name='hassWakeWord'" + String(hassAssistWakeWordEnabled ? " checked" : "") + ">" + tr("Always listen for the pipeline wake word", "常駐收音等待 Pipeline 喚醒詞") + "</label><p class='muted'>" + tr("Requires a wake-word engine and model in the selected Home Assistant pipeline. Sherpa ONNX supplies STT/TTS only. While enabled, the microphone pauses automatically for alarms, meditation audio and firmware updates, then resumes afterward.", "所選 Home Assistant Pipeline 必須另有喚醒詞引擎與模型；Sherpa ONNX 本身只提供 STT/TTS。啟用後，鬧鐘、靜心音訊及韌體更新期間會自動暫停麥克風，結束後再恢復監聽。") + "</p>";
+    page += "<label class='field'>" + tr("Assist pipeline", "Assist Pipeline") + "<select id='hassPipelineSelect' name='hassPipeline'><option value=''" + String(hassAssistPipeline.length() ? "" : " selected") + ">" + tr("Home Assistant preferred pipeline", "使用 Home Assistant 偏好 Pipeline") + "</option>";
+    bool savedHassPipelineFound = !hassAssistPipeline.length();
+    for (uint8_t i = 0; i < hassAssistPipelineCount; ++i) {
+      bool selected = hassAssistPipeline == hassAssistPipelineIds[i];
+      if (selected) savedHassPipelineFound = true;
+      String optionLabel = hassAssistPipelineNames[i];
+      if (hassAssistPipelineIds[i] == hassAssistPreferredPipeline) optionLabel += tr(" (preferred)", "（偏好）");
+      page += "<option value='" + htmlEscape(hassAssistPipelineIds[i]) + "'" + String(selected ? " selected" : "") + ">" + htmlEscape(optionLabel) + "</option>";
+    }
+    if (!savedHassPipelineFound) page += "<option value='" + htmlEscape(hassAssistPipeline) + "' selected>" + htmlEscape(hassAssistPipeline) + "</option>";
+    page += "</select></label>";
     page += "<label class='field'>" + tr("Voice reply volume", "語音回覆音量") + ": <output id='hassVolumeOut'>" + String(hassAssistVolume) + "%</output><input type='range' min='5' max='100' step='5' name='hassVolume' value='" + String(hassAssistVolume) + "' oninput='hassVolumeOut.value=this.value+\"%\"'></label>";
     page += "<p class='muted'>" + tr("The token is stored only in this Core2's Preferences and is never published to GitHub or MQTT. Because this settings page is local HTTP, configure it only on a trusted Wi-Fi network. MP3 and WAV voice replies are supported.", "權杖只會保存在這台 Core2 的偏好設定，不會上傳 GitHub 或 MQTT。因本設定頁是區域網路 HTTP，請只在可信任的 Wi-Fi 設定。支援 MP3 與 WAV 語音回覆。") + "</p>";
   } else if (pageId == "companion") {
@@ -5088,7 +5335,11 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   }
 
   page += "</section><button type='submit'>" + tr("Save this page", "儲存本頁設定") + "</button></form>";
-  page += "<script>function previewSound(k){const s=document.getElementById(k==='start'?'medStartSound':'medEndSound').value,v=document.getElementById(k==='start'?'medStartVolume':'medEndVolume').value;fetch('/preview?sound='+s+'&volume='+v);}</script></body></html>";
+  page += "<script>function previewSound(k){const s=document.getElementById(k==='start'?'medStartSound':'medEndSound').value,v=document.getElementById(k==='start'?'medStartVolume':'medEndVolume').value;fetch('/preview?sound='+s+'&volume='+v);}";
+  if (pageId == "hass") {
+    page += "async function refreshHassStatus(force=false){const status=document.getElementById('hassLiveStatus'),select=document.getElementById('hassPipelineSelect');try{const response=await fetch('/hass-status'+(force?'?refresh=1':''),{cache:'no-store'}),data=await response.json();status.textContent=data.authenticated?'" + tr("Connected · ", "已連線 · ") + "'+data.pipelines.length+' " + tr("pipeline(s) detected", "個 Pipeline") + "':(data.error||'" + tr("Connecting to Home Assistant...", "正在連線至 Home Assistant……") + "');const current=select.value,preferred=data.preferred||'';select.innerHTML='';const automatic=document.createElement('option');automatic.value='';automatic.textContent='" + tr("Home Assistant preferred pipeline", "使用 Home Assistant 偏好 Pipeline") + "';select.appendChild(automatic);for(const pipeline of data.pipelines){const option=document.createElement('option');option.value=pipeline.id;option.textContent=pipeline.name+(pipeline.id===preferred?' " + tr("(preferred)", "（偏好）") + "':'');select.appendChild(option);}if(current&&!Array.from(select.options).some(option=>option.value===current)){const option=document.createElement('option');option.value=current;option.textContent=current;select.appendChild(option);}select.value=current;}catch(error){status.textContent='" + tr("Unable to read Home Assistant status", "無法讀取 Home Assistant 狀態") + "';}}refreshHassStatus();setInterval(refreshHassStatus,5000);";
+  }
+  page += "</script></body></html>";
   settingsServer.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -5107,8 +5358,34 @@ void sendFirmwareUpdatePage(const String& error = "") {
   settingsServer.send(200, "text/html; charset=utf-8", page);
 }
 
+void sendHassAssistStatus() {
+  if (settingsServer.hasArg("refresh")) {
+    if (hassAssistAuthenticated) requestHassAssistPipelines();
+    else if (hassAssistEnabled && !hassAssistSocketStarted) connectHassAssist();
+  }
+  JsonDocument status;
+  status["enabled"] = hassAssistEnabled;
+  status["connected"] = hassAssistSocketConnected;
+  status["authenticated"] = hassAssistAuthenticated;
+  status["preferred"] = hassAssistPreferredPipeline;
+  String statusError = hassAssistDiscoveryError.length() ? hassAssistDiscoveryError : hassAssistError;
+  if (!hassAssistEnabled) statusError = "HASS Assist is disabled";
+  status["error"] = statusError;
+  JsonArray pipelines = status["pipelines"].to<JsonArray>();
+  for (uint8_t i = 0; i < hassAssistPipelineCount; ++i) {
+    JsonObject pipeline = pipelines.add<JsonObject>();
+    pipeline["id"] = hassAssistPipelineIds[i];
+    pipeline["name"] = hassAssistPipelineNames[i];
+  }
+  String payload;
+  serializeJson(status, payload);
+  settingsServer.sendHeader("Cache-Control", "no-store");
+  settingsServer.send(200, "application/json; charset=utf-8", payload);
+}
+
 void setupSettingsServer() {
   settingsServer.on("/", HTTP_GET, []() { sendSettingsPage(); });
+  settingsServer.on("/hass-status", HTTP_GET, []() { sendHassAssistStatus(); });
   settingsServer.on("/mqtt-guide", HTTP_GET, []() {
     settingsServer.send_P(200, "text/html; charset=utf-8", MQTT_GUIDE_HTML);
   });
@@ -5177,7 +5454,7 @@ void setupSettingsServer() {
         lastUserActivity = millis();
         if (!Update.hasError() && Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial);
       } else if (upload.status == UPLOAD_FILE_END) {
-        if (!Update.hasError() && !Update.end(true)) Update.printError(Serial);
+        if (!Update.hasError() && !finalizeFirmwareUpdateSafely()) Update.printError(Serial);
       } else if (upload.status == UPLOAD_FILE_ABORTED) {
         Update.abort();
       }
@@ -5310,10 +5587,13 @@ void setupSettingsServer() {
         nextBase = hassAssistBaseUrl;
       }
       String nextPipeline = settingsServer.arg("hassPipeline"); nextPipeline.trim();
-      reconnectHassAssist = nextEnabled != hassAssistEnabled || nextBase != hassAssistBaseUrl || nextPipeline != hassAssistPipeline;
+      bool nextWakeWordEnabled = settingsServer.hasArg("hassWakeWord");
+      reconnectHassAssist = nextEnabled != hassAssistEnabled || nextBase != hassAssistBaseUrl
+        || nextPipeline != hassAssistPipeline || nextWakeWordEnabled != hassAssistWakeWordEnabled;
       hassAssistEnabled = nextEnabled;
       hassAssistBaseUrl = nextBase;
       hassAssistPipeline = nextPipeline;
+      hassAssistWakeWordEnabled = nextWakeWordEnabled;
       hassAssistVolume = constrain(settingsServer.arg("hassVolume").toInt(), 5, 100);
       if (settingsServer.hasArg("hassClearToken")) {
         reconnectHassAssist |= hassAssistToken.length();
@@ -5393,6 +5673,8 @@ void setup() {
   companionButtonCanvas.createSprite(96, 96);
   meditationCardCanvas.setColorDepth(16);
   meditationCardCanvas.createSprite(98, 96);
+  firmwareProgressCanvas.setColorDepth(16);
+  firmwareProgressCanvasReady = firmwareProgressCanvas.createSprite(292, 44) != nullptr;
   matrixCanvas.setPsram(true);
   matrixCanvas.setColorDepth(16);
   matrixCanvasReady = matrixCanvas.createSprite(320, 240) != nullptr;

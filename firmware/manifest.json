@@ -1,7 +1,7 @@
 {
-  "version": "2.9.20",
+  "version": "2.9.24",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "b35898221af104a83c16dc0540c4cc25efcb7886d37788ce25ab7a5c8535efb4",
-  "size": 5423184,
-  "notes": "Adds todaySheets to Emotion Observation > My Records and includes the resilient OTA updater with live progress, a 12-second stall limit, bounded retry, temporary Wi-Fi sleep disabling, detailed diagnostics and SHA-256 verification. OTA preserves existing Wi-Fi, MQTT, alarm, API and other saved settings."
+  "sha256": "1cba6d7751a997b8ba378d054066297d56eef5d0c7faccb213b3bf1cf7b793c1",
+  "size": 5437824,
+  "notes": "Adds Home Assistant Assist pipeline discovery and selectable pipelines for the Sherpa ONNX Wyoming add-on. Optional always-listening wake-word mode now runs wake_word → STT → intent → TTS, automatically resumes after replies or wake timeouts, and pauses during alarms, meditation audio and firmware updates. Includes the OTA watchdog verification fix and flicker-free progress display."
 }
