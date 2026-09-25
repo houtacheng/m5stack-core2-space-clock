@@ -2987,28 +2987,35 @@ bool readFirmwareManifest(bool redraw = true) {
 }
 
 bool finalizeFirmwareUpdateSafely() {
-  // esp_ota_set_boot_partition() verifies the complete image while the flash
-  // cache is paused. Give that bounded operation enough CPU and watchdog time
-  // for both GitHub OTA and uploads made through the local settings page.
+  // esp_ota_set_boot_partition() verifies the full image synchronously. OTA
+  // runs from loopTask (ARDUINO_RUNNING_CORE), so monitoring CPU0 alone leaves
+  // the calling core unprotected: a stalled verifier can leave the display on
+  // "Verifying firmware" forever. Monitor both the system core and caller, so
+  // a genuinely stuck verification reboots safely before the boot slot changes.
   uint32_t previousCpuMHz = getCpuFrequencyMhz();
   setCpuFrequencyMhz(240);
+  const uint32_t otaWatchdogCores = (1U << 0) | (1U << ARDUINO_RUNNING_CORE);
   const esp_task_wdt_config_t verifyWdt = {
     .timeout_ms = 120000,
-    .idle_core_mask = 1U << 0,
+    .idle_core_mask = otaWatchdogCores,
     .trigger_panic = true,
   };
   esp_err_t verifyWdtResult = esp_task_wdt_reconfigure(&verifyWdt);
-  Serial.printf("[ota] watchdog verification window: %s\n", esp_err_to_name(verifyWdtResult));
+  Serial.printf("[ota] image verification watchdog: %s, cores=0x%lx, timeout=120s\n",
+                esp_err_to_name(verifyWdtResult), (unsigned long)otaWatchdogCores);
   delay(1);
+  Serial.println("[ota] validating complete image and selecting next boot slot");
   bool updateEnded = Update.end(true);
   const esp_task_wdt_config_t normalWdt = {
     .timeout_ms = 5000,
-    .idle_core_mask = 1U << 0,
+    .idle_core_mask = otaWatchdogCores,
     .trigger_panic = true,
   };
-  esp_task_wdt_reconfigure(&normalWdt);
+  esp_err_t restoreWdtResult = esp_task_wdt_reconfigure(&normalWdt);
   setCpuFrequencyMhz(previousCpuMHz);
   delay(1);
+  Serial.printf("[ota] finalize=%s, watchdog restore=%s\n",
+                updateEnded ? "ok" : Update.errorString(), esp_err_to_name(restoreWdtResult));
   return updateEnded;
 }
 

@@ -1,7 +1,7 @@
 {
-  "version": "2.9.24",
+  "version": "2.9.25",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "1cba6d7751a997b8ba378d054066297d56eef5d0c7faccb213b3bf1cf7b793c1",
-  "size": 5437824,
-  "notes": "Adds Home Assistant Assist pipeline discovery and selectable pipelines for the Sherpa ONNX Wyoming add-on. Optional always-listening wake-word mode now runs wake_word → STT → intent → TTS, automatically resumes after replies or wake timeouts, and pauses during alarms, meditation audio and firmware updates. Includes the OTA watchdog verification fix and flicker-free progress display."
+  "sha256": "3abf52ba5b1119f15569d0cefd562a2e46f2c1b0920a7f4ea659bb92c87d479b",
+  "size": 5438016,
+  "notes": "Fixes OTA verification stalls by monitoring both ESP32 cores during full-image validation. A watchdog reset safely returns to the existing firmware if verification becomes unresponsive. Includes Home Assistant Assist pipeline selection and optional wake-word listening."
 }
