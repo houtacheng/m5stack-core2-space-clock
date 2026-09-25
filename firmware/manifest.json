@@ -1,7 +1,7 @@
 {
-  "version": "2.9.25",
+  "version": "2.9.26",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "3abf52ba5b1119f15569d0cefd562a2e46f2c1b0920a7f4ea659bb92c87d479b",
-  "size": 5438016,
-  "notes": "Fixes OTA verification stalls by monitoring both ESP32 cores during full-image validation. A watchdog reset safely returns to the existing firmware if verification becomes unresponsive. Includes Home Assistant Assist pipeline selection and optional wake-word listening."
+  "sha256": "96cfdf3b6a08a772bc3c59182e2f8d1c85fba9fa838f5c948c019e3ff7318835",
+  "size": 5438368,
+  "notes": "Stabilizes Home Assistant Assist wake-word status and adds tap-to-toggle listening plus long-press push-to-talk."
 }

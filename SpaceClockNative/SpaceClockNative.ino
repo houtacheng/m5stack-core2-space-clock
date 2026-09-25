@@ -179,6 +179,7 @@ String hassAssistToken;
 String hassAssistPipeline;
 uint8_t hassAssistVolume = 70;
 bool hassAssistWakeWordEnabled = false;
+bool hassAssistWakeWordPaused = false;
 static constexpr uint8_t HASS_ASSIST_MAX_PIPELINES = 10;
 String hassAssistPipelineIds[HASS_ASSIST_MAX_PIPELINES];
 String hassAssistPipelineNames[HASS_ASSIST_MAX_PIPELINES];
@@ -202,6 +203,10 @@ int hassAssistAudioHandlerId = -1;
 bool hassAssistHolding = false;
 bool hassAssistStopRequested = false;
 bool hassAssistMicRunning = false;
+bool hassAssistToggleListen = false;
+bool hassAssistTouchLongStarted = false;
+uint32_t hassAssistTouchStartedAt = 0;
+static constexpr uint32_t HASS_ASSIST_LONG_PRESS_MS = 600;
 static constexpr size_t HASS_MIC_SAMPLES = 512;
 int16_t hassAssistMicBuffers[4][HASS_MIC_SAMPLES] = {};
 uint8_t hassAssistMicQueueIndex = 0;
@@ -1824,7 +1829,7 @@ const char* hassAssistStateText() {
     case HassAssistState::Ready: return "Hold to talk";
     case HassAssistState::WaitingWakeWord: return "Waiting for wake word...";
     case HassAssistState::Starting: return "Starting Assist...";
-    case HassAssistState::Listening: return "Listening... release to send";
+    case HassAssistState::Listening: return hassAssistToggleListen ? "Listening... tap to send" : "Listening... release to send";
     case HassAssistState::Processing: return "Thinking...";
     case HassAssistState::Downloading: return "Loading voice reply...";
     case HassAssistState::Speaking: return "Speaking...";
@@ -1880,7 +1885,11 @@ void drawHassAssist() {
     M5.Display.drawString(hassAssistTranscript, 14, 168);
   } else {
     M5.Display.setTextColor(0x7BEF, TFT_BLACK);
-    M5.Display.drawString(hassAssistWakeWordEnabled ? "Say the configured wake word" : "Press and hold the microphone", hassAssistWakeWordEnabled ? 46 : 43, 174);
+    const char* hint = hassAssistWakeWordEnabled
+      ? "Say wake word · tap mic to pause/resume"
+      : "Tap mic to start/stop · hold to talk";
+    M5.Display.drawString(hassAssistWakeWordEnabled && hassAssistWakeWordPaused
+      ? "Wake listening paused · tap mic to resume" : hint, 18, 174);
   }
   M5.Display.clearClipRect();
   drawBottomBar("", "", "Close");
@@ -1898,6 +1907,7 @@ void cleanupHassAssistAudio(bool stopSpeaker = false) {
 void abortHassAssistMic() {
   hassAssistHolding = false;
   hassAssistStopRequested = false;
+  hassAssistToggleListen = false;
   hassAssistMicOutstanding = 0;
   if (hassAssistMicRunning || M5.Mic.isRunning()) M5.Mic.end();
   hassAssistMicRunning = false;
@@ -1970,6 +1980,7 @@ void finishHassAssistMic() {
   }
   hassAssistAudioHandlerId = -1;
   hassAssistStopRequested = false;
+  hassAssistToggleListen = false;
   hassAssistState = HassAssistState::Processing;
   drawHassAssist();
 }
@@ -2079,7 +2090,9 @@ void processHassAssistEvent(JsonObject event) {
     String errorCode = data["code"] | "";
     bool wakeTimeout = hassAssistWakeSessionActive && errorCode == "wake-word-timeout";
     hassAssistError = wakeTimeout ? "" : String(data["message"] | "Assist pipeline failed");
-    hassAssistState = wakeTimeout ? HassAssistState::Ready : HassAssistState::Error;
+    // Wake-word timeouts are normal between runs. Keep the display in the
+    // wake-word state while the next pipeline run is scheduled.
+    hassAssistState = wakeTimeout ? HassAssistState::WaitingWakeWord : HassAssistState::Error;
     abortHassAssistMic();
     hassAssistPipelineActive = false;
     hassAssistWakeSessionActive = false;
@@ -2092,7 +2105,8 @@ void processHassAssistEvent(JsonObject event) {
     hassAssistWakeSessionActive = false;
     hassAssistWakeDetected = false;
     if (!hassAssistTtsPending && !hassAssistMp3Decoder && !hassAssistAudioData) {
-      hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
+      hassAssistState = !hassAssistAuthenticated ? HassAssistState::Disconnected
+        : (wasWakeSession ? HassAssistState::WaitingWakeWord : HassAssistState::Ready);
     }
     if (wasWakeSession) hassAssistRestartAt = millis() + 350UL;
   }
@@ -2409,7 +2423,7 @@ void maintainHassAssist(uint32_t nowMs) {
     hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
     drawHassAssist();
   }
-  if (hassAssistWakeWordEnabled && hassAssistAuthenticated && hassAssistWakeWordAllowed()
+  if (hassAssistWakeWordEnabled && !hassAssistWakeWordPaused && hassAssistAuthenticated && hassAssistWakeWordAllowed()
       && hassAssistState != HassAssistState::Error
       && !hassAssistPipelineActive && !hassAssistMicRunning && !hassAssistTtsPending
       && !hassAssistAudioData && !hassAssistMp3Decoder
@@ -4551,17 +4565,52 @@ void handleTouch() {
   if (t.wasPressed() || t.isPressed() || t.wasReleased()) lastUserActivity = millis();
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
   if (screenNow == Screen::HassAssist) {
-    if (!hassAssistWakeWordEnabled && t.wasPressed() && t.y < 210 && sq((int)t.x - 160) + sq((int)t.y - 117) <= 60 * 60) {
+    bool onMic = t.x > 105 && t.x < 215 && t.y < 175
+      && sq((int)t.x - 160) + sq((int)t.y - 117) <= 60 * 60;
+    if (t.wasPressed() && onMic) {
       hassAssistTouchActive = true;
-      hassAssistHolding = true;
+      hassAssistTouchStartedAt = millis();
+      hassAssistTouchLongStarted = false;
+    }
+    if (hassAssistTouchActive && t.isPressed() && !hassAssistTouchLongStarted
+        && millis() - hassAssistTouchStartedAt >= HASS_ASSIST_LONG_PRESS_MS) {
+      hassAssistTouchLongStarted = true;
       haptic(12);
-      startHassAssistPipeline();
+      if (hassAssistWakeWordEnabled) {
+        hassAssistWakeWordPaused = false;
+        drawHassAssist();
+      } else {
+        hassAssistHolding = true;
+        startHassAssistPipeline();
+      }
     }
     if (t.wasReleased() && hassAssistTouchActive) {
       hassAssistTouchActive = false;
-      hassAssistHolding = false;
-      hassAssistStopRequested = true;
-      if (hassAssistState == HassAssistState::Listening) drawHassAssist();
+      if (hassAssistTouchLongStarted) {
+        if (!hassAssistWakeWordEnabled) {
+          hassAssistHolding = false;
+          hassAssistStopRequested = true;
+        }
+      } else if (hassAssistWakeWordEnabled) {
+        hassAssistWakeWordPaused = !hassAssistWakeWordPaused;
+        if (hassAssistWakeWordPaused) stopHassAssist();
+        else if (hassAssistSocketConnected) startHassAssistPipeline(true);
+        drawHassAssist();
+      } else if (hassAssistToggleListen) {
+        hassAssistToggleListen = false;
+        hassAssistHolding = false;
+        hassAssistStopRequested = true;
+        drawHassAssist();
+      } else {
+        hassAssistToggleListen = true;
+        hassAssistHolding = true;
+        haptic(12);
+        startHassAssistPipeline();
+        if (!hassAssistPipelineActive) {
+          hassAssistToggleListen = false;
+          hassAssistHolding = false;
+        }
+      }
     } else if (t.wasReleased() && t.y >= 210 && t.x >= 214) {
       haptic(15);
       screenNow = Screen::Clock;
@@ -5597,6 +5646,7 @@ void setupSettingsServer() {
       bool nextWakeWordEnabled = settingsServer.hasArg("hassWakeWord");
       reconnectHassAssist = nextEnabled != hassAssistEnabled || nextBase != hassAssistBaseUrl
         || nextPipeline != hassAssistPipeline || nextWakeWordEnabled != hassAssistWakeWordEnabled;
+      if (reconnectHassAssist) hassAssistWakeWordPaused = false;
       hassAssistEnabled = nextEnabled;
       hassAssistBaseUrl = nextBase;
       hassAssistPipeline = nextPipeline;
