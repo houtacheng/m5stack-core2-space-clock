@@ -1,7 +1,7 @@
 {
-  "version": "2.9.30",
+  "version": "2.9.32",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "b71ce8ea0d2c55779bab6fe7cbd12af432edc57355910a43c969f65b87678a71",
-  "size": 3942880,
-  "notes": "HASS Assist fixes: recordings no longer stop after 0.25 s, mic stops when HA detects end of speech, stalled runs reset, voice replies play ~8 s sooner, fixed settings radio layout."
+  "sha256": "4021c7957c4b6aebff47e5adca5d326840381b85abc52aab7a157bab428c4f8c",
+  "size": 4255280,
+  "notes": "New devices: invalid RTC no longer crashes the clock and the Wi-Fi setup hotspot opens automatically. Assist: common Chinese glyphs, wrapped replies, streaming voice playback, hold-to-talk from the clock, wake word on any screen."
 }

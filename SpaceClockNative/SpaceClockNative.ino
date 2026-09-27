@@ -187,6 +187,10 @@ uint32_t hassAssistWakeStageStartedAt = 0;
 uint8_t hassAssistWakeEmptyStreak = 0;
 uint32_t hassAssistTapStartedAt = 0;
 uint32_t hassAssistLastEventAt = 0;
+// Set when Assist was opened by a shortcut (hold on the clock, or a wake word
+// heard on another screen); the clock returns once the reply has finished.
+bool hassAssistReturnToClock = false;
+uint32_t hassAssistReturnAt = 0;
 bool hassAssistWakeWordPaused = false;
 static constexpr uint8_t HASS_ASSIST_MAX_PIPELINES = 10;
 String hassAssistPipelineIds[HASS_ASSIST_MAX_PIPELINES];
@@ -728,6 +732,7 @@ void applyNetworkHostname() {
 }
 
 void drawClock(bool full);
+void runWifiPortal(bool automatic = false);
 void drawAstronaut();
 bool verifyEmotionApiConnection(bool force = false);
 void showEmotionSettings();
@@ -829,6 +834,19 @@ void maintainSavedWifi(uint32_t nowMs) {
   }
   wifiWasConnected = false;
 
+  // A brand-new Core2 has no Wi-Fi anywhere (no web profiles, no build-time
+  // default, nothing in the ESP32 Wi-Fi store). Open the setup hotspot by
+  // itself instead of waiting forever; retry every 10 minutes if skipped.
+  static uint32_t lastAutoPortalAt = 0;
+  if (!hasSavedWifiProfiles() && !strlen(DEFAULT_WIFI_SSID) && !WiFi.SSID().length()
+      && nowMs > 15000UL && (!lastAutoPortalAt || nowMs - lastAutoPortalAt > 600000UL)
+      && alarmActive < 0 && screenNow == Screen::Clock) {
+    Serial.println("[wifi] no saved networks; opening setup hotspot " SPACE_CLOCK_WIFI_AP);
+    runWifiPortal(true);
+    lastAutoPortalAt = millis();
+    return;
+  }
+
   if (wifiRecoveryPhase == WifiRecoveryPhase::Primary) {
     if (nowMs - wifiRecoveryPhaseStartedAt < WIFI_PRIMARY_TIMEOUT_MS) return;
     if (!hasSavedWifiProfiles()) {
@@ -902,6 +920,29 @@ void syncTime() {
     dt.time.seconds = t.tm_sec;
     M5.Rtc.setDateTime(&dt);
   }
+}
+
+// A new Core2's RTC holds garbage (e.g. weekDay 0xFF), which crashed the clock
+// face on first boot. Reset any impossible value to the firmware build date;
+// NTP corrects it once Wi-Fi connects.
+void sanitizeRtcOnBoot() {
+  m5::rtc_datetime_t dt;
+  M5.Rtc.getDateTime(&dt);
+  bool bad = dt.date.year < 2024 || dt.date.year > 2099 || dt.date.month < 1 || dt.date.month > 12
+    || dt.date.date < 1 || dt.date.date > 31 || (uint8_t)dt.date.weekDay > 6
+    || dt.time.hours > 23 || dt.time.minutes > 59 || dt.time.seconds > 59;
+  if (!bad) return;
+  static const char* months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  char mon[4] = {0}; int day = 1, year = 2026;
+  sscanf(__DATE__, "%3s %d %d", mon, &day, &year);
+  int month = (int)((strstr(months, mon) - months) / 3) + 1;
+  struct tm t = {};
+  t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day; t.tm_hour = 12;
+  mktime(&t);
+  dt.date.year = year; dt.date.month = month; dt.date.date = day; dt.date.weekDay = t.tm_wday;
+  dt.time.hours = 12; dt.time.minutes = 0; dt.time.seconds = 0;
+  M5.Rtc.setDateTime(&dt);
+  Serial.printf("[rtc] invalid RTC reset to build date %04d-%02d-%02d\n", year, month, day);
 }
 
 void getClockDateTime(m5::rtc_datetime_t* dt) {
@@ -1394,7 +1435,7 @@ void drawClock(bool full = false) {
       const char* days[] = {"星期日 (SUN)", "星期一 (MON)", "星期二 (TUE)", "星期三 (WED)", "星期四 (THU)", "星期五 (FRI)", "星期六 (SAT)"};
       M5.Display.fillRect(0, 29, 320, 28, TFT_BLACK);
       M5.Display.setTextDatum(middle_center); useUIFont(1); M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-      M5.Display.drawString(days[dt.date.weekDay], 160, 41);
+      M5.Display.drawString(days[(uint8_t)dt.date.weekDay % 7], 160, 41);
       M5.Display.fillRoundRect(3, 151, 22, 27, 5, use24HourTime ? TFT_BLACK : 0x2124);
       M5.Display.setTextDatum(middle_center); useUIFont(1);
       if (!use24HourTime) M5.Display.drawString(dt.time.hours >= 12 ? "PM" : "AM", 14, 164);
@@ -1882,6 +1923,45 @@ uint16_t hassAssistStateColor() {
 
 String hassAssistDrawnSignature;
 
+// Wrap Assist text into at most maxLines lines of maxWidth pixels. Prefer
+// breaking right after punctuation (，。！？、；：,.!? and spaces); otherwise
+// break between characters. Overflow on the last line ends with "…".
+void drawAssistWrappedText(const String& text, int x, int y, int maxWidth, uint8_t maxLines, int lineHeight) {
+  auto isBreakAfter = [](const String& ch) {
+    static const char* marks[] = {"，", "。", "！", "？", "、", "；", "：", "）", "」", ",", ".", "!", "?", ";", ":", " "};
+    for (const char* m : marks) if (ch == m) return true;
+    return false;
+  };
+  auto charLen = [](uint8_t c) { return c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1; };
+  size_t pos = 0;
+  for (uint8_t line = 0; line < maxLines && pos < text.length(); ++line) {
+    bool lastLine = line + 1 == maxLines;
+    size_t end = pos, lastBreak = 0;
+    while (end < text.length()) {
+      size_t next = end + charLen((uint8_t)text[end]);
+      if (M5.Display.textWidth(text.substring(pos, next)) > maxWidth) break;
+      if (isBreakAfter(text.substring(end, next))) lastBreak = next;
+      end = next;
+    }
+    String out;
+    if (end >= text.length()) {
+      out = text.substring(pos);
+    } else if (lastLine) {
+      // Trim until the ellipsis fits.
+      while (end > pos && M5.Display.textWidth(text.substring(pos, end) + "…") > maxWidth) {
+        do { --end; } while (end > pos && ((uint8_t)text[end] & 0xC0) == 0x80);
+      }
+      out = text.substring(pos, end) + "…";
+    } else {
+      if (lastBreak > pos) end = lastBreak;
+      out = text.substring(pos, end);
+    }
+    M5.Display.drawString(out, x, y + line * lineHeight);
+    pos = end;
+    while (pos < text.length() && text[pos] == ' ') ++pos;
+  }
+}
+
 void drawHassAssist(bool force = false) {
   if (screenNow != Screen::HassAssist) return;
   // Every pipeline event (VAD start/end, wake-word, stt progress...) used to
@@ -1913,18 +1993,18 @@ void drawHassAssist(bool force = false) {
   M5.Display.fillRect(158, 133, 4, 12, TFT_WHITE);
   M5.Display.fillRoundRect(149, 143, 22, 4, 2, TFT_WHITE);
 
-  M5.Display.setClipRect(12, 166, 296, 42);
+  M5.Display.setClipRect(12, 160, 296, 50);
   M5.Display.setTextDatum(top_left);
   useUIFont(1);
   if (hassAssistError.length()) {
     M5.Display.setTextColor(0xF986, TFT_BLACK);
-    M5.Display.drawString(hassAssistError, 14, 168);
+    drawAssistWrappedText(hassAssistError, 14, 161, 292, 2, 24);
   } else if (hassAssistReply.length()) {
     M5.Display.setTextColor(0xBDF7, TFT_BLACK);
-    M5.Display.drawString(hassAssistReply, 14, 168);
+    drawAssistWrappedText(hassAssistReply, 14, 161, 292, 2, 24);
   } else if (hassAssistTranscript.length()) {
     M5.Display.setTextColor(0x7DFF, TFT_BLACK);
-    M5.Display.drawString(hassAssistTranscript, 14, 168);
+    drawAssistWrappedText(hassAssistTranscript, 14, 161, 292, 2, 24);
   } else {
     M5.Display.setTextColor(0x7BEF, TFT_BLACK);
     const char* hint = hassAssistWakeWordEnabled
@@ -2167,6 +2247,12 @@ void processHassAssistEvent(JsonObject event) {
       hassAssistError = "";
       hassAssistWakeDetected = true;
       hassAssistState = HassAssistState::Listening;
+      if (screenNow != Screen::HassAssist) {
+        haptic(12);
+        wakeDisplay();
+        hassAssistTranscript = ""; hassAssistReply = ""; hassAssistError = "";
+        enterHassAssistScreenForShortcut();
+      }
     }
   } else if (eventType == "stt-start") {
     if (hassAssistWakeSessionActive) {
@@ -2366,7 +2452,15 @@ void connectHassAssist() {
   drawHassAssist();
 }
 
+void enterHassAssistScreenForShortcut() {
+  screenNow = Screen::HassAssist;
+  hassAssistReturnToClock = true;
+  hassAssistReturnAt = 0;
+  drawHassAssist(true);
+}
+
 void showHassAssist() {
+  hassAssistReturnToClock = false;
   screenNow = Screen::HassAssist;
   hassAssistTranscript = "";
   hassAssistReply = "";
@@ -2417,6 +2511,7 @@ bool downloadHassAssistAudio() {
   if (!hassAssistAudioData) { http.end(); hassAssistError = "Not enough memory for voice reply"; return false; }
   WiFiClient* stream = http.getStreamPtr();
   hassAssistAudioLength = 0;
+  bool streamMp3 = hassAssistTtsMime.indexOf("mpeg") >= 0 || hassAssistTtsMime.indexOf("mp3") >= 0;
   uint32_t lastDataAt = millis();
   while (http.connected() && (declared < 0 || hassAssistAudioLength < (size_t)declared)) {
     size_t available = stream->available();
@@ -2438,6 +2533,16 @@ bool downloadHassAssistAudio() {
     if (!readNow) break;
     hassAssistAudioLength += readNow;
     lastDataAt = millis();
+    // Sherpa TTS streams the MP3 while it is still synthesising. Start
+    // speaking as soon as a few frames are here instead of waiting for the
+    // whole reply; playRaw() on a fixed channel paces the decoder.
+    if (streamMp3) {
+      if (!hassAssistMp3Decoder && hassAssistAudioLength >= 4096) {
+        if (!beginHassAssistPlayback() || !hassAssistAudioData) { http.end(); return false; }
+        Serial.printf("[assist] TTS playback started after %lu ms\n", (unsigned long)(millis() - downloadStartedAt));
+      }
+      while (hassAssistMp3Decoder && hassAssistAudioLength - hassAssistMp3Position > 2048) decodeNextHassAssistMp3Frame();
+    }
   }
   http.end();
   Serial.printf("[assist] TTS download %u bytes in %lu ms\n", (unsigned)hassAssistAudioLength,
@@ -2552,7 +2657,7 @@ void maintainHassAssist(uint32_t nowMs) {
     hassAssistTtsPending = false;
     hassAssistState = HassAssistState::Downloading;
     drawHassAssist();
-    if (!downloadHassAssistAudio() || !beginHassAssistPlayback()) {
+    if (!downloadHassAssistAudio() || (!hassAssistMp3Decoder && !beginHassAssistPlayback())) {
       hassAssistState = HassAssistState::Error;
       drawHassAssist();
     }
@@ -2563,6 +2668,22 @@ void maintainHassAssist(uint32_t nowMs) {
     hassAssistState = !hassAssistAuthenticated ? HassAssistState::Disconnected
       : (hassAssistWakeWordEnabled && hassAssistWakeWordPaused ? HassAssistState::Paused : HassAssistState::Ready);
     drawHassAssist();
+  }
+  if (hassAssistReturnToClock) {
+    bool busy = hassAssistMicRunning || hassAssistTtsPending || hassAssistAudioData || hassAssistMp3Decoder
+      || (hassAssistPipelineActive && !(hassAssistWakeSessionActive && !hassAssistWakeDetected));
+    if (screenNow != Screen::HassAssist) {
+      hassAssistReturnToClock = false;
+    } else if (busy) {
+      hassAssistReturnAt = 0;
+    } else if (!hassAssistReturnAt) {
+      hassAssistReturnAt = millis() + 2500UL;  // leave the reply readable briefly
+    } else if ((int32_t)(millis() - hassAssistReturnAt) >= 0) {
+      hassAssistReturnToClock = false;
+      hassAssistReturnAt = 0;
+      screenNow = Screen::Clock;
+      drawClock(true); drawAstronaut();
+    }
   }
   if (hassAssistWakeWordEnabled && !hassAssistWakeWordPaused && hassAssistAuthenticated && hassAssistWakeWordAllowed()
       && hassAssistState != HassAssistState::Error
@@ -3366,12 +3487,13 @@ void showAbout() {
   drawBottomBar("", "", "Close");
 }
 
-void runWifiPortal() {
+void runWifiPortal(bool automatic) {
   if (settingsServerReady) settingsServer.stop();
   title("Wi-Fi setup");
   M5.Display.setTextColor(TFT_WHITE, BG); useUIFont(1);
   M5.Display.drawCentreString("Connect to SpaceClock-Setup", 160, 90, 2);
   M5.Display.drawCentreString("and open the captive portal", 160, 115, 2);
+  if (automatic) M5.Display.drawCentreString("No Wi-Fi saved yet - first-time setup", 160, 145, 2);
   WiFiManager wm;
   char compHost[40] = {0}, compPort[8] = {0};
   companionHosts[0].substring(0, 39).toCharArray(compHost, sizeof(compHost));
@@ -3389,7 +3511,8 @@ void runWifiPortal() {
     if (settingsServerReady) settingsServer.begin(); else setupSettingsServer();
     syncTime();
   }
-  showMenu();
+  if (automatic) { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); }
+  else showMenu();
 }
 
 void dismissAlarm() {
@@ -4808,6 +4931,23 @@ void handleClockTouch(const m5::touch_detail_t& t) {
     companionNavPressValid = t.y >= 210 && t.x < 107;
     companionNavPressStarted = companionNavPressValid ? millis() : 0;
   }
+  if (hassAssistVoiceMode == HASS_MODE_HOLD && hassAssistEnabled && clockMiddlePressValid && t.isPressed()
+      && clockMiddlePressedAt && millis() - clockMiddlePressedAt >= 700UL) {
+    // Hold-to-talk shortcut: start talking straight from the clock. The
+    // Assist screen takes over this touch, so releasing anywhere sends.
+    clockMiddlePressValid = false; clockMiddlePressedAt = 0;
+    haptic(12);
+    hassAssistTranscript = ""; hassAssistReply = ""; hassAssistError = "";
+    hassAssistState = hassAssistAuthenticated ? HassAssistState::Ready : HassAssistState::Disconnected;
+    enterHassAssistScreenForShortcut();
+    hassAssistTouchActive = true;
+    hassAssistTouchStartedAt = millis();
+    hassAssistTouchLongStarted = true;
+    hassAssistHolding = true;
+    startHassAssistPipeline();
+    if (!hassAssistPipelineActive) hassAssistHolding = false;
+    return;
+  }
   if (!t.wasReleased()) return;
   if (t.y < 210) {
     clockSettingsPressValid = false;
@@ -5264,7 +5404,7 @@ void publishMqttState() {
   JsonDocument doc;
   doc["time"] = localTime;
   doc["date"] = dateText;
-  doc["weekday"] = weekdayText[now.date.weekDay];
+  doc["weekday"] = weekdayText[(uint8_t)now.date.weekDay % 7];
   doc["clock_time"] = clockTime;
   doc["timezone"] = TIME_ZONES[timeZoneIndex].city;
   doc["time_format"] = use24HourTime ? 24 : 12;
@@ -6124,6 +6264,7 @@ void setup() {
   }
   Serial.printf("[display] Matrix canvas: %s (%d bpp)\n", matrixCanvasReady ? "ready" : "FAILED", matrixCanvas.getColorDepth());
   loadSettings();
+  sanitizeRtcOnBoot();
   lastUserActivity = millis();
   m5::rtc_datetime_t startupTime; getClockDateTime(&startupTime); applyDisplayBrightness(startupTime);
   WiFi.mode(WIFI_STA); applyNetworkHostname(); WiFi.setAutoReconnect(true); WiFi.setSleep(true); WiFi.begin();
