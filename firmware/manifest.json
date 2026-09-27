@@ -1,7 +1,7 @@
 {
-  "version": "2.9.28",
+  "version": "2.9.29",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "20a787518868e20c6b3d0dc7f64263bdc95350c3aac5049c1393159f6c710932",
-  "size": 5479184,
-  "notes": "Fixes Home Assistant Assist screen flicker and dropped audio (redraw only on change, 100 ms mic chunks), adds offline emotion record queue and OTA diagnostics."
+  "sha256": "7d44494f1c5c1682d747e7893c0df94f9611e10212836a26961acbf9ce9b4608",
+  "size": 3942032,
+  "notes": "Fixes OTA verification hang (compact font tables free flash MMU pages), web-upload OTA progress on the Core2 screen, three HASS Assist voice modes (tap, hold, wake word) and stable wake-word display."
 }

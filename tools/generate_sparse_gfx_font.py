@@ -67,6 +67,9 @@ def main():
               f"  0x{first:02X}, 0x{last:04X}, {y_advance} }};", ""]
     Path(a.output).write_text("\n".join(lines), encoding="utf-8")
     print(f"{a.name}: {len(bitmap)} bitmap bytes, U+{first:04X}-U+{last:04X}")
+    # Keep DROM small enough for OTA image verification (see compact_gfx_font.py).
+    from compact_gfx_font import compact
+    compact(Path(a.output))
 
 
 if __name__ == "__main__":

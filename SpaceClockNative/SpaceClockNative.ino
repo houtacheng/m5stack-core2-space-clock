@@ -180,6 +180,11 @@ String hassAssistToken;
 String hassAssistPipeline;
 uint8_t hassAssistVolume = 70;
 bool hassAssistWakeWordEnabled = false;
+// 0 = tap to start / tap to send, 1 = hold to talk, 2 = always-on wake word.
+enum : uint8_t { HASS_MODE_TAP = 0, HASS_MODE_HOLD = 1, HASS_MODE_WAKE = 2 };
+uint8_t hassAssistVoiceMode = HASS_MODE_TAP;
+uint32_t hassAssistWakeStageStartedAt = 0;
+uint8_t hassAssistWakeEmptyStreak = 0;
 bool hassAssistWakeWordPaused = false;
 static constexpr uint8_t HASS_ASSIST_MAX_PIPELINES = 10;
 String hassAssistPipelineIds[HASS_ASSIST_MAX_PIPELINES];
@@ -208,6 +213,7 @@ bool hassAssistToggleListen = false;
 bool hassAssistTouchLongStarted = false;
 uint32_t hassAssistTouchStartedAt = 0;
 static constexpr uint32_t HASS_ASSIST_LONG_PRESS_MS = 600;
+static constexpr uint32_t HASS_ASSIST_HOLD_START_MS = 200;
 // 100 ms per chunk: two queued chunks give 200 ms of headroom so a display
 // redraw or TLS write in loop() no longer drops PCM between buffers.
 static constexpr size_t HASS_MIC_SAMPLES = 1600;
@@ -545,6 +551,7 @@ void saveSettings() {
   prefs.putString("hassPipe", hassAssistPipeline);
   prefs.putUChar("hassVol", hassAssistVolume);
   prefs.putBool("hassWake", hassAssistWakeWordEnabled);
+  prefs.putUChar("hassMode", hassAssistVoiceMode);
   prefs.putUChar("emoMode", emotionReminderMode);
   prefs.putUShort("emoInterval", emotionReminderIntervalMinutes);
   prefs.putUShort("emoWinStart", emotionReminderWindowStart);
@@ -639,6 +646,8 @@ void loadSettings() {
   hassAssistPipeline.trim();
   hassAssistVolume = constrain((int)prefs.getUChar("hassVol", 70), 5, 100);
   hassAssistWakeWordEnabled = prefs.getBool("hassWake", false);
+  hassAssistVoiceMode = constrain((int)prefs.getUChar("hassMode", hassAssistWakeWordEnabled ? HASS_MODE_WAKE : HASS_MODE_TAP), 0, 2);
+  hassAssistWakeWordEnabled = hassAssistVoiceMode == HASS_MODE_WAKE;
   hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
   emotionReminderMode = constrain((int)prefs.getUChar("emoMode", 0), 0, 2);
   emotionReminderIntervalMinutes = prefs.getUShort("emoInterval", 60);
@@ -795,6 +804,14 @@ void startWifiProfileScan(uint32_t nowMs) {
 }
 
 void maintainSavedWifi(uint32_t nowMs) {
+  static wl_status_t lastLoggedStatus = (wl_status_t)255;
+  static uint8_t lastLoggedPhase = 255;
+  if (WiFi.status() != lastLoggedStatus || (uint8_t)wifiRecoveryPhase != lastLoggedPhase) {
+    lastLoggedStatus = WiFi.status();
+    lastLoggedPhase = (uint8_t)wifiRecoveryPhase;
+    Serial.printf("[wifi] status=%d phase=%u ssid='%s' saved-profiles=%d ip=%s\n", (int)lastLoggedStatus, lastLoggedPhase,
+                  WiFi.SSID().c_str(), hasSavedWifiProfiles() ? 1 : 0, WiFi.localIP().toString().c_str());
+  }
   if (WiFi.status() == WL_CONNECTED) {
     bool justConnected = !wifiWasConnected;
     wifiWasConnected = true;
@@ -1838,11 +1855,11 @@ const char* hassAssistStateText() {
     case HassAssistState::Disconnected: return "Disconnected";
     case HassAssistState::Connecting: return "Connecting...";
     case HassAssistState::Authenticating: return "Authenticating...";
-    case HassAssistState::Ready: return "Hold to talk";
+    case HassAssistState::Ready: return hassAssistVoiceMode == HASS_MODE_HOLD ? "Hold to talk" : "Tap to talk";
     case HassAssistState::Paused: return "Wake listening paused";
     case HassAssistState::WaitingWakeWord: return "Waiting for wake word...";
     case HassAssistState::Starting: return "Starting Assist...";
-    case HassAssistState::Listening: return hassAssistToggleListen ? "Listening... tap to send" : "Listening... release to send";
+    case HassAssistState::Listening: return hassAssistWakeSessionActive ? "Listening..." : (hassAssistToggleListen ? "Listening... tap to send" : "Listening... release to send");
     case HassAssistState::Processing: return "Thinking...";
     case HassAssistState::Downloading: return "Loading voice reply...";
     case HassAssistState::Speaking: return "Speaking...";
@@ -1910,7 +1927,8 @@ void drawHassAssist(bool force = false) {
     M5.Display.setTextColor(0x7BEF, TFT_BLACK);
     const char* hint = hassAssistWakeWordEnabled
       ? "Say wake word · tap mic to pause/resume"
-      : "Tap mic to start/stop · hold to talk";
+      : (hassAssistVoiceMode == HASS_MODE_HOLD ? "Hold mic while talking, release to send"
+                                              : "Tap mic to talk, tap again to send");
     M5.Display.drawString(hassAssistWakeWordEnabled && hassAssistWakeWordPaused
       ? "Wake listening paused · tap mic to resume" : hint, 18, 174);
   }
@@ -2100,23 +2118,45 @@ void startHassAssistPipeline(bool wakeWordMode = false) {
   String payload;
   serializeJson(command, payload);
   hassAssistWebSocket.sendTXT(payload);
-  hassAssistState = HassAssistState::Starting;
+  // Wake-word runs restart continuously; keep showing "waiting" instead of
+  // flashing "Starting" between runs.
+  hassAssistState = wakeWordMode ? HassAssistState::WaitingWakeWord : HassAssistState::Starting;
   drawHassAssist();
 }
 
 void processHassAssistEvent(JsonObject event) {
   String eventType = event["type"] | "";
   hassAssistLastEvent = eventType;
+  {
+    String dataText; serializeJson(event["data"], dataText);
+    Serial.printf("[assist] %lu event=%s state=%d mic=%d wake=%d chunks=%lu data=%.300s\n", (unsigned long)millis(),
+                  eventType.c_str(), (int)hassAssistState, hassAssistMicRunning ? 1 : 0, hassAssistWakeSessionActive ? 1 : 0,
+                  (unsigned long)hassAssistMicChunksSent, dataText.c_str());
+  }
   JsonVariant data = event["data"];
   if (eventType == "run-start") {
     hassAssistAudioHandlerId = data["runner_data"]["stt_binary_handler_id"] | -1;
     if (hassAssistWakeSessionActive) beginHassAssistMic();
   } else if (eventType == "wake_word-start") {
+    hassAssistWakeStageStartedAt = millis();
     hassAssistState = HassAssistState::WaitingWakeWord;
     if (hassAssistWakeSessionActive && !hassAssistMicRunning) beginHassAssistMic();
   } else if (eventType == "wake_word-end") {
-    hassAssistWakeDetected = true;
-    hassAssistState = HassAssistState::Listening;
+    if (data["wake_word_output"].isNull() || data["wake_word_output"].size() == 0) {
+      // No detection. If the engine gives up within seconds (instead of the
+      // 30 s timeout) it is misconfigured or disconnecting; back off so the
+      // device does not hammer Home Assistant and tell the user why.
+      bool quick = millis() - hassAssistWakeStageStartedAt < 5000UL;
+      hassAssistWakeEmptyStreak = quick ? min(hassAssistWakeEmptyStreak + 1, 50) : 0;
+      if (hassAssistWakeEmptyStreak >= 3) {
+        hassAssistError = "Wake word engine stops early - check the pipeline wake word in HA";
+      }
+    } else {
+      hassAssistWakeEmptyStreak = 0;
+      hassAssistError = "";
+      hassAssistWakeDetected = true;
+      hassAssistState = HassAssistState::Listening;
+    }
   } else if (eventType == "stt-start") {
     if (hassAssistWakeSessionActive) {
       hassAssistWakeDetected = true;
@@ -2167,7 +2207,10 @@ void processHassAssistEvent(JsonObject event) {
       hassAssistState = !hassAssistAuthenticated ? HassAssistState::Disconnected
         : (wasWakeSession ? HassAssistState::WaitingWakeWord : HassAssistState::Ready);
     }
-    if (wasWakeSession) hassAssistRestartAt = millis() + 350UL;
+    if (wasWakeSession) {
+      hassAssistRestartAt = millis() + (hassAssistWakeEmptyStreak >= 3 ? 8000UL : 350UL);
+      if (hassAssistState == HassAssistState::Error) hassAssistState = HassAssistState::WaitingWakeWord;
+    }
   }
   if (hassAssistWakeWordPaused && hassAssistState != HassAssistState::Error) {
     hassAssistState = HassAssistState::Paused;
@@ -2957,17 +3000,17 @@ void showFirmwareUpdate() {
   drawBottomBar("Check", firmwareUpdateAvailable ? "Install" : "", "Close");
 }
 
-void drawFirmwareDownloadProgress(uint8_t percent, uint8_t attempt, uint8_t attempts) {
+void drawFirmwareDownloadProgress(uint8_t percent, uint8_t attempt, uint8_t attempts, const char* label = "Downloading") {
   if (screenNow != Screen::FirmwareUpdate) return;
   percent = min((uint8_t)100, percent);
-  String attemptText = String(attempt) + "/" + String(attempts);
+  String attemptText = attempts ? String(attempt) + "/" + String(attempts) : String("Web");
   if (firmwareProgressCanvasReady) {
     firmwareProgressCanvas.fillSprite(BG);
     firmwareProgressCanvas.setFont(&SourceHanSansTC_UI8pt8b);
     firmwareProgressCanvas.setTextSize(1);
     firmwareProgressCanvas.setTextColor(TFT_GREEN, BG);
     firmwareProgressCanvas.setTextDatum(top_left);
-    firmwareProgressCanvas.drawString("Downloading " + String(percent) + "%", 0, 1);
+    firmwareProgressCanvas.drawString(String(label) + " " + String(percent) + "%", 0, 1);
     firmwareProgressCanvas.setTextColor(UI_MUTED, BG);
     firmwareProgressCanvas.setTextDatum(top_right);
     firmwareProgressCanvas.drawString(attemptText, 291, 1);
@@ -2983,7 +3026,7 @@ void drawFirmwareDownloadProgress(uint8_t percent, uint8_t attempt, uint8_t atte
   useUIFont(1);
   M5.Display.setTextColor(TFT_GREEN, BG);
   M5.Display.setTextDatum(top_left);
-  M5.Display.drawString("Downloading " + String(percent) + "%", 14, 163);
+  M5.Display.drawString(String(label) + " " + String(percent) + "%", 14, 163);
   M5.Display.setTextColor(UI_MUTED, BG);
   M5.Display.setTextDatum(top_right);
   M5.Display.drawString(attemptText, 305, 163);
@@ -2993,7 +3036,7 @@ void drawFirmwareDownloadProgress(uint8_t percent, uint8_t attempt, uint8_t atte
 
 void drawFirmwareVerificationStatus(uint8_t attempt, uint8_t attempts) {
   if (screenNow != Screen::FirmwareUpdate) return;
-  String attemptText = String(attempt) + "/" + String(attempts);
+  String attemptText = attempts ? String(attempt) + "/" + String(attempts) : String("Web");
   if (firmwareProgressCanvasReady) {
     firmwareProgressCanvas.fillSprite(BG);
     firmwareProgressCanvas.setFont(&SourceHanSansTC_UI8pt8b);
@@ -3065,44 +3108,55 @@ bool readFirmwareManifest(bool redraw = true) {
   return true;
 }
 
-bool finalizeFirmwareUpdateSafely() {
-  // esp_ota_set_boot_partition() verifies the full image synchronously. OTA
-  // runs from loopTask (ARDUINO_RUNNING_CORE), so monitoring CPU0 alone leaves
-  // the calling core unprotected: a stalled verifier can leave the display on
-  // "Verifying firmware" forever. Monitor both the system core and caller, so
-  // a genuinely stuck verification reboots safely before the boot slot changes.
-  uint32_t previousCpuMHz = getCpuFrequencyMhz();
-  setCpuFrequencyMhz(240);
-  const uint32_t otaWatchdogCores = (1U << 0) | (1U << ARDUINO_RUNNING_CORE);
-  const esp_task_wdt_config_t verifyWdt = {
-    .timeout_ms = 120000,
-    .idle_core_mask = otaWatchdogCores,
-    .trigger_panic = true,
-  };
-  esp_err_t verifyWdtResult = esp_task_wdt_reconfigure(&verifyWdt);
-  Serial.printf("[ota] image verification watchdog: %s, cores=0x%lx, timeout=120s\n",
-                esp_err_to_name(verifyWdtResult), (unsigned long)otaWatchdogCores);
-  delay(1);
+bool webFirmwareUploadOk = false;
+int webFirmwareLastPercent = -1;
+
+struct FirmwareFinalizeJob {
+  bool evenIfRemaining;
+  volatile bool done;
+  volatile bool ok;
+};
+
+void firmwareFinalizeTask(void* arg) {
+  FirmwareFinalizeJob* job = static_cast<FirmwareFinalizeJob*>(arg);
+  job->ok = Update.end(job->evenIfRemaining);
+  job->done = true;
+  vTaskDelete(nullptr);
+}
+
+bool finalizeFirmwareUpdateSafely(bool exactSize = true) {
+  // esp_ota_set_boot_partition() re-reads the whole 5+ MB image through
+  // thousands of flash mmap/unmap calls. Run from loopTask (CPU1) with the
+  // CPU clock switched, this repeatedly deadlocked in
+  // spi_flash_disable_interrupts_caches_and_other_cpu() until the watchdog
+  // rebooted into the old firmware. Verify on a dedicated CPU0 task instead,
+  // keep the clock unchanged, and let loopTask yield so IDLE1 stays fed.
   uint32_t verifyStartedAt = millis();
-  Serial.printf("[ota] finalizing exact image size=%u, update progress=%u\n",
-                (unsigned)Update.size(), (unsigned)Update.progress());
-  Serial.println("[ota] validating complete image and selecting next boot slot");
-  // All advertised bytes are already received, written, and SHA-256 checked.
-  // Refuse to activate a short image instead of letting end(true) shrink the
-  // expected size to whatever Update happened to buffer.
-  bool updateEnded = Update.end(false);
-  const esp_task_wdt_config_t normalWdt = {
-    .timeout_ms = 5000,
-    .idle_core_mask = otaWatchdogCores,
-    .trigger_panic = true,
-  };
-  esp_err_t restoreWdtResult = esp_task_wdt_reconfigure(&normalWdt);
-  setCpuFrequencyMhz(previousCpuMHz);
-  delay(1);
-  Serial.printf("[ota] finalize=%s, elapsed=%lu ms, watchdog restore=%s\n",
-                updateEnded ? "ok" : Update.errorString(), (unsigned long)(millis() - verifyStartedAt),
-                esp_err_to_name(restoreWdtResult));
-  return updateEnded;
+  Serial.printf("[ota] finalizing image size=%u, update progress=%u, exact=%d\n",
+                (unsigned)Update.size(), (unsigned)Update.progress(), exactSize ? 1 : 0);
+  // Manifest downloads know the exact size: refuse to activate a short image.
+  // Browser uploads start with UPDATE_SIZE_UNKNOWN, so they must finalize at
+  // the received length or end() always fails with "premature end".
+  static FirmwareFinalizeJob job;
+  job.evenIfRemaining = !exactSize;
+  job.done = false;
+  job.ok = false;
+  if (xTaskCreatePinnedToCore(firmwareFinalizeTask, "otaFinalize", 8192, &job, 5, nullptr, 0) != pdPASS) {
+    Serial.println("[ota] could not start finalize task; finalizing inline");
+    job.ok = Update.end(job.evenIfRemaining);
+    job.done = true;
+  }
+  while (!job.done) {
+    if (millis() - verifyStartedAt > 180000UL) {
+      Serial.println("[ota] finalize timed out; restarting into current firmware");
+      delay(100);
+      ESP.restart();
+    }
+    delay(20);
+  }
+  Serial.printf("[ota] finalize=%s, elapsed=%lu ms\n",
+                job.ok ? "ok" : Update.errorString(), (unsigned long)(millis() - verifyStartedAt));
+  return job.ok;
 }
 
 bool installLatestFirmware(bool redraw = true) {
@@ -4793,29 +4847,28 @@ void handleTouch() {
       hassAssistTouchLongStarted = false;
     }
     if (hassAssistTouchActive && t.isPressed() && !hassAssistTouchLongStarted
-        && millis() - hassAssistTouchStartedAt >= HASS_ASSIST_LONG_PRESS_MS) {
+        && hassAssistVoiceMode == HASS_MODE_HOLD
+        && millis() - hassAssistTouchStartedAt >= HASS_ASSIST_HOLD_START_MS) {
+      // Mode 2: hold to talk, release to send.
       hassAssistTouchLongStarted = true;
       haptic(12);
-      if (hassAssistWakeWordEnabled) {
-        hassAssistWakeWordPaused = false;
-        if (hassAssistSocketConnected && hassAssistAuthenticated && !hassAssistPipelineActive) {
-          startHassAssistPipeline(true);
-        }
-        drawHassAssist();
-      } else {
-        hassAssistHolding = true;
-        startHassAssistPipeline();
-      }
+      hassAssistHolding = true;
+      startHassAssistPipeline();
+      if (!hassAssistPipelineActive) hassAssistHolding = false;
     }
     if (t.wasReleased() && hassAssistTouchActive) {
       hassAssistTouchActive = false;
-      if (hassAssistTouchLongStarted) {
-        if (!hassAssistWakeWordEnabled) {
+      if (hassAssistVoiceMode == HASS_MODE_HOLD) {
+        if (hassAssistTouchLongStarted) {
           hassAssistHolding = false;
           hassAssistStopRequested = true;
+          drawHassAssist();
         }
-      } else if (hassAssistWakeWordEnabled) {
+      } else if (hassAssistVoiceMode == HASS_MODE_WAKE) {
+        // Mode 3: tap pauses / resumes always-on wake-word listening.
         hassAssistWakeWordPaused = !hassAssistWakeWordPaused;
+        hassAssistWakeEmptyStreak = 0;
+        hassAssistError = "";
         if (hassAssistWakeWordPaused) {
           hassAssistRestartAt = 0;
           if (hassAssistMicRunning) {
@@ -4830,11 +4883,13 @@ void handleTouch() {
         else if (hassAssistSocketConnected) startHassAssistPipeline(true);
         drawHassAssist();
       } else if (hassAssistToggleListen) {
+        // Mode 1: second tap sends.
         hassAssistToggleListen = false;
         hassAssistHolding = false;
         hassAssistStopRequested = true;
         drawHassAssist();
       } else {
+        // Mode 1: first tap starts listening.
         hassAssistToggleListen = true;
         hassAssistHolding = true;
         haptic(12);
@@ -5595,7 +5650,15 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<label class='field'>" + tr("Home Assistant base URL", "Home Assistant 基礎網址") + "<input name='hassBaseUrl' inputmode='url' placeholder='http://homeassistant.local:8123' value='" + htmlEscape(hassAssistBaseUrl) + "'></label>";
     page += "<label class='field'>" + tr("Long-lived access token", "長期存取權杖") + "<input type='password' name='hassToken' autocomplete='new-password' placeholder='" + tr(hassAssistToken.length() ? "Saved — leave blank to keep current" : "Paste a Home Assistant long-lived token", hassAssistToken.length() ? "已儲存—留白即可保留目前權杖" : "貼上 Home Assistant 長期存取權杖") + "'></label>";
     page += "<label class='check'><input type='checkbox' name='hassClearToken'>" + tr("Forget the saved token", "清除已儲存的權杖") + "</label>";
-    page += "<label class='check'><input type='checkbox' name='hassWakeWord'" + String(hassAssistWakeWordEnabled ? " checked" : "") + ">" + tr("Always listen for the pipeline wake word", "常駐收音等待 Pipeline 喚醒詞") + "</label><p class='muted'>" + tr("Requires a wake-word engine and model in the selected Home Assistant pipeline. Sherpa ONNX supplies STT/TTS only. While enabled, the microphone pauses automatically for alarms, meditation audio and firmware updates, then resumes afterward.", "所選 Home Assistant Pipeline 必須另有喚醒詞引擎與模型；Sherpa ONNX 本身只提供 STT/TTS。啟用後，鬧鐘、靜心音訊及韌體更新期間會自動暫停麥克風，結束後再恢復監聽。") + "</p>";
+    page += "<fieldset class='field'><legend>" + tr("Voice mode", "發話方式") + "</legend>";
+    {
+      const char* modeEn[] = {"Tap to talk, tap again to send (no wake word)", "Hold to talk, release to send (no wake word)", "Always listening for the wake word"};
+      const char* modeZh[] = {"按一下發話，再按一下結束（不需要喚醒詞）", "長按發話，放開結束（不需要喚醒詞）", "常駐收音偵測發話（需要喚醒詞）"};
+      for (uint8_t m = 0; m < 3; ++m) {
+        page += "<label class='check'><input type='radio' name='hassMode' value='" + String(m) + "'" + String(hassAssistVoiceMode == m ? " checked" : "") + ">" + tr(modeEn[m], modeZh[m]) + "</label>";
+      }
+    }
+    page += "</fieldset><p class='muted'>" + tr("Wake-word mode requires a wake-word engine and model in the selected Home Assistant pipeline. Sherpa ONNX supplies STT/TTS only. The microphone pauses automatically for alarms, meditation audio and firmware updates.", "常駐收音模式需要所選 Home Assistant Pipeline 另有喚醒詞引擎與模型；Sherpa ONNX 本身只提供 STT/TTS。鬧鐘、靜心音訊及韌體更新期間會自動暫停麥克風。") + "</p>";
     page += "<label class='field'>" + tr("Assist pipeline", "Assist Pipeline") + "<select id='hassPipelineSelect' name='hassPipeline'><option value=''" + String(hassAssistPipeline.length() ? "" : " selected") + ">" + tr("Home Assistant preferred pipeline", "使用 Home Assistant 偏好 Pipeline") + "</option>";
     bool savedHassPipelineFound = !hassAssistPipeline.length();
     for (uint8_t i = 0; i < hassAssistPipelineCount; ++i) {
@@ -5733,8 +5796,11 @@ void setupSettingsServer() {
   settingsServer.on("/update", HTTP_GET, []() { sendFirmwareUpdatePage(); });
   settingsServer.on("/update", HTTP_POST,
     []() {
-      bool success = !Update.hasError();
+      bool success = webFirmwareUploadOk && !Update.hasError();
       settingsServer.sendHeader("Connection", "close");
+      firmwareUpdateMessage = success ? "Installed. Restarting..."
+        : "Web update failed (error " + String(Update.getError()) + ").";
+      showFirmwareUpdate();
       if (success) {
         settingsServer.send(200, "text/html; charset=utf-8",
           "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'><style>body{font-family:system-ui;background:#08111f;color:#eef4ff;padding:30px}h1{color:#70e39a}</style><h1>Update complete</h1><p>Core2 is restarting. Reopen the device IP in about 15 seconds.</p>");
@@ -5748,14 +5814,36 @@ void setupSettingsServer() {
       HTTPUpload& upload = settingsServer.upload();
       if (upload.status == UPLOAD_FILE_START) {
         lastUserActivity = millis();
+        webFirmwareUploadOk = false;
+        webFirmwareLastPercent = -1;
+        // The upload runs inside one handleClient() call, so loop() cannot
+        // stop Assist for us. Release the mic/socket before flashing.
+        stopHassAssist();
+        firmwareUpdateMessage = "Receiving firmware from web page...";
+        showFirmwareUpdate();
+        drawFirmwareDownloadProgress(0, 0, 0, "Uploading");
+        Serial.printf("[ota] web upload start: %s, request length %d\n",
+                      upload.filename.c_str(), settingsServer.clientContentLength());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) Update.printError(Serial);
       } else if (upload.status == UPLOAD_FILE_WRITE) {
         lastUserActivity = millis();
         if (!Update.hasError() && Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial);
+        int total = settingsServer.clientContentLength();
+        int percent = total > 0 ? (int)min<uint64_t>(99, (uint64_t)upload.totalSize * 100ULL / (uint64_t)total) : 0;
+        if (percent >= webFirmwareLastPercent + 2) {
+          webFirmwareLastPercent = percent;
+          drawFirmwareDownloadProgress((uint8_t)percent, 0, 0, "Uploading");
+        }
       } else if (upload.status == UPLOAD_FILE_END) {
-        if (!Update.hasError() && !finalizeFirmwareUpdateSafely()) Update.printError(Serial);
+        Serial.printf("[ota] web upload received %u bytes\n", (unsigned)upload.totalSize);
+        drawFirmwareVerificationStatus(0, 0);
+        webFirmwareUploadOk = !Update.hasError() && finalizeFirmwareUpdateSafely(false);
+        if (!webFirmwareUploadOk) Update.printError(Serial);
       } else if (upload.status == UPLOAD_FILE_ABORTED) {
         Update.abort();
+        webFirmwareUploadOk = false;
+        firmwareUpdateMessage = "Web upload was interrupted.";
+        showFirmwareUpdate();
       }
     });
   settingsServer.on("/save", HTTP_POST, []() {
@@ -5886,7 +5974,10 @@ void setupSettingsServer() {
         nextBase = hassAssistBaseUrl;
       }
       String nextPipeline = settingsServer.arg("hassPipeline"); nextPipeline.trim();
-      bool nextWakeWordEnabled = settingsServer.hasArg("hassWakeWord");
+      uint8_t nextVoiceMode = settingsServer.hasArg("hassMode")
+        ? (uint8_t)constrain(settingsServer.arg("hassMode").toInt(), 0, 2) : hassAssistVoiceMode;
+      bool nextWakeWordEnabled = nextVoiceMode == HASS_MODE_WAKE;
+      hassAssistVoiceMode = nextVoiceMode;
       reconnectHassAssist = nextEnabled != hassAssistEnabled || nextBase != hassAssistBaseUrl
         || nextPipeline != hassAssistPipeline || nextWakeWordEnabled != hassAssistWakeWordEnabled;
       if (reconnectHassAssist) hassAssistWakeWordPaused = false;
