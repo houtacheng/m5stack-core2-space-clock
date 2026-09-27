@@ -185,6 +185,8 @@ enum : uint8_t { HASS_MODE_TAP = 0, HASS_MODE_HOLD = 1, HASS_MODE_WAKE = 2 };
 uint8_t hassAssistVoiceMode = HASS_MODE_TAP;
 uint32_t hassAssistWakeStageStartedAt = 0;
 uint8_t hassAssistWakeEmptyStreak = 0;
+uint32_t hassAssistTapStartedAt = 0;
+uint32_t hassAssistLastEventAt = 0;
 bool hassAssistWakeWordPaused = false;
 static constexpr uint8_t HASS_ASSIST_MAX_PIPELINES = 10;
 String hassAssistPipelineIds[HASS_ASSIST_MAX_PIPELINES];
@@ -2040,6 +2042,9 @@ void sendHassAssistAudioBuffer(const int16_t* samples, size_t sampleCount) {
 }
 
 void finishHassAssistMic() {
+  Serial.printf("[assist] mic finished: chunks=%lu bytes=%lu peak=%u after %lu ms\n",
+                (unsigned long)hassAssistMicChunksSent, (unsigned long)hassAssistMicBytesSent,
+                hassAssistMicPeak, (unsigned long)(millis() - hassAssistListenStarted));
   if (hassAssistMicRunning) M5.Mic.end();
   M5.Mic.setBufferReleaseCallback(nullptr, nullptr);
   hassAssistMicRunning = false;
@@ -2059,7 +2064,11 @@ void finishHassAssistMic() {
 
 void maintainHassAssistMic(uint32_t nowMs) {
   if (!hassAssistMicRunning) return;
-  if (!hassAssistWakeSessionActive && nowMs - hassAssistListenStarted >= 15000UL) {
+  // nowMs is sampled at the top of loop(), but the mic may have started later
+  // in the same pass (inside WebSocket event handling). Compare signed so a
+  // listen start that is "newer" than nowMs does not underflow to a huge age
+  // and stop every recording after the first two chunks.
+  if (!hassAssistWakeSessionActive && (int32_t)(nowMs - hassAssistListenStarted) >= 15000) {
     hassAssistHolding = false;
     hassAssistStopRequested = true;
   }
@@ -2102,6 +2111,7 @@ void startHassAssistPipeline(bool wakeWordMode = false) {
   hassAssistWakeDetected = false;
   hassAssistPipelineActive = true;
   hassAssistActiveCommandId = ++hassAssistCommandId;
+  hassAssistLastEventAt = millis();
   JsonDocument command;
   command["id"] = hassAssistActiveCommandId;
   command["type"] = "assist_pipeline/run";
@@ -2127,6 +2137,7 @@ void startHassAssistPipeline(bool wakeWordMode = false) {
 void processHassAssistEvent(JsonObject event) {
   String eventType = event["type"] | "";
   hassAssistLastEvent = eventType;
+  hassAssistLastEventAt = millis();
   {
     String dataText; serializeJson(event["data"], dataText);
     Serial.printf("[assist] %lu event=%s state=%d mic=%d wake=%d chunks=%lu data=%.300s\n", (unsigned long)millis(),
@@ -2168,7 +2179,7 @@ void processHassAssistEvent(JsonObject event) {
       if (hassAssistAudioHandlerId >= 0) hassAssistWebSocket.sendBIN(&endMarker, 1);
       hassAssistState = HassAssistState::Processing;
     }
-  } else if (eventType == "stt-vad-end" && hassAssistWakeSessionActive) {
+  } else if (eventType == "stt-vad-end") {
     // Home Assistant detected the end of the spoken command after the wake
     // word. Finish the binary stream so Sherpa can transcribe immediately.
     hassAssistStopRequested = true;
@@ -2380,9 +2391,15 @@ String absoluteHassAssistTtsUrl(String url) {
 bool downloadHassAssistAudio() {
   String url = absoluteHassAssistTtsUrl(hassAssistTtsUrl);
   if (!url.length()) return false;
+  uint32_t downloadStartedAt = millis();
   HTTPClient http;
   http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  // HA streams TTS with chunked encoding on a keep-alive connection, so the
+  // raw stream never "ends" and every reply waited for the 8 s idle timeout
+  // (and chunk-size lines leaked into the MP3). HTTP/1.0 makes the server
+  // send plain bytes and close the connection when the reply is complete.
+  http.useHTTP10(true);
   WiFiClient plain;
   WiFiClientSecure secure;
   bool https = url.startsWith("https://");
@@ -2405,6 +2422,7 @@ bool downloadHassAssistAudio() {
     size_t available = stream->available();
     if (!available) {
       if (millis() - lastDataAt > 8000UL) break;
+      if (!http.connected()) break;
       delay(1);
       continue;
     }
@@ -2422,6 +2440,8 @@ bool downloadHassAssistAudio() {
     lastDataAt = millis();
   }
   http.end();
+  Serial.printf("[assist] TTS download %u bytes in %lu ms\n", (unsigned)hassAssistAudioLength,
+                (unsigned long)(millis() - downloadStartedAt));
   if (hassAssistAudioLength < 16) {
     cleanupHassAssistAudio();
     hassAssistError = "Voice reply was empty";
@@ -2515,6 +2535,19 @@ void maintainHassAssist(uint32_t nowMs) {
     return;
   }
   maintainHassAssistMic(nowMs);
+  // A run that stops producing events (e.g. HA stalls after an empty audio
+  // stream) used to leave pipelineActive set forever, so every later tap was
+  // ignored. Reset so the user can talk again.
+  if (hassAssistPipelineActive && !hassAssistWakeSessionActive && !hassAssistMicRunning
+      && (int32_t)(millis() - hassAssistLastEventAt) > 20000) {
+    Serial.println("[assist] pipeline stalled; resetting");
+    abortHassAssistMic();
+    hassAssistPipelineActive = false;
+    hassAssistTtsPending = false;
+    hassAssistError = "Assist timed out, please try again";
+    hassAssistState = HassAssistState::Error;
+    drawHassAssist();
+  }
   if (hassAssistTtsPending && !hassAssistMicRunning && !hassAssistAudioData) {
     hassAssistTtsPending = false;
     hassAssistState = HassAssistState::Downloading;
@@ -4883,13 +4916,21 @@ void handleTouch() {
         else if (hassAssistSocketConnected) startHassAssistPipeline(true);
         drawHassAssist();
       } else if (hassAssistToggleListen) {
-        // Mode 1: second tap sends.
+        // Mode 1: second tap sends. Ignore touch bounce right after the
+        // first tap, which otherwise ended the recording after ~0.2 s.
+        if (millis() - hassAssistTapStartedAt < 1000UL || !hassAssistMicRunning) {
+          Serial.println("[assist] ignored tap (debounce)");
+          return;
+        }
+        Serial.printf("[assist] tap stop after %lu ms\n", (unsigned long)(millis() - hassAssistTapStartedAt));
         hassAssistToggleListen = false;
         hassAssistHolding = false;
         hassAssistStopRequested = true;
         drawHassAssist();
       } else {
         // Mode 1: first tap starts listening.
+        hassAssistTapStartedAt = millis();
+        Serial.println("[assist] tap start");
         hassAssistToggleListen = true;
         hassAssistHolding = true;
         haptic(12);
@@ -5505,7 +5546,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   page.reserve(24000);
   page = "<!doctype html><html lang='" + String(zh ? "zh-Hant" : "en") + "'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<title>Space Clock</title><style>html{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#08111f;color:#eef4ff;max-width:760px;margin:auto;padding:18px}"
-         "header{display:flex;align-items:center;justify-content:space-between;gap:12px}h1{color:#65b9ff;font-size:25px;margin:8px 0}h2{font-size:19px;margin:24px 0 8px}.muted{color:#aabbd0;font-size:14px}.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.tabs a,.lang{border:1px solid #344b63;border-radius:999px;padding:8px 12px;color:#c8d9ee;text-decoration:none;font-size:14px}.tabs a.active{background:#1688e5;border-color:#1688e5;color:white}.lang{white-space:nowrap}.panel{background:#101d2e;border:1px solid #263b52;border-radius:16px;padding:16px}.field{display:block;margin-top:15px;font-size:15px}.field input:not([type=checkbox]),.field select{display:block;width:100%;padding:11px;margin-top:6px;border-radius:9px;border:1px solid #52657a;background:#142236;color:white;font-size:16px}.field input[type=range]{padding:0}.field input[type=color]{height:48px;padding:5px}.check{display:flex;align-items:center;gap:9px;margin:15px 0}.check input{width:20px;height:20px;accent-color:#1688e5}.card{background:#0b1727;border:1px solid #344b63;border-radius:12px;padding:12px;margin:12px 0}.card summary{cursor:pointer;font-weight:700}.days{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px}.days label{white-space:nowrap}.btn,button{display:block;width:100%;padding:13px;margin-top:18px;border:0;border-radius:10px;background:#1688e5;color:white;font-size:16px;text-align:center;text-decoration:none;cursor:pointer}.btn.secondary{background:#20354e}.ok{color:#70e39a}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:520px){body{padding:12px}.panel{padding:13px}.grid{grid-template-columns:1fr}}</style></head><body>";
+         "header{display:flex;align-items:center;justify-content:space-between;gap:12px}h1{color:#65b9ff;font-size:25px;margin:8px 0}h2{font-size:19px;margin:24px 0 8px}.muted{color:#aabbd0;font-size:14px}.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.tabs a,.lang{border:1px solid #344b63;border-radius:999px;padding:8px 12px;color:#c8d9ee;text-decoration:none;font-size:14px}.tabs a.active{background:#1688e5;border-color:#1688e5;color:white}.lang{white-space:nowrap}.panel{background:#101d2e;border:1px solid #263b52;border-radius:16px;padding:16px}.field{display:block;margin-top:15px;font-size:15px}.field input:not([type=checkbox]):not([type=radio]),.field select{display:block;width:100%;padding:11px;margin-top:6px;border-radius:9px;border:1px solid #52657a;background:#142236;color:white;font-size:16px}.field input[type=range]{padding:0}.field input[type=color]{height:48px;padding:5px}.check{display:flex;align-items:center;gap:9px;margin:15px 0}.check input{flex:none;width:20px;height:20px;margin:0;accent-color:#1688e5}fieldset.field{border:1px solid #52657a;border-radius:12px;padding:4px 14px 2px}fieldset.field legend{padding:0 6px}.card{background:#0b1727;border:1px solid #344b63;border-radius:12px;padding:12px;margin:12px 0}.card summary{cursor:pointer;font-weight:700}.days{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px}.days label{white-space:nowrap}.btn,button{display:block;width:100%;padding:13px;margin-top:18px;border:0;border-radius:10px;background:#1688e5;color:white;font-size:16px;text-align:center;text-decoration:none;cursor:pointer}.btn.secondary{background:#20354e}.ok{color:#70e39a}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:520px){body{padding:12px}.panel{padding:13px}.grid{grid-template-columns:1fr}}</style></head><body>";
   m5::rtc_datetime_t webNow; getClockDateTime(&webNow);
   char webTime[24]; snprintf(webTime, sizeof(webTime), "%04d-%02d-%02d %02d:%02d:%02d", webNow.date.year, webNow.date.month, webNow.date.date, webNow.time.hours, webNow.time.minutes, webNow.time.seconds);
   page += "<header><div><h1>" + tr("Space Clock settings", "太空時鐘設定") + "</h1><div class='muted'>" + tr("Device", "設備") + ": <b>" + htmlEscape(deviceName) + "</b> · " + tr("Network name", "網路名稱") + ": <b>" + networkHostname() + "</b><br>" + tr("IP", "設備 IP") + ": <b>" + WiFi.localIP().toString() + "</b> · " + tr("Device time", "裝置時間") + ": <b>" + webTime + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</div></div>";
