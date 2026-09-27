@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
 #include <Adafruit_NeoPixel.h>
 #include <PubSubClient.h>
 #include <WebSocketsClient.h>
@@ -207,11 +208,18 @@ bool hassAssistToggleListen = false;
 bool hassAssistTouchLongStarted = false;
 uint32_t hassAssistTouchStartedAt = 0;
 static constexpr uint32_t HASS_ASSIST_LONG_PRESS_MS = 600;
-static constexpr size_t HASS_MIC_SAMPLES = 512;
+// 100 ms per chunk: two queued chunks give 200 ms of headroom so a display
+// redraw or TLS write in loop() no longer drops PCM between buffers.
+static constexpr size_t HASS_MIC_SAMPLES = 1600;
 int16_t hassAssistMicBuffers[4][HASS_MIC_SAMPLES] = {};
 uint8_t hassAssistMicQueueIndex = 0;
 uint8_t hassAssistMicSendIndex = 0;
 uint8_t hassAssistMicOutstanding = 0;
+std::atomic<uint8_t> hassAssistMicReadyMask{0};
+uint32_t hassAssistMicChunksSent = 0;
+uint32_t hassAssistMicBytesSent = 0;
+uint16_t hassAssistMicPeak = 0;
+String hassAssistLastEvent;
 uint32_t hassAssistListenStarted = 0;
 String hassAssistTranscript;
 String hassAssistReply;
@@ -280,6 +288,10 @@ String emotionRecordsTopEmotion = "-";
 String emotionRecordsStrongest = "-";
 String emotionRecordsTopGrounding = "-";
 String emotionRecordsError;
+uint32_t emotionStatsCacheAt = 0;
+uint8_t emotionPendingCount = 0;
+uint32_t emotionLastQueueSyncAt = 0;
+bool emotionStorageReady = false;
 m5::rtc_datetime_t emotionFormTime;
 bool emotionTriggers[8] = {};
 uint8_t emotionHeartRate = 4, emotionBreathRate = 4, emotionSweating = 0;
@@ -1849,8 +1861,17 @@ uint16_t hassAssistStateColor() {
   return 0xFFE0;
 }
 
-void drawHassAssist() {
+String hassAssistDrawnSignature;
+
+void drawHassAssist(bool force = false) {
   if (screenNow != Screen::HassAssist) return;
+  // Every pipeline event (VAD start/end, wake-word, stt progress...) used to
+  // clear and repaint the whole screen, causing visible flicker and stalling
+  // loop() long enough to drop microphone chunks. Repaint only on change.
+  String signature = String((int)hassAssistState) + '|' + hassAssistWakeWordEnabled + hassAssistWakeWordPaused
+    + '|' + hassAssistError + '|' + hassAssistReply + '|' + hassAssistTranscript;
+  if (!force && signature == hassAssistDrawnSignature) return;
+  hassAssistDrawnSignature = signature;
   M5.Display.fillScreen(TFT_BLACK);
   uint16_t stateColor = hassAssistStateColor();
   M5.Display.fillCircle(16, 16, 5, stateColor);
@@ -1910,10 +1931,25 @@ void abortHassAssistMic() {
   hassAssistHolding = false;
   hassAssistStopRequested = false;
   hassAssistToggleListen = false;
-  hassAssistMicOutstanding = 0;
   if (hassAssistMicRunning || M5.Mic.isRunning()) M5.Mic.end();
+  M5.Mic.setBufferReleaseCallback(nullptr, nullptr);
+  hassAssistMicOutstanding = 0;
+  hassAssistMicReadyMask.store(0, std::memory_order_release);
   hassAssistMicRunning = false;
   M5.Speaker.begin();
+}
+
+// M5Unified owns two asynchronous recording slots. A falling isRecording()
+// count is not a safe indication that a particular buffer is ready: its
+// release callback can arrive slightly later. Mark the exact buffer here,
+// then send it from the main loop where the WebSocket is safe to use.
+void onHassAssistMicBufferReady(void*, void* data, size_t) {
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (data == hassAssistMicBuffers[i]) {
+      hassAssistMicReadyMask.fetch_or((uint8_t)(1U << i), std::memory_order_release);
+      return;
+    }
+  }
 }
 
 void stopHassAssist() {
@@ -1941,7 +1977,9 @@ void beginHassAssistMic() {
   if (hassAssistMicRunning || hassAssistAudioHandlerId < 0 || !hassAssistSocketConnected) return;
   M5.Speaker.stop();
   M5.Speaker.end();
+  M5.Mic.setBufferReleaseCallback(nullptr, onHassAssistMicBufferReady);
   if (!M5.Mic.begin()) {
+    M5.Mic.setBufferReleaseCallback(nullptr, nullptr);
     hassAssistError = "Microphone could not start";
     hassAssistState = HassAssistState::Error;
     drawHassAssist();
@@ -1950,6 +1988,10 @@ void beginHassAssistMic() {
   hassAssistMicQueueIndex = 0;
   hassAssistMicSendIndex = 0;
   hassAssistMicOutstanding = 0;
+  hassAssistMicReadyMask.store(0, std::memory_order_release);
+  hassAssistMicChunksSent = 0;
+  hassAssistMicBytesSent = 0;
+  hassAssistMicPeak = 0;
   for (int i = 0; i < 2; ++i) {
     if (M5.Mic.record(hassAssistMicBuffers[hassAssistMicQueueIndex], HASS_MIC_SAMPLES, 16000, false)) {
       hassAssistMicQueueIndex = (hassAssistMicQueueIndex + 1) % 4;
@@ -1965,16 +2007,26 @@ void beginHassAssistMic() {
 
 void sendHassAssistAudioBuffer(const int16_t* samples, size_t sampleCount) {
   if (!hassAssistSocketConnected || hassAssistAudioHandlerId < 0 || !sampleCount) return;
-  uint8_t packet[1 + HASS_MIC_SAMPLES * sizeof(int16_t)];
+  static uint8_t packet[1 + HASS_MIC_SAMPLES * sizeof(int16_t)];
   packet[0] = (uint8_t)hassAssistAudioHandlerId;
   memcpy(packet + 1, samples, sampleCount * sizeof(int16_t));
   hassAssistWebSocket.sendBIN(packet, 1 + sampleCount * sizeof(int16_t));
+  uint16_t peak = 0;
+  for (size_t i = 0; i < sampleCount; ++i) {
+    int32_t magnitude = samples[i] < 0 ? -(int32_t)samples[i] : samples[i];
+    if (magnitude > peak) peak = (uint16_t)min<int32_t>(magnitude, 32767);
+  }
+  hassAssistMicPeak = max(hassAssistMicPeak, peak);
+  ++hassAssistMicChunksSent;
+  hassAssistMicBytesSent += sampleCount * sizeof(int16_t);
 }
 
 void finishHassAssistMic() {
   if (hassAssistMicRunning) M5.Mic.end();
+  M5.Mic.setBufferReleaseCallback(nullptr, nullptr);
   hassAssistMicRunning = false;
   hassAssistMicOutstanding = 0;
+  hassAssistMicReadyMask.store(0, std::memory_order_release);
   M5.Speaker.begin();
   if (hassAssistSocketConnected && hassAssistAudioHandlerId >= 0) {
     uint8_t endMarker = (uint8_t)hassAssistAudioHandlerId;
@@ -1993,9 +2045,13 @@ void maintainHassAssistMic(uint32_t nowMs) {
     hassAssistHolding = false;
     hassAssistStopRequested = true;
   }
-  uint8_t active = min<size_t>(M5.Mic.isRecording(), hassAssistMicOutstanding);
-  uint8_t completed = hassAssistMicOutstanding - active;
-  while (completed--) {
+  // Send in queue order and only after M5Unified has released this exact
+  // pointer. This prevents incomplete PCM chunks from reaching HASS.
+  while (hassAssistMicOutstanding) {
+    uint8_t bit = (uint8_t)(1U << hassAssistMicSendIndex);
+    uint8_t ready = hassAssistMicReadyMask.load(std::memory_order_acquire);
+    if (!(ready & bit)) break;
+    hassAssistMicReadyMask.fetch_and((uint8_t)~bit, std::memory_order_acq_rel);
     sendHassAssistAudioBuffer(hassAssistMicBuffers[hassAssistMicSendIndex], HASS_MIC_SAMPLES);
     hassAssistMicSendIndex = (hassAssistMicSendIndex + 1) % 4;
     --hassAssistMicOutstanding;
@@ -2050,6 +2106,7 @@ void startHassAssistPipeline(bool wakeWordMode = false) {
 
 void processHassAssistEvent(JsonObject event) {
   String eventType = event["type"] | "";
+  hassAssistLastEvent = eventType;
   JsonVariant data = event["data"];
   if (eventType == "run-start") {
     hassAssistAudioHandlerId = data["runner_data"]["stt_binary_handler_id"] | -1;
@@ -2266,7 +2323,7 @@ void showHassAssist() {
   else if (hassAssistWakeSessionActive) {
     hassAssistState = hassAssistWakeDetected ? HassAssistState::Listening : HassAssistState::WaitingWakeWord;
   } else hassAssistState = HassAssistState::Ready;
-  drawHassAssist();
+  drawHassAssist(true);
   connectHassAssist();
 }
 
@@ -2948,7 +3005,7 @@ void drawFirmwareVerificationStatus(uint8_t attempt, uint8_t attempts) {
     firmwareProgressCanvas.setTextDatum(top_right);
     firmwareProgressCanvas.drawString(attemptText, 291, 1);
     firmwareProgressCanvas.drawRoundRect(0, 27, 292, 13, 4, UI_BORDER);
-    firmwareProgressCanvas.fillRoundRect(2, 29, 288, 9, 3, TFT_YELLOW);
+    firmwareProgressCanvas.fillRoundRect(2, 29, 86, 9, 3, TFT_YELLOW);
     firmwareProgressCanvas.pushSprite(14, 162);
     return;
   }
@@ -2961,7 +3018,7 @@ void drawFirmwareVerificationStatus(uint8_t attempt, uint8_t attempts) {
   M5.Display.setTextDatum(top_right);
   M5.Display.drawString(attemptText, 305, 163);
   M5.Display.drawRoundRect(14, 189, 292, 13, 4, UI_BORDER);
-  M5.Display.fillRoundRect(16, 191, 288, 9, 3, TFT_YELLOW);
+  M5.Display.fillRoundRect(16, 191, 86, 9, 3, TFT_YELLOW);
 }
 
 bool readFirmwareManifest(bool redraw = true) {
@@ -3026,8 +3083,14 @@ bool finalizeFirmwareUpdateSafely() {
   Serial.printf("[ota] image verification watchdog: %s, cores=0x%lx, timeout=120s\n",
                 esp_err_to_name(verifyWdtResult), (unsigned long)otaWatchdogCores);
   delay(1);
+  uint32_t verifyStartedAt = millis();
+  Serial.printf("[ota] finalizing exact image size=%u, update progress=%u\n",
+                (unsigned)Update.size(), (unsigned)Update.progress());
   Serial.println("[ota] validating complete image and selecting next boot slot");
-  bool updateEnded = Update.end(true);
+  // All advertised bytes are already received, written, and SHA-256 checked.
+  // Refuse to activate a short image instead of letting end(true) shrink the
+  // expected size to whatever Update happened to buffer.
+  bool updateEnded = Update.end(false);
   const esp_task_wdt_config_t normalWdt = {
     .timeout_ms = 5000,
     .idle_core_mask = otaWatchdogCores,
@@ -3036,8 +3099,9 @@ bool finalizeFirmwareUpdateSafely() {
   esp_err_t restoreWdtResult = esp_task_wdt_reconfigure(&normalWdt);
   setCpuFrequencyMhz(previousCpuMHz);
   delay(1);
-  Serial.printf("[ota] finalize=%s, watchdog restore=%s\n",
-                updateEnded ? "ok" : Update.errorString(), esp_err_to_name(restoreWdtResult));
+  Serial.printf("[ota] finalize=%s, elapsed=%lu ms, watchdog restore=%s\n",
+                updateEnded ? "ok" : Update.errorString(), (unsigned long)(millis() - verifyStartedAt),
+                esp_err_to_name(restoreWdtResult));
   return updateEnded;
 }
 
@@ -3358,6 +3422,10 @@ bool emotionApiConnected() {
     && emotionApiToken.length() && emotionApiUserId.length();
 }
 
+bool emotionApiConfigured() {
+  return emotionApiToken.length() && emotionApiUserId.length();
+}
+
 uint16_t emotionTheme(uint8_t strength = 100) {
   return matrixColor(strength);
 }
@@ -3520,7 +3588,7 @@ void drawEmotionObservation() {
   M5.Display.drawString(emotionTitleText(), 20, 5);
   drawEmotionResetIcon();
 
-  if (!emotionApiConnected()) {
+  if (!emotionApiConfigured()) {
     M5.Display.fillRoundRect(17, 48, 286, 137, 14, panel);
     M5.Display.drawRoundRect(17, 48, 286, 137, 14, TFT_RED);
     useUIMediumFont(); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(TFT_WHITE, panel);
@@ -3694,10 +3762,6 @@ void showEmotionObservation(bool newEntry = false) {
     for (uint8_t page = 0; page < 7; ++page) resetEmotionPage(page);
   }
   drawEmotionObservation();
-  if (newEntry) {
-    verifyEmotionApiConnection(true);
-    drawEmotionObservation();
-  }
 }
 
 String emotionReminderTimeText(uint16_t minutes) {
@@ -3898,6 +3962,106 @@ bool verifyEmotionApiConnection(bool force) {
   return connected;
 }
 
+bool saveEmotionQueue(const String& localId, const String& body) {
+  if (!emotionStorageReady || !emotionApiUserId.length() || body.length() > 8192) return false;
+  DynamicJsonDocument queue(32768);
+  File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
+  if (input) { deserializeJson(queue, input); input.close(); }
+  JsonArray items = queue.is<JsonArray>() ? queue.as<JsonArray>() : queue.to<JsonArray>();
+  if (items.size() >= 20) return false;
+  JsonObject item = items.createNestedObject();
+  item["local_id"] = localId;
+  item["user"] = emotionApiUserId;
+  item["body"] = body;
+  File output = SPIFFS.open("/emotion_queue.json", FILE_WRITE);
+  if (!output) return false;
+  bool ok = serializeJson(queue, output) == measureJson(queue);
+  output.close();
+  emotionPendingCount = items.size();
+  return ok;
+}
+
+uint8_t countEmotionQueue() {
+  if (!emotionStorageReady) return 0;
+  File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
+  if (!input) return 0;
+  DynamicJsonDocument queue(32768);
+  deserializeJson(queue, input);
+  input.close();
+  return queue.is<JsonArray>() ? (uint8_t)min<size_t>(queue.size(), 255) : 0;
+}
+
+bool loadEmotionStatsCache(DynamicJsonDocument& result) {
+  if (!emotionStorageReady) return false;
+  File cacheFile = SPIFFS.open("/emotion_stats.json", FILE_READ);
+  if (!cacheFile) return false;
+  DynamicJsonDocument stored(4096);
+  DeserializationError err = deserializeJson(stored, cacheFile);
+  cacheFile.close();
+  if (err || String((const char*)(stored["user"] | "")) != emotionApiUserId) return false;
+  result.set(stored["data"]);
+  return result["data"]["summary"].is<JsonObject>();
+}
+
+void applyEmotionStatistics(DynamicJsonDocument& stats) {
+  JsonObject summary = stats["data"]["summary"].as<JsonObject>();
+  emotionRecordsSheetCount = summary["filledSheets"] | 0UL;
+  emotionRecordsTodaySheets = summary["todaySheets"] | 0UL;
+  emotionRecordsLearningDays = summary["learningDays"] | 0;
+  char average[16];
+  snprintf(average, sizeof(average), "%.1f", summary["averagePerDay"] | 0.0);
+  emotionRecordsAverage = average;
+  const char* topBody = summary["mostCommonBodyReaction"]["name"] | "-";
+  const char* topEmotion = summary["mostCommonEmotion"]["name"] | "-";
+  const char* strongest = summary["strongestEmotion"]["emotion"] | "-";
+  const char* topGrounding = summary["mostCommonGrounding"]["name"] | "-";
+  emotionRecordsTopBody = topBody && topBody[0] ? topBody : "-";
+  emotionRecordsTopEmotion = topEmotion && topEmotion[0] ? topEmotion : "-";
+  emotionRecordsTopGrounding = topGrounding && topGrounding[0] ? topGrounding : "-";
+  emotionRecordsStrongest = strongest && strongest[0] ? strongest : "-";
+  int strongestIndex = summary["strongestEmotion"]["index"] | -1;
+  if (emotionRecordsStrongest != "-" && strongestIndex >= 0) emotionRecordsStrongest += " " + String(strongestIndex) + "%";
+}
+
+bool flushOneEmotionRecord() {
+  if (!emotionStorageReady || WiFi.status() != WL_CONNECTED || !emotionApiConfigured() || millis() - emotionLastQueueSyncAt < 5000UL) return false;
+  emotionLastQueueSyncAt = millis();
+  File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
+  if (!input) { emotionPendingCount = 0; return false; }
+  DynamicJsonDocument queue(32768);
+  if (deserializeJson(queue, input) || !queue.is<JsonArray>() || queue.size() == 0) { input.close(); return false; }
+  input.close();
+  JsonArray items = queue.as<JsonArray>();
+  if (String((const char*)(items[0]["user"] | "")) != emotionApiUserId) return false;
+  String body = items[0]["body"] | "";
+  if (!body.length()) return false;
+  String base = normalizeEmotionApiBase(emotionApiBase);
+  WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
+  HTTPClient http; http.setTimeout(8000);
+  if (!base.length() || !http.begin(secure, base + "/api/collections/entries/records")) return false;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + emotionApiToken);
+  int code = http.POST(body);
+  if (code == 401) {
+    http.end(); secure.stop();
+    if (!refreshEmotionApiToken()) return false;
+    WiFiClientSecure retrySecure; retrySecure.setCACert(EMOTION_API_ROOT_CA);
+    HTTPClient retry; retry.setTimeout(8000);
+    if (!retry.begin(retrySecure, base + "/api/collections/entries/records")) return false;
+    retry.addHeader("Content-Type", "application/json"); retry.addHeader("Authorization", "Bearer " + emotionApiToken);
+    code = retry.POST(body); retry.end(); retrySecure.stop();
+  } else { http.end(); secure.stop(); }
+  if (code != 200 && code != 201) return false;
+  queue.as<JsonArray>().remove(0);
+  File output = SPIFFS.open("/emotion_queue.json", FILE_WRITE);
+  if (!output) return false;
+  serializeJson(queue, output); output.close();
+  emotionPendingCount = queue.size();
+  emotionApiState = EmotionApiState::Connected;
+  emotionApiLastChecked = millis();
+  return true;
+}
+
 int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
   String base = normalizeEmotionApiBase(emotionApiBase);
   if (!base.length()) return -10001;
@@ -3905,7 +4069,7 @@ int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
   WiFiClientSecure secure;
   secure.setCACert(EMOTION_API_ROOT_CA);
   HTTPClient http;
-  http.setTimeout(15000);
+  http.setTimeout(7000);
   if (!http.begin(secure, base + "/api/statistics?period=all&includeDeleted=false")) return -10001;
   http.addHeader("Accept", "application/json");
   http.addHeader("Authorization", "Bearer " + emotionApiToken);
@@ -3939,22 +4103,27 @@ int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
 bool loadEmotionRecordStats() {
   emotionRecordsState = EmotionRecordsState::Loading;
   emotionRecordsError = "";
+  DynamicJsonDocument cached(4096);
+  bool haveCache = loadEmotionStatsCache(cached);
+  if (haveCache) {
+    applyEmotionStatistics(cached);
+    emotionRecordsState = EmotionRecordsState::Ready;
+    emotionPendingCount = countEmotionQueue();
+    if (!emotionStatsCacheAt) emotionStatsCacheAt = millis();
+    if (millis() - emotionStatsCacheAt < 300000UL) return true;
+  }
   if (WiFi.status() != WL_CONNECTED) {
-    emotionRecordsError = "目前沒有 Wi-Fi 連線";
+    if (haveCache) return true;
+    emotionRecordsError = "離線且尚無快取資料";
     emotionRecordsState = EmotionRecordsState::Error;
     return false;
   }
   if (!emotionApiToken.length() || !emotionApiUserId.length()) {
+    if (haveCache) return true;
     emotionRecordsError = "請先從網頁登入情緒觀察 API";
     emotionRecordsState = EmotionRecordsState::Error;
     return false;
   }
-  if (!emotionApiConnected() && !verifyEmotionApiConnection(true)) {
-    emotionRecordsError = "資料庫未連線，請重新登入";
-    emotionRecordsState = EmotionRecordsState::Error;
-    return false;
-  }
-
   DynamicJsonDocument stats(3072);
   String errorBody;
   int code = fetchEmotionStatistics(stats, errorBody);
@@ -3964,6 +4133,7 @@ bool loadEmotionRecordStats() {
     code = fetchEmotionStatistics(stats, errorBody);
   }
   if (code != 200) {
+    if (haveCache) { emotionApiState = EmotionApiState::Disconnected; return true; }
     if (code == 401) emotionRecordsError = "登入已過期，請從網頁重新登入";
     else if (code == -10002) emotionRecordsError = "統計資料格式解析失敗";
     else if (code < 0) emotionRecordsError = "HTTPS／網路連線失敗";
@@ -3979,25 +4149,15 @@ bool loadEmotionRecordStats() {
     emotionRecordsState = EmotionRecordsState::Error;
     return false;
   }
-  emotionRecordsSheetCount = summary["filledSheets"] | 0UL;
-  emotionRecordsTodaySheets = summary["todaySheets"] | 0UL;
-  emotionRecordsLearningDays = summary["learningDays"] | 0;
-  char average[16];
-  snprintf(average, sizeof(average), "%.1f", summary["averagePerDay"] | 0.0);
-  emotionRecordsAverage = average;
-
-  const char* topBody = summary["mostCommonBodyReaction"]["name"] | "-";
-  const char* topEmotion = summary["mostCommonEmotion"]["name"] | "-";
-  const char* strongest = summary["strongestEmotion"]["emotion"] | "-";
-  const char* topGrounding = summary["mostCommonGrounding"]["name"] | "-";
-  emotionRecordsTopBody = topBody && topBody[0] ? topBody : "-";
-  emotionRecordsTopEmotion = topEmotion && topEmotion[0] ? topEmotion : "-";
-  emotionRecordsTopGrounding = topGrounding && topGrounding[0] ? topGrounding : "-";
-  emotionRecordsStrongest = strongest && strongest[0] ? strongest : "-";
-  int strongestIndex = summary["strongestEmotion"]["index"] | -1;
-  if (emotionRecordsStrongest != "-" && strongestIndex >= 0) {
-    emotionRecordsStrongest += " " + String(strongestIndex) + "%";
+  applyEmotionStatistics(stats);
+  if (emotionStorageReady) {
+    DynamicJsonDocument stored(4096);
+    stored["user"] = emotionApiUserId;
+    stored["data"] = stats;
+    File cache = SPIFFS.open("/emotion_stats.json", FILE_WRITE);
+    if (cache) { serializeJson(stored, cache); cache.close(); }
   }
+  emotionStatsCacheAt = millis();
 
   emotionApiState = EmotionApiState::Connected;
   emotionApiLastChecked = millis();
@@ -4007,7 +4167,15 @@ bool loadEmotionRecordStats() {
 
 void showEmotionRecords(bool refresh = true) {
   screenNow = Screen::EmotionRecords;
-  if (refresh) emotionRecordsState = EmotionRecordsState::Loading;
+  if (refresh) {
+    DynamicJsonDocument cached(4096);
+    if (loadEmotionStatsCache(cached)) {
+      applyEmotionStatistics(cached);
+      emotionRecordsState = EmotionRecordsState::Ready;
+      emotionPendingCount = countEmotionQueue();
+      if (!emotionStatsCacheAt) emotionStatsCacheAt = millis();
+    } else emotionRecordsState = EmotionRecordsState::Loading;
+  }
   drawEmotionRecords();
   if (refresh) {
     loadEmotionRecordStats();
@@ -4016,17 +4184,19 @@ void showEmotionRecords(bool refresh = true) {
 }
 
 bool submitEmotionObservation() {
-  if (!emotionApiConnected() && !verifyEmotionApiConnection(true)) { emotionSubmitMessage = "資料庫未連線，請先在網頁設定登入 API。"; drawEmotionObservation(); return false; }
-  if (WiFi.status() != WL_CONNECTED) { emotionSubmitMessage = "目前沒有 Wi-Fi，請連線後再送出。"; drawEmotionObservation(); return false; }
+  if (!emotionApiConfigured()) { emotionSubmitMessage = "請先從網頁登入情緒觀察 API。"; drawEmotionObservation(); return false; }
   time_t now = time(nullptr); struct tm utcNow;
-  if (now < 1700000000 || !gmtime_r(&now, &utcNow)) { emotionSubmitMessage = "設備時間尚未同步，請連線後重試。"; drawEmotionObservation(); return false; }
+  bool hasUtc = now >= 1700000000 && gmtime_r(&now, &utcNow);
+  if (!hasUtc && WiFi.status() == WL_CONNECTED) { emotionSubmitMessage = "設備時間尚未同步，請連線後重試。"; drawEmotionObservation(); return false; }
   emotionSubmitMessage = "送出中，請稍候…"; drawEmotionObservation();
   DynamicJsonDocument doc(6144);
   doc["user"] = emotionApiUserId;
   doc["local_id"] = emotionUuid();
   doc["deleted"] = false;
-  char updatedAt[32]; strftime(updatedAt, sizeof(updatedAt), "%Y-%m-%dT%H:%M:%S.000Z", &utcNow);
-  doc["client_updated_at"] = updatedAt;
+  if (hasUtc) {
+    char updatedAt[32]; strftime(updatedAt, sizeof(updatedAt), "%Y-%m-%dT%H:%M:%S.000Z", &utcNow);
+    doc["client_updated_at"] = updatedAt;
+  }
   JsonObject data = doc.createNestedObject("data");
   char emotionTime[24]; snprintf(emotionTime, sizeof(emotionTime), "%04d-%02d-%02dT%02u:%02u", emotionFormTime.date.year, emotionFormTime.date.month, emotionFormTime.date.date, emotionFormTime.time.hours, emotionFormTime.time.minutes);
   data["emotion_time"] = emotionTime;
@@ -4064,8 +4234,25 @@ bool submitEmotionObservation() {
   data["emotional_grounding"] = String(EMOTION_GROUNDING_TIMES[emotionGroundingTiming]) + "、" + EMOTION_GROUNDING_ACTIONS[emotionGroundingAction];
   data["inner_voice"] = ""; data["natural_voice"] = ""; data["daily_review"] = ""; data["event"] = "";
   String body; serializeJson(doc, body);
+  String localId = doc["local_id"].as<String>();
+  // Save locally first so submitting never waits on a slow server. The same
+  // queue handles online and offline operation; the loop uploads it later.
+  if (saveEmotionQueue(localId, body)) {
+    emotionLastSubmittedId = "queued:" + localId;
+    emotionLastSubmittedPayload = body;
+    emotionSubmitMessage = WiFi.status() == WL_CONNECTED
+      ? "已保存在設備，稍後自動同步，可按左鍵撤回。"
+      : "已離線保存，連線後會自動同步，可按左鍵撤回。";
+    drawEmotionObservation();
+    return true;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    emotionSubmitMessage = "離線佇列已滿或本機儲存不可用，資料尚未保存。";
+    drawEmotionObservation();
+    return false;
+  }
   WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
-  HTTPClient http; http.setTimeout(15000);
+  HTTPClient http; http.setTimeout(8000);
   String base = normalizeEmotionApiBase(emotionApiBase);
   if (!base.length() || !http.begin(secure, base + "/api/collections/entries/records")) { emotionSubmitMessage = "無法建立 HTTPS 連線。"; drawEmotionObservation(); return false; }
   http.addHeader("Content-Type", "application/json"); http.addHeader("Authorization", "Bearer " + emotionApiToken);
@@ -4074,7 +4261,7 @@ bool submitEmotionObservation() {
   http.end(); secure.stop();
   if (code == 401 && refreshEmotionApiToken()) {
     WiFiClientSecure retrySecure; retrySecure.setCACert(EMOTION_API_ROOT_CA);
-    HTTPClient retry; retry.setTimeout(15000);
+    HTTPClient retry; retry.setTimeout(8000);
     if (retry.begin(retrySecure, base + "/api/collections/entries/records")) {
       retry.addHeader("Content-Type", "application/json"); retry.addHeader("Authorization", "Bearer " + emotionApiToken);
       code = retry.POST(body); if (code > 0) response = retry.getString(); retry.end(); retrySecure.stop();
@@ -4093,6 +4280,13 @@ bool submitEmotionObservation() {
     drawEmotionObservation();
     return true;
   }
+  if (code < 0 && saveEmotionQueue(localId, body)) {
+    emotionLastSubmittedId = "queued:" + localId;
+    emotionLastSubmittedPayload = body;
+    emotionSubmitMessage = "網路暫時不可用，已離線保存，稍後自動同步。";
+    drawEmotionObservation();
+    return true;
+  }
   emotionApiState = EmotionApiState::Disconnected; emotionApiLastChecked = millis();
   if (code == 401) emotionSubmitMessage = "登入已過期，請回網頁「情緒觀察」重新登入。";
   else if (code < 0) emotionSubmitMessage = "HTTPS／網路連線失敗（" + String(code) + "），資料未送出。";
@@ -4107,7 +4301,27 @@ bool withdrawEmotionObservation() {
     drawEmotionObservation();
     return false;
   }
-  if (!emotionApiConnected() && !verifyEmotionApiConnection(true)) {
+  if (emotionLastSubmittedId.startsWith("queued:")) {
+    if (!emotionStorageReady) { emotionSubmitMessage = "本機儲存未啟動，無法撤回佇列紀錄。"; drawEmotionObservation(); return false; }
+    String localId = emotionLastSubmittedId.substring(7);
+    File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
+    DynamicJsonDocument queue(32768);
+    if (input) { deserializeJson(queue, input); input.close(); }
+    JsonArray items = queue.as<JsonArray>();
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (String((const char*)(items[i]["local_id"] | "")) == localId) { items.remove(i); break; }
+    }
+    File output = SPIFFS.open("/emotion_queue.json", FILE_WRITE);
+    if (!output) { emotionSubmitMessage = "無法撤回離線佇列紀錄。"; drawEmotionObservation(); return false; }
+    serializeJson(queue, output); output.close();
+    emotionPendingCount = queue.size();
+    emotionLastSubmittedId = ""; emotionLastSubmittedPayload = "";
+    emotionSubmitCompleted = false; emotionSubmitArmed = false;
+    emotionSubmitMessage = "已取消尚未同步的離線紀錄。";
+    drawEmotionObservation();
+    return true;
+  }
+  if (WiFi.status() != WL_CONNECTED || !emotionApiConfigured()) {
     emotionSubmitMessage = "資料庫未連線，暫時無法撤回。";
     drawEmotionObservation();
     return false;
@@ -4133,7 +4347,7 @@ bool withdrawEmotionObservation() {
   String base = normalizeEmotionApiBase(emotionApiBase);
   String endpoint = base + "/api/collections/entries/records/" + emotionLastSubmittedId;
   WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
-  HTTPClient http; http.setTimeout(15000);
+  HTTPClient http; http.setTimeout(8000);
   int code = -1;
   if (base.length() && http.begin(secure, endpoint)) {
     http.addHeader("Content-Type", "application/json");
@@ -4143,7 +4357,7 @@ bool withdrawEmotionObservation() {
   }
   if (code == 401 && refreshEmotionApiToken()) {
     WiFiClientSecure retrySecure; retrySecure.setCACert(EMOTION_API_ROOT_CA);
-    HTTPClient retry; retry.setTimeout(15000);
+    HTTPClient retry; retry.setTimeout(8000);
     if (retry.begin(retrySecure, endpoint)) {
       retry.addHeader("Content-Type", "application/json");
       retry.addHeader("Authorization", "Bearer " + emotionApiToken);
@@ -4319,7 +4533,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     emotionCancelPressValid = t.y >= 210 && t.x >= 214;
     emotionCancelPressedAt = emotionCancelPressValid ? millis() : 0;
   }
-  if (emotionApiConnected() && emotionFormPage == 4 && t.isPressed() && t.y >= 115 && t.y < 195) {
+  if (emotionApiConfigured() && emotionFormPage == 4 && t.isPressed() && t.y >= 115 && t.y < 195) {
     int next = constrain((int)map(constrain((int)t.x, 28, 292), 28, 292, 5, 120), 5, 120);
     next = constrain(((next + 2) / 5) * 5, 5, 120);
     if (next != emotionIndexPercent) { emotionIndexPercent = next; drawEmotionObservation(); }
@@ -4327,7 +4541,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
   }
   if (!t.wasReleased()) return;
   haptic(12);
-  if (emotionApiConnected() && emotionFormPage < 7 && t.x >= 282 && t.y < 34) {
+  if (emotionApiConfigured() && emotionFormPage < 7 && t.x >= 282 && t.y < 34) {
     resetEmotionPage(emotionFormPage);
     drawEmotionObservation();
     return;
@@ -4346,8 +4560,6 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
       emotionSubmitArmed = false; emotionSubmitMessage = ""; drawEmotionObservation();
     } else if (t.x < 107 && emotionFormPage == 0) {
       showEmotionRecords(true);
-    } else if (!emotionApiConnected()) {
-      return;
     } else if (t.x < 107 && emotionFormPage > 0) {
       --emotionFormPage; emotionSubmitArmed = false; emotionSubmitMessage = ""; drawEmotionObservation();
     } else if (t.x >= 107 && t.x < 214) {
@@ -4371,7 +4583,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     return;
   }
   emotionCancelPressValid = false; emotionCancelPressedAt = 0;
-  if (!emotionApiConnected()) return;
+  if (!emotionApiConfigured()) return;
   if (emotionFormPage == 0) {
     if (t.y >= 48 && t.y < 160) {
       uint8_t field = constrain(((int)t.x - 5) / 63, 0, 4);
@@ -5444,6 +5656,16 @@ void sendHassAssistStatus() {
   status["enabled"] = hassAssistEnabled;
   status["connected"] = hassAssistSocketConnected;
   status["authenticated"] = hassAssistAuthenticated;
+  status["state"] = hassAssistStateText();
+  status["last_event"] = hassAssistLastEvent;
+  status["pipeline_active"] = hassAssistPipelineActive;
+  status["wake_session"] = hassAssistWakeSessionActive;
+  status["wake_detected"] = hassAssistWakeDetected;
+  status["mic_running"] = hassAssistMicRunning;
+  status["mic_chunks"] = hassAssistMicChunksSent;
+  status["mic_bytes"] = hassAssistMicBytesSent;
+  status["mic_peak"] = hassAssistMicPeak;
+  status["audio_handler"] = hassAssistAudioHandlerId;
   status["preferred"] = hassAssistPreferredPipeline;
   String statusError = hassAssistDiscoveryError.length() ? hassAssistDiscoveryError : hassAssistError;
   if (!hassAssistEnabled) statusError = "HASS Assist is disabled";
@@ -5735,6 +5957,13 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_spk = true; cfg.internal_mic = true; cfg.internal_rtc = true; cfg.internal_imu = true;
   M5.begin(cfg);
+  if (SPIFFS.begin(false)) {
+    emotionStorageReady = true;
+    emotionPendingCount = countEmotionQueue();
+    Serial.printf("[emotion] local storage ready; queued records=%u\n", emotionPendingCount);
+  } else {
+    Serial.println("[emotion] local storage unavailable; offline queue disabled");
+  }
   setCpuFrequencyMhz(160);
   Serial.begin(115200);
   M5.Display.setRotation(1);
@@ -5794,13 +6023,19 @@ void loop() {
     }
   }
   maintainSavedWifi(nowMs);
+  if (screenNow != Screen::EmotionObservation && screenNow != Screen::EmotionSettings
+      && screenNow != Screen::EmotionReminder && WiFi.status() == WL_CONNECTED
+      && emotionPendingCount && nowMs - emotionLastQueueSyncAt >= 5000UL) {
+    if (flushOneEmotionRecord()) Serial.printf("[emotion] queued record synced; remaining=%u\n", emotionPendingCount);
+  }
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings) {
     bool redrawConnection = false;
     if (WiFi.status() != WL_CONNECTED && emotionApiState != EmotionApiState::Disconnected) {
       emotionApiState = EmotionApiState::Disconnected;
       emotionApiLastChecked = nowMs;
       redrawConnection = true;
-    } else if (WiFi.status() == WL_CONNECTED && emotionApiToken.length() && emotionApiUserId.length()) {
+    } else if (screenNow != Screen::EmotionObservation && WiFi.status() == WL_CONNECTED
+               && emotionApiToken.length() && emotionApiUserId.length()) {
       bool retryDisconnected = emotionApiState == EmotionApiState::Disconnected && nowMs - emotionApiLastChecked >= 15000UL;
       bool periodicCheck = emotionApiState == EmotionApiState::Connected && nowMs - emotionApiLastChecked >= 300000UL;
       if (emotionApiState == EmotionApiState::Unknown || retryDisconnected || periodicCheck) {

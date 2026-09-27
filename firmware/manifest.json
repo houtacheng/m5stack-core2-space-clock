@@ -1,7 +1,7 @@
 {
-  "version": "2.9.27",
+  "version": "2.9.28",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "a7ee016b3c143046b21452dfd15c5d37a0f7cf571ce71870668656bada2d915a",
-  "size": 5438624,
-  "notes": "Stabilizes Home Assistant Assist wake-word listening, adds tap-to-toggle and long-press voice modes, and avoids disconnecting Home Assistant when pausing wake-word listening."
+  "sha256": "20a787518868e20c6b3d0dc7f64263bdc95350c3aac5049c1393159f6c710932",
+  "size": 5479184,
+  "notes": "Fixes Home Assistant Assist screen flicker and dropped audio (redraw only on change, 100 ms mic chunks), adds offline emotion record queue and OTA diagnostics."
 }
