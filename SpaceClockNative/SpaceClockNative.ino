@@ -40,7 +40,7 @@
 #endif
 #include "mqtt_guide.h"
 
-enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About };
+enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
 
@@ -139,6 +139,13 @@ uint16_t nightLightSeconds = 60;
 // changing the automatic screen-off night-light preference.
 bool manualNightLightOverride = false;
 bool manualNightLightActive = false;
+// True while the side LEDs are showing the night-light colour (manual night
+// light, or the sleep night light). Double-tapping then turns the whole
+// screen into a night light of the same colour and brightness.
+bool nightLedShowing = false;
+uint8_t screenNightBrightness = 0;   // 0 = follow LED brightness
+uint32_t screenNightLabelUntil = 0;
+String touchDebugLog;  // recent touch events, served at /debug
 bool screenSleeping = false;
 bool automaticFirmwareUpdate = false;
 uint8_t firmwareCheckHour = 3;
@@ -314,6 +321,7 @@ uint8_t emotionObserveCount = 1, emotionObserveMinutes = 1;
 uint8_t emotionGroundingTiming = 1, emotionGroundingAction = 10;
 uint32_t emotionCancelPressedAt = 0;
 bool emotionCancelPressValid = false;
+uint32_t emotionMiddlePressedAt = 0;  // long-press middle = force sync
 uint8_t emotionSettingsPage = 0;
 uint32_t companionNavPressStarted = 0;
 bool companionNavPressValid = false;
@@ -381,7 +389,9 @@ uint8_t matrixGlassOpacity = 58;    // dithered black veil over the time card
 static const char* const MATRIX_GLYPH_SET[] = {
   "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
   "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "X", "Y", "Z",
-  "@", "#", "$", "%", "&", "*", "+", "-", "=", "!", "?", "/", "\\", "<", ">", "[", "]", "{", "}", "~", "^", "|", ":", ";"
+  "@", "#", "$", "%", "&", "*", "+", "-", "=", "!", "?", "/", "\\", "<", ">", "[", "]", "{", "}", "~", "^", "|", ":", ";",
+  // Katakana give the classic Matrix look (glyphs are in the 8 pt UI font).
+  "ア", "イ", "ウ", "エ", "オ", "カ", "キ", "ク", "ケ", "コ", "サ", "シ", "ス", "セ", "ソ", "タ", "チ", "ツ", "テ", "ト", "ナ", "ニ", "ヌ", "ネ", "ノ", "ハ", "ヒ", "フ", "ヘ", "ホ", "マ", "ミ", "ム", "メ", "モ", "ヤ", "ユ", "ヨ", "ラ", "リ", "ル", "レ", "ロ", "ワ", "ヲ", "ン"
 };
 static constexpr uint8_t MATRIX_GLYPH_COUNT = sizeof(MATRIX_GLYPH_SET) / sizeof(MATRIX_GLYPH_SET[0]);
 
@@ -735,6 +745,7 @@ void drawClock(bool full);
 void runWifiPortal(bool automatic = false);
 void drawAstronaut();
 bool verifyEmotionApiConnection(bool force = false);
+void showEmotionRecords(bool refresh = true);
 void showEmotionSettings();
 
 bool hasSavedWifiProfiles() {
@@ -962,6 +973,10 @@ void getClockDateTime(m5::rtc_datetime_t* dt) {
 
 void applyDisplayBrightness(const m5::rtc_datetime_t& dt) {
   if (screenSleeping) return;
+  if (screenNow == Screen::NightLight) {
+    M5.Display.setBrightness((uint8_t)max(1, (screenNightBrightness ? screenNightBrightness : nightLightBrightness) * 255 / 100));
+    return;
+  }
   uint8_t percent = dayBrightness;
   if (adaptiveBrightness && (dt.time.hours < 7 || dt.time.hours >= 21)) percent = nightBrightness;
   M5.Display.setBrightness((uint8_t)(percent * 255 / 100));
@@ -996,6 +1011,24 @@ void checkMotionWake(uint32_t nowMs) {
   if (nowMs - screenSleepStarted >= 500 && (accelerationChange >= 0.10f || rotationSpeed >= 24.0f)) wakeDisplay();
 }
 
+// Device name in the status bar, centred in the gap between the IP address
+// and the battery gauge so several Core2 units can be told apart at a glance.
+template <typename Gfx>
+void drawStatusDeviceName(Gfx& gfx, int ipRight, uint16_t color) {
+  int left = ipRight + 8, right = 236;
+  if (right - left < 24 || !deviceName.length()) return;
+  String name = deviceName;
+  while (name.length() > 1 && gfx.textWidth(name) > right - left) {
+    int cut = name.length() - 1;
+    while (cut > 0 && ((uint8_t)name[cut] & 0xC0) == 0x80) --cut;  // UTF-8 boundary
+    name = name.substring(0, cut);
+    if (gfx.textWidth(name + "…") <= right - left) { name += "…"; break; }
+  }
+  gfx.setTextDatum(top_center);
+  gfx.setTextColor(color);
+  gfx.drawString(name, (left + right) / 2, 7);
+}
+
 void drawClockStatus(uint16_t background) {
   bool transparentMatrix = clockFace == ClockFace::Matrix && background == TFT_BLACK;
   if (!transparentMatrix) M5.Display.fillRect(0, 0, 320, 29, background);
@@ -1009,6 +1042,8 @@ void drawClockStatus(uint16_t background) {
   else M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED, background);
   String label = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Wi-Fi offline";
   M5.Display.drawString(label, 5, 7);
+  drawStatusDeviceName(M5.Display, 5 + M5.Display.textWidth(label),
+                       clockFace == ClockFace::Matrix ? matrixColor(100) : (uint16_t)0xBDF7);
   M5.Display.setTextDatum(top_right);
   useUIFont(1);
   if (transparentMatrix) M5.Display.setTextColor(batteryColor);
@@ -1097,9 +1132,9 @@ uint16_t matrixColor(uint8_t strength) {
   return M5.Display.color565(r, g, b);
 }
 
-uint16_t matrixTrailColor(uint8_t trail, uint8_t length) {
-  if (trail == 0) return M5.Display.color565(245, 255, 250);
-  float position = (float)trail / max(1, (int)length - 1);
+uint16_t matrixTrailColor(float trail, uint8_t length) {
+  if (trail < 0.5f) return M5.Display.color565(245, 255, 250);
+  float position = min(1.0f, trail / max(1, (int)length - 1));
   uint8_t themeR = (matrixRainColor >> 16) & 255;
   uint8_t themeG = (matrixRainColor >> 8) & 255;
   uint8_t themeB = matrixRainColor & 255;
@@ -1195,7 +1230,9 @@ void drawMatrixStatus(M5Canvas& canvas) {
   uint16_t battery = level <= 20 ? TFT_RED : theme;
   canvas.setTextDatum(top_left); canvas.setFont(&SourceHanSansTC_UI8pt8b); canvas.setTextSize(1);
   canvas.setTextColor(WiFi.status() == WL_CONNECTED ? theme : TFT_RED);
-  canvas.drawString(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Wi-Fi offline", 5, 7);
+  String ipLabel = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Wi-Fi offline";
+  canvas.drawString(ipLabel, 5, 7);
+  drawStatusDeviceName(canvas, 5 + canvas.textWidth(ipLabel), theme);
   canvas.setTextDatum(top_right); canvas.setTextColor(battery);
   canvas.drawString(String(level) + "%", 278, 9);
   canvas.drawRoundRect(282, 5, 32, 19, 4, battery);
@@ -1257,7 +1294,9 @@ void drawMatrixRainFrame(uint32_t nowMs) {
     drawClockNavigationIcons();
     return;
   }
-  uint32_t frameInterval = 100;  // CM4 uses 10 fps for the live rain layer.
+  // 20 fps: smooth enough to read as falling rain while leaving time for the
+  // SPI push of the full 320x240 frame and the rest of loop().
+  uint32_t frameInterval = 50;
   if (nowMs - lastMatrixFrame < frameInterval) return;
   float dt = lastMatrixFrame ? (nowMs - lastMatrixFrame) / 1000.0f : frameInterval / 1000.0f;
   if (dt > 0.25f) dt = 0.25f;
@@ -1289,8 +1328,8 @@ void drawMatrixRainFrame(uint32_t nowMs) {
     if (head != previousHead && head >= 0) {
       matrixGlyphs[i][head % MATRIX_MAX_ROWS] = esp_random() % MATRIX_GLYPH_COUNT;
     }
-    // Keep glyph changes occasional rather than making the whole screen flicker.
-    if ((esp_random() % 100) < 3) matrixGlyphs[i][esp_random() % rows] = esp_random() % MATRIX_GLYPH_COUNT;
+    // Occasional glyph mutations (rate independent of frame rate).
+    if ((esp_random() % 1000) < (uint32_t)(dt * 300.0f)) matrixGlyphs[i][esp_random() % rows] = esp_random() % MATRIX_GLYPH_COUNT;
     for (int row = 0; row < rows; ++row) if (matrixGlint[i][row]) --matrixGlint[i][row];
 
     for (int trail = 0; trail < matrixLength[i]; ++trail) {
@@ -1301,9 +1340,12 @@ void drawMatrixRainFrame(uint32_t nowMs) {
       if (trail > 1 && trail < matrixLength[i] - 1 && !matrixGlint[i][row] && (esp_random() % 1200) == 0) {
         matrixGlint[i][row] = 3 + esp_random() % 4;
       }
+      // Use the head's sub-cell position so the tail fades continuously
+      // instead of stepping one whole cell at a time.
+      float frac = matrixHead[i] - floorf(matrixHead[i]);
       matrixCanvas.setTextColor(matrixGlint[i][row]
         ? M5.Display.color565(220, 255, 230)
-        : matrixTrailColor(trail, matrixLength[i]));
+        : matrixTrailColor(trail == 0 ? 0.0f : trail - 0.5f + frac, matrixLength[i]));
       matrixCanvas.drawString(MATRIX_GLYPH_SET[matrixGlyphs[i][row]], cellX + columnPitch / 2,
                               row * rowPitch + rowPitch / 2);
     }
@@ -3545,6 +3587,9 @@ void updateAlarmBaseLights(uint32_t nowMs) {
       strength = ((age / 180UL) & 1) ? 0 : alarmLightBrightness;
     }
     color = alarmLightColor;
+  } else if (screenNow == Screen::NightLight) {
+    color = nightLightColor;
+    strength = nightLightBrightness;
   } else if (manualNightLightOverride) {
     if (manualNightLightActive) {
       color = nightLightColor;
@@ -3570,6 +3615,9 @@ void updateAlarmBaseLights(uint32_t nowMs) {
     else if (nightLightMode == 2 && age < (uint32_t)nightLightSeconds * 1000UL + 5000UL)
       strength = nightLightBrightness * ((uint32_t)nightLightSeconds * 1000UL + 5000UL - age) / 5000UL;
   }
+  // Only the manual night light (long press on the right button) enables
+  // the full-screen night light.
+  nightLedShowing = alarmActive < 0 && !screenSleeping && manualNightLightOverride && manualNightLightActive;
   uint8_t r = ((color >> 16) & 255) * strength / 100;
   uint8_t g = ((color >> 8) & 255) * strength / 100;
   uint8_t b = (color & 255) * strength / 100;
@@ -4272,6 +4320,47 @@ bool flushOneEmotionRecord() {
   return true;
 }
 
+// Long-press the middle button: reconnect to the database right away and
+// upload every record waiting in the offline queue.
+void drawEmotionSyncToast(const String& message) {
+  // Overlay just above the bottom bar so it works on every emotion page.
+  M5.Display.fillRoundRect(10, 172, 300, 34, 10, emotionPanel(18));
+  M5.Display.drawRoundRect(10, 172, 300, 34, 10, emotionTheme(80));
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(TFT_WHITE, emotionPanel(18));
+  M5.Display.setClipRect(14, 174, 292, 30);
+  M5.Display.drawString(message, 160, 189);
+  M5.Display.clearClipRect();
+}
+
+// Long-press the middle button: reconnect to the database right away and
+// upload every record waiting in the offline queue.
+void forceEmotionSync() {
+  if (WiFi.status() != WL_CONNECTED) { drawEmotionSyncToast("Wi-Fi 未連線，無法同步"); return; }
+  drawEmotionSyncToast("重新連線資料庫並上傳離線資料…");
+  emotionApiState = EmotionApiState::Unknown;
+  bool connected = verifyEmotionApiConnection(true);
+  if (!connected && refreshEmotionApiToken()) connected = verifyEmotionApiConnection(true);
+  uint8_t before = emotionStorageReady ? countEmotionQueue() : 0;
+  emotionPendingCount = before;
+  uint8_t uploaded = 0;
+  while (connected && emotionPendingCount) {
+    emotionLastQueueSyncAt = 0;  // bypass the 5 s background pacing
+    if (!flushOneEmotionRecord()) break;
+    ++uploaded;
+  }
+  String result;
+  if (!connected) result = "資料庫連線失敗，請檢查登入或網路";
+  else if (!emotionStorageReady) result = "已連線；本機儲存未啟用，無離線資料";
+  else if (!before) result = "已重新連線，沒有待上傳的離線資料";
+  else result = "已連線，上傳 " + String(uploaded) + " 筆，剩 " + String(emotionPendingCount) + " 筆";
+  Serial.printf("[emotion] forced sync: connected=%d uploaded=%u remaining=%u\n", connected ? 1 : 0, uploaded, emotionPendingCount);
+  if (screenNow == Screen::EmotionRecords) { emotionStatsCacheAt = 0; showEmotionRecords(true); }
+  else drawEmotionObservation();
+  drawEmotionSyncToast(result);
+}
+
 int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
   String base = normalizeEmotionApiBase(emotionApiBase);
   if (!base.length()) return -10001;
@@ -4319,8 +4408,9 @@ bool loadEmotionRecordStats() {
     applyEmotionStatistics(cached);
     emotionRecordsState = EmotionRecordsState::Ready;
     emotionPendingCount = countEmotionQueue();
-    if (!emotionStatsCacheAt) emotionStatsCacheAt = millis();
-    if (millis() - emotionStatsCacheAt < 300000UL) return true;
+    // The cache is only a fallback for offline use. Always fetch fresh
+    // statistics when online: treating a cache loaded at boot as "fresh"
+    // made two devices show different, stale numbers (and made Refresh a no-op).
   }
   if (WiFi.status() != WL_CONNECTED) {
     if (haveCache) return true;
@@ -4375,7 +4465,7 @@ bool loadEmotionRecordStats() {
   return true;
 }
 
-void showEmotionRecords(bool refresh = true) {
+void showEmotionRecords(bool refresh) {
   screenNow = Screen::EmotionRecords;
   if (refresh) {
     DynamicJsonDocument cached(4096);
@@ -4383,7 +4473,6 @@ void showEmotionRecords(bool refresh = true) {
       applyEmotionStatistics(cached);
       emotionRecordsState = EmotionRecordsState::Ready;
       emotionPendingCount = countEmotionQueue();
-      if (!emotionStatsCacheAt) emotionStatsCacheAt = millis();
     } else emotionRecordsState = EmotionRecordsState::Loading;
   }
   drawEmotionRecords();
@@ -4673,7 +4762,11 @@ void checkEmotionReminder(uint32_t nowMs, const m5::rtc_datetime_t& dt) {
 
 void handleEmotionTouch(const m5::touch_detail_t& t) {
   if (screenNow == Screen::EmotionRecords) {
+    if (t.wasPressed()) emotionMiddlePressedAt = (t.y >= 210 && t.x >= 107 && t.x < 214) ? millis() : 0;
     if (!t.wasReleased()) return;
+    if (t.y >= 210 && t.x >= 107 && t.x < 214 && emotionMiddlePressedAt && millis() - emotionMiddlePressedAt >= 700UL) {
+      emotionMiddlePressedAt = 0; haptic(20); forceEmotionSync(); return;
+    }
     if (t.y >= 210) {
       haptic(12);
       if (t.x < 107) showEmotionRecords(true);
@@ -4742,6 +4835,7 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
   if (t.wasPressed()) {
     emotionCancelPressValid = t.y >= 210 && t.x >= 214;
     emotionCancelPressedAt = emotionCancelPressValid ? millis() : 0;
+    emotionMiddlePressedAt = (t.y >= 210 && t.x >= 107 && t.x < 214) ? millis() : 0;
   }
   if (emotionApiConfigured() && emotionFormPage == 4 && t.isPressed() && t.y >= 115 && t.y < 195) {
     int next = constrain((int)map(constrain((int)t.x, 28, 292), 28, 292, 5, 120), 5, 120);
@@ -4754,6 +4848,11 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
   if (emotionApiConfigured() && emotionFormPage < 7 && t.x >= 282 && t.y < 34) {
     resetEmotionPage(emotionFormPage);
     drawEmotionObservation();
+    return;
+  }
+  if (t.y >= 210 && t.x >= 107 && t.x < 214 && emotionMiddlePressedAt && millis() - emotionMiddlePressedAt >= 700UL) {
+    emotionMiddlePressedAt = 0;
+    forceEmotionSync();
     return;
   }
   if (t.y >= 210) {
@@ -4995,8 +5094,96 @@ bool deviceIsFlat() {
   return fabsf(az) > 0.82f && fabsf(ax) < 0.42f && fabsf(ay) < 0.42f;
 }
 
+void fillNightLightScreen() {
+  M5.Display.fillScreen(M5.Display.color565((nightLightColor >> 16) & 255, (nightLightColor >> 8) & 255, nightLightColor & 255));
+}
+
+void enterNightLightScreen() {
+  screenSleeping = false;
+  screenNow = Screen::NightLight;
+  screenNightBrightness = nightLightBrightness;
+  fillNightLightScreen();
+  M5.Display.setBrightness((uint8_t)max(1, screenNightBrightness * 255 / 100));
+  updateAlarmBaseLights(millis() + 1000);
+}
+
+void exitNightLightScreen() {
+  // Double tap ends both the screen night light and the LED night light.
+  manualNightLightOverride = true;
+  manualNightLightActive = false;
+  screenNow = Screen::Clock;
+  lastUserActivity = millis();
+  m5::rtc_datetime_t now; getClockDateTime(&now);
+  applyDisplayBrightness(now);
+  updateAlarmBaseLights(millis() + 1000);
+  drawClock(true); drawAstronaut();
+}
+
+void showNightBrightnessLabel() {
+  fillNightLightScreen();
+  uint16_t bg = M5.Display.color565((nightLightColor >> 16) & 255, (nightLightColor >> 8) & 255, nightLightColor & 255);
+  uint32_t luma = ((nightLightColor >> 16) & 255) * 3 + ((nightLightColor >> 8) & 255) * 6 + (nightLightColor & 255);
+  M5.Display.setTextColor(luma > 1200 ? TFT_BLACK : TFT_WHITE, bg);
+  M5.Display.setTextDatum(middle_center);
+  useUIMediumFont();
+  M5.Display.drawString(String(screenNightBrightness) + "%", 160, 120);
+  screenNightLabelUntil = millis() + 1200UL;
+}
+
 void handleTouch() {
   auto t = M5.Touch.getDetail();
+  // Screen night light: long-press the screen to enter (while the manual LED
+  // night light is on) and long-press again to leave. Sliding left/right
+  // changes brightness. One press can only trigger one action, so the press
+  // that enters never immediately leaves again.
+  static uint32_t pressStartedAt = 0;
+  static int16_t pressX = 0;
+  static uint8_t pressBrightness = 0;
+  static bool sliding = false;
+  static bool pressHandled = false;
+  if (t.wasPressed()) {
+    pressStartedAt = millis(); pressX = t.x; pressBrightness = screenNightBrightness;
+    sliding = false; pressHandled = false;
+  }
+  if (t.isPressed() && abs((int)t.x - pressX) > 12) sliding = true;
+  bool longHeld = t.isPressed() && !sliding && !pressHandled && pressStartedAt
+    && millis() - pressStartedAt >= 800UL;
+  if (t.wasPressed() || t.wasReleased()) {
+    char line[96];
+    snprintf(line, sizeof(line), "%lu %s x=%d y=%d night=%d screen=%d\n", (unsigned long)millis(),
+             t.wasPressed() ? "down" : "up", t.x, t.y, nightLedShowing ? 1 : 0, (int)screenNow);
+    touchDebugLog += line;
+    if (touchDebugLog.length() > 1500) touchDebugLog.remove(0, touchDebugLog.length() - 1500);
+  }
+
+  if (screenNow == Screen::NightLight) {
+    if (sliding && t.isPressed() && !pressHandled) {
+      int next = constrain((int)pressBrightness + ((int)t.x - pressX) * 100 / 280, 1, 100);
+      if (next != screenNightBrightness) {
+        screenNightBrightness = next;
+        M5.Display.setBrightness((uint8_t)max(1, screenNightBrightness * 255 / 100));
+        showNightBrightnessLabel();
+      }
+    }
+    if (longHeld) {
+      pressHandled = true;
+      haptic(20);
+      exitNightLightScreen();
+      wakeTouchConsumed = true;  // ignore the rest of this press on the clock
+      return;
+    }
+    if (screenNightLabelUntil && (int32_t)(millis() - screenNightLabelUntil) >= 0) {
+      screenNightLabelUntil = 0;
+      fillNightLightScreen();
+    }
+    return;
+  }
+  if (longHeld && nightLedShowing && screenNow == Screen::Clock && t.y < 210) {
+    pressHandled = true;
+    haptic(20);
+    enterNightLightScreen();
+    return;
+  }
   if (screenSleeping) {
     if (t.wasPressed() || t.isPressed()) {
       wakeDisplay();
@@ -6220,6 +6407,12 @@ void setupSettingsServer() {
       }
     }
   });
+  settingsServer.on("/debug", HTTP_GET, []() {
+    String out = "night_led=" + String(nightLedShowing) + " manual_override=" + String(manualNightLightOverride)
+      + " manual_active=" + String(manualNightLightActive) + " sleeping=" + String(screenSleeping)
+      + " screen=" + String((int)screenNow) + "\n" + touchDebugLog;
+    settingsServer.send(200, "text/plain; charset=utf-8", out);
+  });
   settingsServer.onNotFound([]() { settingsServer.sendHeader("Location", "/"); settingsServer.send(302); });
   settingsServer.begin();
   settingsServerReady = true;
@@ -6229,7 +6422,11 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_spk = true; cfg.internal_mic = true; cfg.internal_rtc = true; cfg.internal_imu = true;
   M5.begin(cfg);
-  if (SPIFFS.begin(false)) {
+  Serial.begin(115200);
+  // The SPIFFS partition is never formatted on a new Core2 (or after a USB
+  // flash that erased it), so mounting without formatting always failed and
+  // silently disabled the offline emotion queue. Format once when needed.
+  if (SPIFFS.begin(true)) {
     emotionStorageReady = true;
     emotionPendingCount = countEmotionQueue();
     Serial.printf("[emotion] local storage ready; queued records=%u\n", emotionPendingCount);
@@ -6336,7 +6533,7 @@ void loop() {
     drawMeditation();
   }
   updateAlarmBaseLights(nowMs);
-  if (!screenSleeping && alarmActive < 0 && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
+  if (!screenSleeping && alarmActive < 0 && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
     screenSleeping = true;
     screenSleepStarted = nowMs;
     motionBaselineReady = false;

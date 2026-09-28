@@ -27,6 +27,7 @@ def common_chinese():
             try: chars.add(bytes([hi, lo]).decode("big5"))
             except UnicodeDecodeError: pass
     chars.update("，。、；：？！「」『』（）《》〈〉…—～·％＋－＝／")
+    chars.update(chr(c) for c in range(0x30A1, 0x30F7))  # katakana for Matrix rain
     return {ord(c) for c in chars if 0x20 < ord(c) <= 0xFFFF}
 
 

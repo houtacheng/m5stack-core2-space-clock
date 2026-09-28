@@ -15,13 +15,24 @@ from pathlib import Path
 GLYPH = re.compile(r"^\s*\{\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(-?\d+),\s*(-?\d+)\s*\},?\s*//\s*0x([0-9A-Fa-f]+)", re.M)
 
 
-def compact(path: Path) -> None:
+def compact(path: Path, fill_gap: int = 64) -> None:
     text = path.read_text(encoding="utf-8")
     name = re.search(r"const uint8_t (\w+)Bitmaps\[\]", text).group(1)
     start = text.index(f"const GFXglyph {name}Glyphs[]")
     head = text[:start]
     glyphs = [(int(m.group(7), 16), tuple(int(m.group(i)) for i in range(1, 7))) for m in GLYPH.finditer(text[start:])]
     keep = [(c, g) for c, g in glyphs if c < 0x7F or g[1] or g[2]]
+    # LovyanGFX scans EncodeRange linearly for every character drawn. Thousands
+    # of tiny ranges made every text draw (Matrix rain, clock, Assist) slow, so
+    # pad short gaps with empty glyphs and keep only a handful of ranges.
+    y_adv_guess = max((g[3] for _, g in keep), default=8)
+    filled = []
+    for code, g in keep:
+        if filled and 0 < code - filled[-1][0] - 1 < fill_gap:
+            for gap in range(filled[-1][0] + 1, code):
+                filled.append((gap, (0, 0, 0, max(1, y_adv_guess // 2), 0, 0)))
+        filled.append((code, g))
+    keep = filled
     ranges = []
     for index, (code, _) in enumerate(keep):
         if ranges and ranges[-1][1] + 1 == code:
@@ -41,5 +52,9 @@ def compact(path: Path) -> None:
 
 
 if __name__ == "__main__":
+    gap = 64
     for arg in sys.argv[1:]:
-        compact(Path(arg))
+        if arg.startswith("--gap="):
+            gap = int(arg.split("=", 1)[1])
+            continue
+        compact(Path(arg), gap)
