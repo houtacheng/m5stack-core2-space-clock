@@ -197,6 +197,8 @@ uint32_t hassAssistLastEventAt = 0;
 // Set when Assist was opened by a shortcut (hold on the clock, or a wake word
 // heard on another screen); the clock returns once the reply has finished.
 bool hassAssistReturnToClock = false;
+// Set when the user interrupts a reply; late tts-end events are ignored.
+bool hassAssistReplyInterrupted = false;
 uint32_t hassAssistReturnAt = 0;
 bool hassAssistWakeWordPaused = false;
 static constexpr uint8_t HASS_ASSIST_MAX_PIPELINES = 10;
@@ -323,6 +325,7 @@ uint32_t emotionCancelPressedAt = 0;
 bool emotionCancelPressValid = false;
 uint32_t emotionMiddlePressedAt = 0;  // long-press middle = force sync
 uint8_t emotionSettingsPage = 0;
+uint8_t emotionRecordsPage = 0;
 uint32_t companionNavPressStarted = 0;
 bool companionNavPressValid = false;
 uint32_t lastMqttReconnect = 0;
@@ -515,6 +518,35 @@ void title(const char* text) {
   M5.Display.drawFastHLine(10, 34, 300, UI_BORDER);
 }
 
+// Device settings lists: four large rows per page, filling the screen
+// between the title rule and the bottom bar.
+static constexpr int SETTINGS_ROW_TOP = 39;
+static constexpr int SETTINGS_ROW_PITCH = 44;
+int settingsRowAt(int y) {
+  if (y < SETTINGS_ROW_TOP || y >= SETTINGS_ROW_TOP + 4 * SETTINGS_ROW_PITCH || y >= 210) return -1;
+  return (y - SETTINGS_ROW_TOP) / SETTINGS_ROW_PITCH;
+}
+void drawSettingsRow(uint8_t index, const String& label, const String& value, int32_t swatch = -1) {
+  int y = SETTINGS_ROW_TOP + index * SETTINGS_ROW_PITCH;
+  int h = SETTINGS_ROW_PITCH - 5;
+  uint16_t fill = index & 1 ? UI_PANEL_ALT : PANEL;
+  M5.Display.fillRoundRect(8, y, 304, h, 8, fill);
+  M5.Display.drawRoundRect(8, y, 304, h, 8, UI_BORDER);
+  useUIMediumFont();
+  M5.Display.setTextColor(TFT_WHITE, fill);
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.drawString(label, 18, y + h / 2);
+  if (swatch >= 0) {
+    M5.Display.fillRoundRect(248, y + 8, 50, h - 16, 5,
+      M5.Display.color565((swatch >> 16) & 255, (swatch >> 8) & 255, swatch & 255));
+  } else if (value.length()) {
+    M5.Display.setTextColor(0x9EFF, fill);
+    M5.Display.setTextDatum(middle_right);
+    M5.Display.drawString(value, 302, y + h / 2);
+  }
+  M5.Display.setTextDatum(top_left);
+}
+
 void saveSettings() {
   prefs.begin("spaceclock", false);
   prefs.putUChar("tzCity", timeZoneIndex);
@@ -625,8 +657,8 @@ void loadSettings() {
   automaticFirmwareUpdate = prefs.getBool("fwAuto", false);
   firmwareCheckHour = constrain((int)prefs.getUChar("fwHour", 3), 0, 23);
   meditationSoundEnabled = prefs.getBool("medSound", true);
-  meditationPresetMinutes[0] = constrain((int)prefs.getUShort("medP1", 5), 1, 180);
-  meditationPresetMinutes[1] = constrain((int)prefs.getUShort("medP2", 15), 1, 180);
+  meditationPresetMinutes[0] = constrain((int)prefs.getUShort("medP1", 5), 1, 60);
+  meditationPresetMinutes[1] = constrain((int)prefs.getUShort("medP2", 15), 1, 60);
   meditationStartSound = constrain((int)prefs.getUChar("medStartS", 1), 0, 3);
   meditationEndSound = constrain((int)prefs.getUChar("medEndS", 1), 0, 3);
   meditationStartVolume = constrain((int)prefs.getUChar("medStartV", 55), 5, 100);
@@ -1662,19 +1694,45 @@ void drawAstronaut() {
   }
 }
 
+uint8_t menuPage = 0;
+static const char* const MENU_ROWS[] = {"Wi-Fi & Companion", "Clock faces", "Clock settings", "Alarms", "Meditation settings", "Firmware update"};
+// A settings row with a slider (used for the meditation preset times).
+static constexpr int SLIDER_LEFT = 24, SLIDER_RIGHT = 296;
+void drawSettingsSliderRow(uint8_t index, const String& label, int value, int minValue, int maxValue, const String& unit) {
+  int y = SETTINGS_ROW_TOP + index * SETTINGS_ROW_PITCH;
+  int h = SETTINGS_ROW_PITCH - 5;
+  uint16_t fill = index & 1 ? UI_PANEL_ALT : PANEL;
+  M5.Display.fillRoundRect(8, y, 304, h, 8, fill);
+  M5.Display.drawRoundRect(8, y, 304, h, 8, UI_BORDER);
+  useUIFont(1);
+  M5.Display.setTextColor(TFT_WHITE, fill);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.drawString(label, 18, y + 2);
+  M5.Display.setTextColor(0x9EFF, fill);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.drawString(String(value) + " " + unit, 302, y + 2);
+  int trackY = y + h - 10;
+  int knobX = SLIDER_LEFT + (value - minValue) * (SLIDER_RIGHT - SLIDER_LEFT) / max(1, maxValue - minValue);
+  M5.Display.fillRoundRect(SLIDER_LEFT, trackY - 2, SLIDER_RIGHT - SLIDER_LEFT, 5, 2, UI_BORDER);
+  M5.Display.fillRoundRect(SLIDER_LEFT, trackY - 2, knobX - SLIDER_LEFT + 1, 5, 2, 0x65DF);
+  M5.Display.fillCircle(knobX, trackY, 7, TFT_WHITE);
+  M5.Display.drawCircle(knobX, trackY, 7, 0x65DF);
+  M5.Display.setTextDatum(top_left);
+}
+
+int sliderValueAt(int x, int minValue, int maxValue) {
+  x = constrain(x, SLIDER_LEFT, SLIDER_RIGHT);
+  return minValue + ((x - SLIDER_LEFT) * (maxValue - minValue) + (SLIDER_RIGHT - SLIDER_LEFT) / 2) / (SLIDER_RIGHT - SLIDER_LEFT);
+}
+
 void showMenu() {
   screenNow = Screen::Menu;
-  title("Settings");
-  useUIFont(1);
-  M5.Display.setTextColor(TFT_WHITE, BG);
-  const char* rows[] = {"Wi-Fi & Companion", "Clock faces", "Clock settings", "Alarms", "Meditation settings", "Firmware update"};
-  for (int i = 0; i < 6; ++i) {
-    M5.Display.fillRoundRect(12, 38 + i * 29, 296, 25, 7, i & 1 ? UI_PANEL_ALT : PANEL);
-    M5.Display.drawRoundRect(12, 38 + i * 29, 296, 25, 7, UI_BORDER);
-    M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.drawString(rows[i], 25, 42 + i * 29);
+  title(menuPage ? "Settings 2/2" : "Settings 1/2");
+  for (int row = 0; row < 4; ++row) {
+    int i = menuPage * 4 + row;
+    if (i < 6) drawSettingsRow(row, MENU_ROWS[i], ">");
   }
-  drawBottomBar("", "", "Close");
+  drawBottomBar(menuPage ? "Previous" : "", menuPage ? "" : "Next", "Close");
 }
 
 uint16_t rgbHexTo565(const String& value) {
@@ -2234,6 +2292,7 @@ void startHassAssistPipeline(bool wakeWordMode = false) {
   hassAssistPipelineActive = true;
   hassAssistActiveCommandId = ++hassAssistCommandId;
   hassAssistLastEventAt = millis();
+  hassAssistReplyInterrupted = false;
   JsonDocument command;
   command["id"] = hassAssistActiveCommandId;
   command["type"] = "assist_pipeline/run";
@@ -2322,7 +2381,7 @@ void processHassAssistEvent(JsonObject event) {
     else output = data["tts_output"].as<JsonVariant>();
     hassAssistTtsUrl = output["url"] | "";
     hassAssistTtsMime = output["mime_type"] | "";
-    hassAssistTtsPending = hassAssistTtsUrl.length();
+    hassAssistTtsPending = hassAssistTtsUrl.length() && !hassAssistReplyInterrupted;
     if (hassAssistTtsPending) hassAssistState = HassAssistState::Downloading;
   } else if (eventType == "error") {
     String errorCode = data["code"] | "";
@@ -2494,6 +2553,28 @@ void connectHassAssist() {
   drawHassAssist();
 }
 
+bool hassAssistReplyActive() {
+  return hassAssistAudioData || hassAssistMp3Decoder || hassAssistTtsPending
+    || (hassAssistPipelineActive && !hassAssistMicRunning && !hassAssistWakeSessionActive
+        && (hassAssistState == HassAssistState::Processing || hassAssistState == HassAssistState::Downloading
+            || hassAssistState == HassAssistState::Speaking));
+}
+
+// Stop the spoken reply (or the wait for it) immediately.
+void interruptHassAssistReply() {
+  Serial.println("[assist] reply interrupted by user");
+  hassAssistReplyInterrupted = true;
+  hassAssistTtsPending = false;
+  cleanupHassAssistAudio(true);
+  M5.Speaker.stop();
+  hassAssistPipelineActive = false;
+  hassAssistState = hassAssistWakeWordEnabled
+    ? (hassAssistWakeWordPaused ? HassAssistState::Paused : HassAssistState::WaitingWakeWord)
+    : HassAssistState::Ready;
+  if (hassAssistWakeWordEnabled) hassAssistRestartAt = millis() + 500UL;
+  drawHassAssist();
+}
+
 void enterHassAssistScreenForShortcut() {
   screenNow = Screen::HassAssist;
   hassAssistReturnToClock = true;
@@ -2578,6 +2659,14 @@ bool downloadHassAssistAudio() {
     // Sherpa TTS streams the MP3 while it is still synthesising. Start
     // speaking as soon as a few frames are here instead of waiting for the
     // whole reply; playRaw() on a fixed channel paces the decoder.
+    // The download runs inside loop(); poll the touch panel so a tap can
+    // interrupt a long reply while it is still streaming.
+    M5.update();
+    if (M5.Touch.getDetail().wasPressed()) {
+      http.end();
+      interruptHassAssistReply();
+      return false;
+    }
     if (streamMp3) {
       if (!hassAssistMp3Decoder && hassAssistAudioLength >= 4096) {
         if (!beginHassAssistPlayback() || !hassAssistAudioData) { http.end(); return false; }
@@ -2699,7 +2788,8 @@ void maintainHassAssist(uint32_t nowMs) {
     hassAssistTtsPending = false;
     hassAssistState = HassAssistState::Downloading;
     drawHassAssist();
-    if (!downloadHassAssistAudio() || (!hassAssistMp3Decoder && !beginHassAssistPlayback())) {
+    if ((!downloadHassAssistAudio() || (!hassAssistMp3Decoder && !beginHassAssistPlayback()))
+        && !hassAssistReplyInterrupted) {
       hassAssistState = HassAssistState::Error;
       drawHassAssist();
     }
@@ -2906,12 +2996,12 @@ void showMeditationSettings() {
     rows[2]="Background volume"; values[2]=String(meditationNoiseVolume)+"%";
     rows[3]="Preview"; values[3]="Play";
   }
-  for (int i=0;i<4;++i) {
-    int y=47+i*39; M5.Display.fillRoundRect(10,y,300,32,8,i&1?UI_PANEL_ALT:PANEL);
-    M5.Display.drawRoundRect(10,y,300,32,8,UI_BORDER);
-    M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.setTextDatum(middle_left); M5.Display.drawString(rows[i],20,y+16);
-    M5.Display.setTextDatum(middle_right); M5.Display.drawString(values[i],300,y+16);
+  for (int i = 0; i < 4; ++i) {
+    if (meditationSettingsPage == 0 && i < 2) {
+      drawSettingsSliderRow(i, i ? "Preset time 2" : "Preset time 1", meditationPresetMinutes[i], 1, 60, "min");
+    } else {
+      drawSettingsRow(i, rows[i], values[i]);
+    }
   }
   drawBottomBar(meditationSettingsPage?"Previous":"", meditationSettingsPage<2?"Next":"", "Close");
 }
@@ -3144,26 +3234,26 @@ void cycleScreenOffTime() {
 uint8_t clockSettingsPage = 0;
 void showSettings() {
   screenNow = Screen::Settings;
-  title("Settings");
-  useUIFont(1); M5.Display.setTextColor(TFT_WHITE, BG);
-  if (!clockSettingsPage) {
-    M5.Display.drawString("Time zone", 14, 42); M5.Display.drawString(TIME_ZONES[timeZoneIndex].city, 174, 42);
-    M5.Display.drawString("Auto brightness", 14, 70); M5.Display.drawString(adaptiveBrightness ? "ON" : "OFF", 244, 70);
-    M5.Display.drawString("Day brightness", 14, 98); M5.Display.drawString(String(dayBrightness) + "%", 238, 98);
-    M5.Display.drawString("Night brightness", 14, 126); M5.Display.drawString(String(nightBrightness) + "%", 238, 126);
-    M5.Display.drawString("Alarm volume", 14, 154); M5.Display.drawString(String(alarmVolume) + "%", 238, 154);
-    M5.Display.drawString("Screen off", 14, 182); M5.Display.drawString(screenOffText(), 218, 182);
-    drawBottomBar("NTP sync", "Next", "Close");
+  char heading[24]; snprintf(heading, sizeof(heading), "Clock settings %u/3", clockSettingsPage + 1);
+  title(heading);
+  if (clockSettingsPage == 0) {
+    drawSettingsRow(0, "Time zone", TIME_ZONES[timeZoneIndex].city);
+    drawSettingsRow(1, "Auto brightness", adaptiveBrightness ? "ON" : "OFF");
+    drawSettingsRow(2, "Day brightness", String(dayBrightness) + "%");
+    drawSettingsRow(3, "Night brightness", String(nightBrightness) + "%");
+  } else if (clockSettingsPage == 1) {
+    drawSettingsRow(0, "Alarm volume", String(alarmVolume) + "%");
+    drawSettingsRow(1, "Screen off", screenOffText());
+    drawSettingsRow(2, "Time format", use24HourTime ? "24 hour" : "12 hour");
+    drawSettingsRow(3, "Flat buttons", flatVirtualButtonsEnabled ? "ON" : "OFF");
   } else {
-    M5.Display.drawString("Time format", 14, 42); M5.Display.drawString(use24HourTime?"24 hour":"12 hour", 220, 42);
-    M5.Display.drawString("Flat virtual buttons", 14, 70); M5.Display.drawString(flatVirtualButtonsEnabled?"ON":"OFF", 244, 70);
-    M5.Display.drawString("Night light", 14, 98); M5.Display.drawString(nightLightEnabled ? "ON" : "OFF", 244, 98);
-    M5.Display.drawString("Color", 14, 126); M5.Display.fillRoundRect(250, 122, 45, 22, 5, M5.Display.color565((nightLightColor>>16)&255,(nightLightColor>>8)&255,nightLightColor&255));
-    M5.Display.drawString("LED brightness", 14, 154); M5.Display.drawString(String(nightLightBrightness)+"%", 238, 154);
     const char* modes[] = {"Stay on", "Timed off", "Timed fade"};
-    M5.Display.drawString("Mode", 14, 182); M5.Display.drawString(modes[nightLightMode], 205, 182);
-    drawBottomBar("Previous", "Save", "Close");
+    drawSettingsRow(0, "Night light", nightLightEnabled ? "ON" : "OFF");
+    drawSettingsRow(1, "Color", "", (int32_t)nightLightColor);
+    drawSettingsRow(2, "LED brightness", String(nightLightBrightness) + "%");
+    drawSettingsRow(3, "Mode", modes[nightLightMode]);
   }
+  drawBottomBar(clockSettingsPage ? "Previous" : "NTP sync", clockSettingsPage < 2 ? "Next" : "", "Close");
 }
 
 int compareFirmwareVersions(const String& left, const String& right) {
@@ -3544,11 +3634,29 @@ void runWifiPortal(bool automatic) {
   WiFiManagerParameter companionPortField("companion_port", "Companion page 1 port", compPort, 7);
   wm.addParameter(&companionHostField);
   wm.addParameter(&companionPortField);
-  wm.setConfigPortalTimeout(180);
+  drawBottomBar("", "", "Back");
+  // Non-blocking portal so the Back button works while waiting for a phone.
+  wm.setConfigPortalBlocking(false);
   wm.startConfigPortal(SPACE_CLOCK_WIFI_AP);
-  companionHosts[0] = companionHostField.getValue();
-  companionPorts[0] = max(1, atoi(companionPortField.getValue()));
-  saveSettings();
+  bool saved = false;
+  uint32_t portalStartedAt = millis();
+  while (millis() - portalStartedAt < 180000UL) {
+    if (wm.process()) { saved = true; break; }
+    M5.update();
+    auto t = M5.Touch.getDetail();
+    if (t.wasReleased() && t.y >= 210 && t.x >= 214) { haptic(15); break; }
+    delay(10);
+  }
+  if (!saved) wm.stopConfigPortal();
+  if (saved) {
+    companionHosts[0] = companionHostField.getValue();
+    companionPorts[0] = max(1, atoi(companionPortField.getValue()));
+    saveSettings();
+  }
+  // Return to normal station mode (the portal leaves the soft AP running).
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  if (WiFi.status() != WL_CONNECTED) WiFi.begin();
   if (WiFi.status() == WL_CONNECTED) {
     if (settingsServerReady) settingsServer.begin(); else setupSettingsServer();
     syncTime();
@@ -3754,6 +3862,25 @@ void drawEmotionRow(int y, const String& label, const String& value, bool select
   M5.Display.drawString(value, 302, y + 14);
 }
 
+// Four large rows fill the space between the title and the bottom bar.
+static constexpr int EMOTION_BIG_ROW_TOP = 32;
+static constexpr int EMOTION_BIG_ROW_PITCH = 44;
+void drawEmotionBigRow(uint8_t index, const String& label, const String& value, bool selectable = false) {
+  int y = EMOTION_BIG_ROW_TOP + index * EMOTION_BIG_ROW_PITCH;
+  uint16_t fill = emotionPanel(selectable ? 20 : ((index & 1) ? 10 : 14));
+  M5.Display.fillRoundRect(8, y, 304, EMOTION_BIG_ROW_PITCH - 4, 8, fill);
+  M5.Display.drawRoundRect(8, y, 304, EMOTION_BIG_ROW_PITCH - 4, 8, selectable ? emotionTheme(75) : emotionTheme(30));
+  useUIMediumFont();
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.setTextColor(selectable ? emotionTheme(100) : emotionTheme(75), fill);
+  M5.Display.drawString(label, 18, y + (EMOTION_BIG_ROW_PITCH - 4) / 2);
+  M5.Display.setClipRect(150, y + 2, 156, EMOTION_BIG_ROW_PITCH - 8);
+  M5.Display.setTextDatum(middle_right);
+  M5.Display.setTextColor(TFT_WHITE, fill);
+  M5.Display.drawString(value, 302, y + (EMOTION_BIG_ROW_PITCH - 4) / 2);
+  M5.Display.clearClipRect();
+}
+
 void drawEmotionChoicePanel(int y, const char* label, const String& value, uint16_t fill, uint16_t accent) {
   M5.Display.fillRoundRect(12, y, 296, 61, 10, fill);
   M5.Display.drawRoundRect(12, y, 296, 61, 10, accent);
@@ -3797,7 +3924,7 @@ void drawEmotionRecords() {
   useUIFont(1);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(emotionTheme(100), TFT_BLACK);
-  M5.Display.drawString("我的紀錄", 20, 5);
+  M5.Display.drawString("我的紀錄 " + String(emotionRecordsPage + 1) + "/2", 20, 5);
 
   if (emotionRecordsState == EmotionRecordsState::Loading) {
     useUIMediumFont();
@@ -3820,16 +3947,19 @@ void drawEmotionRecords() {
     M5.Display.drawString(emotionRecordsError, 160, 132);
     M5.Display.clearClipRect();
   } else {
-    drawEmotionRecordsRow(37,  "學習天數", String(emotionRecordsLearningDays) + " 天");
-    drawEmotionRecordsRow(58,  "填寫張數", String(emotionRecordsSheetCount) + " 張");
-    drawEmotionRecordsRow(79,  "今日張數", String(emotionRecordsTodaySheets) + " 張");
-    drawEmotionRecordsRow(100, "平均一天", emotionRecordsAverage + " 張");
-    drawEmotionRecordsRow(121, "最常身體反應", emotionRecordsTopBody);
-    drawEmotionRecordsRow(142, "最常出現情緒", emotionRecordsTopEmotion);
-    drawEmotionRecordsRow(163, "最強烈的情緒", emotionRecordsStrongest);
-    drawEmotionRecordsRow(184, "最常情緒落地", emotionRecordsTopGrounding);
+    if (!emotionRecordsPage) {
+      drawEmotionBigRow(0, "學習天數", String(emotionRecordsLearningDays) + " 天");
+      drawEmotionBigRow(1, "填寫張數", String(emotionRecordsSheetCount) + " 張");
+      drawEmotionBigRow(2, "今日張數", String(emotionRecordsTodaySheets) + " 張");
+      drawEmotionBigRow(3, "平均一天", emotionRecordsAverage + " 張");
+    } else {
+      drawEmotionBigRow(0, "最常身體反應", emotionRecordsTopBody);
+      drawEmotionBigRow(1, "最常出現情緒", emotionRecordsTopEmotion);
+      drawEmotionBigRow(2, "最強烈的情緒", emotionRecordsStrongest);
+      drawEmotionBigRow(3, "最常情緒落地", emotionRecordsTopGrounding);
+    }
   }
-  drawEmotionBottomBar("重新整理", "", "返回");
+  drawEmotionBottomBar(emotionRecordsPage ? "上一頁" : "重新整理", emotionRecordsPage ? "" : "下一頁", "返回");
 }
 
 void drawEmotionObservation() {
@@ -4032,32 +4162,31 @@ void showEmotionSettings() {
   screenNow = Screen::EmotionSettings;
   drawEmotionMatrixBackground();
   drawEmotionConnectionIndicator();
+  static const char* pageTitles[] = {"填寫提醒", "提醒方式", "提醒音量"};
   useUIFont(1); M5.Display.setTextDatum(top_left); M5.Display.setTextColor(emotionTheme(100), TFT_BLACK);
-  M5.Display.drawString("情緒觀察設定 " + String(emotionSettingsPage + 1) + "/2", 20, 5);
-  M5.Display.setTextColor(emotionTheme(70), TFT_BLACK);
-  M5.Display.drawString(emotionSettingsPage ? "提醒方式" : "填寫提醒", 12, 31);
-  if (!emotionSettingsPage) {
-    const char* modes[] = {"關閉", "整點提醒", "固定鬧鐘提醒"};
-    drawEmotionRow(53, "提醒模式", modes[emotionReminderMode], true);
+  M5.Display.drawString("情緒觀察設定 " + String(emotionSettingsPage + 1) + "/3 · " + pageTitles[emotionSettingsPage], 20, 5);
+  if (emotionSettingsPage == 0) {
+    const char* modes[] = {"關閉", "整點提醒", "固定鬧鐘"};
+    drawEmotionBigRow(0, "提醒模式", modes[emotionReminderMode], true);
     if (emotionReminderMode == 1) {
-      drawEmotionRow(84, "開始時間", emotionReminderTimeText(emotionReminderWindowStart), true);
-      drawEmotionRow(115, "結束時間", emotionReminderTimeText(emotionReminderWindowEnd), true);
-      drawEmotionRow(146, "提醒間隔", String(emotionReminderIntervalMinutes) + " 分鐘", true);
+      drawEmotionBigRow(1, "開始時間", emotionReminderTimeText(emotionReminderWindowStart), true);
+      drawEmotionBigRow(2, "結束時間", emotionReminderTimeText(emotionReminderWindowEnd), true);
+      drawEmotionBigRow(3, "提醒間隔", String(emotionReminderIntervalMinutes) + " 分鐘", true);
     } else if (emotionReminderMode == 2) {
-      drawEmotionRow(84, "固定時間 1", emotionReminderTimeText(emotionReminderTimes[0]), true);
-      drawEmotionRow(115, "固定時間 2", emotionReminderTimeText(emotionReminderTimes[1]), true);
-      drawEmotionRow(146, "固定時間 3", emotionReminderTimeText(emotionReminderTimes[2]), true);
+      drawEmotionBigRow(1, "固定時間 1", emotionReminderTimeText(emotionReminderTimes[0]), true);
+      drawEmotionBigRow(2, "固定時間 2", emotionReminderTimeText(emotionReminderTimes[1]), true);
+      drawEmotionBigRow(3, "固定時間 3", emotionReminderTimeText(emotionReminderTimes[2]), true);
     }
-    drawEmotionBottomBar("", "下一頁", "完成");
-  } else {
+  } else if (emotionSettingsPage == 1) {
     const char* sounds[] = {"打版", "磬聲", "流水聲", "水滴聲"};
-    drawEmotionRow(53, "振動", emotionReminderVibration ? "開" : "關", true);
-    drawEmotionRow(84, "鬧鐘", emotionReminderSound ? "開" : "關", true);
-    drawEmotionRow(115, "提醒時間", String(emotionReminderDurationSeconds) + " 秒", true);
-    drawEmotionRow(146, "鬧鐘鈴聲", sounds[emotionReminderSoundChoice], true);
-    drawEmotionRow(177, "音量", String(emotionReminderVolume) + "%", true);
-    drawEmotionBottomBar("上一頁", "", "完成");
+    drawEmotionBigRow(0, "振動", emotionReminderVibration ? "開" : "關", true);
+    drawEmotionBigRow(1, "鬧鐘", emotionReminderSound ? "開" : "關", true);
+    drawEmotionBigRow(2, "提醒時間", String(emotionReminderDurationSeconds) + " 秒", true);
+    drawEmotionBigRow(3, "鬧鐘鈴聲", sounds[emotionReminderSoundChoice], true);
+  } else {
+    drawEmotionBigRow(0, "音量", String(emotionReminderVolume) + "%", true);
   }
+  drawEmotionBottomBar(emotionSettingsPage ? "上一頁" : "", emotionSettingsPage < 2 ? "下一頁" : "", "完成");
 }
 
 String emotionUuid() {
@@ -4466,6 +4595,7 @@ bool loadEmotionRecordStats() {
 }
 
 void showEmotionRecords(bool refresh) {
+  emotionRecordsPage = 0;
   screenNow = Screen::EmotionRecords;
   if (refresh) {
     DynamicJsonDocument cached(4096);
@@ -4769,8 +4899,10 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     }
     if (t.y >= 210) {
       haptic(12);
-      if (t.x < 107) showEmotionRecords(true);
-      else if (t.x >= 214) showEmotionObservation(false);
+      if (t.x < 107 && emotionRecordsPage) { emotionRecordsPage = 0; drawEmotionRecords(); }
+      else if (t.x < 107) showEmotionRecords(true);
+      else if (t.x < 214 && !emotionRecordsPage) { emotionRecordsPage = 1; drawEmotionRecords(); }
+      else if (t.x >= 214) { emotionRecordsPage = 0; showEmotionObservation(false); }
     }
     return;
   }
@@ -4787,12 +4919,14 @@ void handleEmotionTouch(const m5::touch_detail_t& t) {
     haptic(12);
     if (t.y >= 210) {
       if (t.x < 107 && emotionSettingsPage) { --emotionSettingsPage; showEmotionSettings(); }
-      else if (t.x < 214 && !emotionSettingsPage) { ++emotionSettingsPage; showEmotionSettings(); }
+      else if (t.x >= 107 && t.x < 214 && emotionSettingsPage < 2) { ++emotionSettingsPage; showEmotionSettings(); }
       else if (t.x >= 214) { saveSettings(); showEmotionObservation(false); }
       return;
     }
-    if (t.y < 53 || t.y >= 208) return;
-    int row = constrain((t.y - 53) / 31, 0, 4);
+    if (t.y < EMOTION_BIG_ROW_TOP || t.y >= EMOTION_BIG_ROW_TOP + 4 * EMOTION_BIG_ROW_PITCH) return;
+    int row = constrain((t.y - EMOTION_BIG_ROW_TOP) / EMOTION_BIG_ROW_PITCH, 0, 3);
+    if (emotionSettingsPage == 2) row = row == 0 ? 4 : -1;  // page 3 only has the volume row
+    if (row < 0) return;
     if (!emotionSettingsPage) {
       if (row == 0) {
         emotionReminderMode = (emotionReminderMode + 1) % 3;
@@ -5081,6 +5215,7 @@ void handleClockTouch(const m5::touch_detail_t& t) {
       manualNightLightActive = !manualNightLightActive;
       updateAlarmBaseLights(millis());
     } else {
+      menuPage = 0;
       showMenu();
     }
   }
@@ -5199,6 +5334,14 @@ void handleTouch() {
   if (t.wasPressed() || t.isPressed() || t.wasReleased()) lastUserActivity = millis();
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings || screenNow == Screen::EmotionReminder) { handleEmotionTouch(t); return; }
   if (screenNow == Screen::HassAssist) {
+    if (t.wasPressed() && hassAssistReplyActive()) {
+      // Any touch while waiting for / playing the reply stops it at once.
+      haptic(15);
+      interruptHassAssistReply();
+      hassAssistTouchActive = false;
+      if (t.y >= 210 && t.x >= 214) { hassAssistReturnToClock = false; screenNow = Screen::Clock; drawClock(true); drawAstronaut(); }
+      return;
+    }
     bool onMic = t.x > 105 && t.x < 215 && t.y < 175
       && sq((int)t.x - 160) + sq((int)t.y - 117) <= 60 * 60;
     if (t.wasPressed() && onMic) {
@@ -5322,6 +5465,23 @@ void handleTouch() {
     }
     return;
   }
+  if (screenNow == Screen::MeditationSettings && meditationSettingsPage == 0) {
+    // Preset times: drag the slider (1-60 min); save when released.
+    static int8_t sliderRow = -1;
+    if (t.wasPressed()) {
+      int row = settingsRowAt(t.y);
+      sliderRow = (row == 0 || row == 1) ? row : -1;
+    }
+    if (sliderRow >= 0 && (t.isPressed() || t.wasReleased())) {
+      int next = sliderValueAt(t.x, 1, 60);
+      if (next != meditationPresetMinutes[sliderRow]) {
+        meditationPresetMinutes[sliderRow] = next;
+        drawSettingsSliderRow(sliderRow, sliderRow ? "Preset time 2" : "Preset time 1", next, 1, 60, "min");
+      }
+      if (t.wasReleased()) { sliderRow = -1; saveSettings(); }
+      return;
+    }
+  }
   if (screenNow == Screen::MeditationSettings && t.wasReleased()) {
     haptic(15);
     if (t.y >= 210) {
@@ -5330,11 +5490,10 @@ void handleTouch() {
       else if (t.x >= 214) showMeditation();
       return;
     }
-    if (t.y >= 47 && t.y < 203) {
-      int row = constrain((t.y - 47) / 39, 0, 3);
+    if (settingsRowAt(t.y) >= 0) {
+      int row = settingsRowAt(t.y);
       if (!meditationSettingsPage) {
-        if (row == 0) meditationPresetMinutes[0] = meditationPresetMinutes[0] >= 60 ? 1 : meditationPresetMinutes[0] + 1;
-        else if (row == 1) meditationPresetMinutes[1] = meditationPresetMinutes[1] >= 120 ? 1 : meditationPresetMinutes[1] + 5;
+        if (row < 2) return;  // preset times are handled by the sliders above
         else if (row == 2) meditationSoundEnabled = !meditationSoundEnabled;
         else meditationLightEnabled = !meditationLightEnabled;
       } else if (meditationSettingsPage == 1) {
@@ -5356,12 +5515,19 @@ void handleTouch() {
   haptic();
   if (t.y >= 210 && t.x >= 214) { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); return; }
   if (screenNow == Screen::Menu) {
-    if (t.y >= 38 && t.y < 67) runWifiPortal();
-    else if (t.y < 96) showFaces();
-    else if (t.y < 125) { clockSettingsPage = 0; showSettings(); }
-    else if (t.y < 154) showAlarms();
-    else if (t.y < 183) { meditationSettingsPage = 0; showMeditationSettings(); }
-    else if (t.y < 212) showFirmwareUpdate();
+    if (t.y >= 210) {
+      if (t.x < 107 && menuPage) { menuPage = 0; showMenu(); }
+      else if (t.x >= 107 && t.x < 214 && !menuPage) { menuPage = 1; showMenu(); }
+      return;
+    }
+    int row = settingsRowAt(t.y);
+    int item = row < 0 ? -1 : menuPage * 4 + row;
+    if (item == 0) runWifiPortal();
+    else if (item == 1) showFaces();
+    else if (item == 2) { clockSettingsPage = 0; showSettings(); }
+    else if (item == 3) showAlarms();
+    else if (item == 4) { meditationSettingsPage = 0; showMeditationSettings(); }
+    else if (item == 5) showFirmwareUpdate();
   } else if (screenNow == Screen::Faces) {
     if (t.y >= 52 && t.y < 196) {
       int selected = (t.y - 52) / 48;
@@ -5391,29 +5557,33 @@ void handleTouch() {
       ++alarmPage; showAlarms();
     }
   } else if (screenNow == Screen::Settings) {
+    int row = settingsRowAt(t.y);
     if (t.y >= 210) {
       if (t.x < 107) {
-        if (clockSettingsPage) clockSettingsPage = 0; else syncTime();
-      } else if (t.x < 214) {
-        if (!clockSettingsPage) clockSettingsPage = 1; else saveSettings();
+        if (clockSettingsPage) --clockSettingsPage; else syncTime();
+      } else if (t.x < 214 && clockSettingsPage < 2) {
+        ++clockSettingsPage;
       }
-    } else if (!clockSettingsPage) {
-      if (t.y >= 36 && t.y < 62) { timeZoneIndex = (timeZoneIndex + 1) % TIME_ZONE_COUNT; syncTime(); }
-      else if (t.y < 90) adaptiveBrightness = !adaptiveBrightness;
-      else if (t.y < 118) dayBrightness = dayBrightness >= 100 ? 20 : dayBrightness + 10;
-      else if (t.y < 146) nightBrightness = nightBrightness >= 100 ? 5 : nightBrightness + 5;
-      else if (t.y < 174) alarmVolume = alarmVolume >= 100 ? 10 : alarmVolume + 10;
-      else if (t.y < 210) cycleScreenOffTime();
+    } else if (row < 0) {
+      return;
+    } else if (clockSettingsPage == 0) {
+      if (row == 0) { timeZoneIndex = (timeZoneIndex + 1) % TIME_ZONE_COUNT; syncTime(); }
+      else if (row == 1) adaptiveBrightness = !adaptiveBrightness;
+      else if (row == 2) dayBrightness = dayBrightness >= 100 ? 20 : dayBrightness + 10;
+      else nightBrightness = nightBrightness >= 100 ? 5 : nightBrightness + 5;
+    } else if (clockSettingsPage == 1) {
+      if (row == 0) alarmVolume = alarmVolume >= 100 ? 10 : alarmVolume + 10;
+      else if (row == 1) cycleScreenOffTime();
+      else if (row == 2) use24HourTime = !use24HourTime;
+      else flatVirtualButtonsEnabled = !flatVirtualButtonsEnabled;
     } else {
-      if (t.y >= 36 && t.y < 62) use24HourTime = !use24HourTime;
-      else if (t.y < 90) flatVirtualButtonsEnabled = !flatVirtualButtonsEnabled;
-      else if (t.y < 118) nightLightEnabled = !nightLightEnabled;
-      else if (t.y < 146) {
+      if (row == 0) nightLightEnabled = !nightLightEnabled;
+      else if (row == 1) {
         const uint32_t colors[] = {0xFFF0C8, 0xFFFFFF, 0xFFD080, 0x80B8FF, 0xFF9090};
         int next = 0; for (int i=0;i<5;++i) if (nightLightColor==colors[i]) next=(i+1)%5;
         nightLightColor=colors[next];
-      } else if (t.y < 174) nightLightBrightness = nightLightBrightness >= 100 ? 5 : nightLightBrightness + 5;
-      else if (t.y < 210) nightLightMode = (nightLightMode + 1) % 3;
+      } else if (row == 2) nightLightBrightness = nightLightBrightness >= 100 ? 5 : nightLightBrightness + 5;
+      else nightLightMode = (nightLightMode + 1) % 3;
     }
     saveSettings();
     m5::rtc_datetime_t brightnessNow; getClockDateTime(&brightnessNow); applyDisplayBrightness(brightnessNow);
@@ -5721,8 +5891,8 @@ bool applyMqttSettings(const String& payload, String& error) {
   JsonObjectConst meditation = root["meditation"];
   if (!meditation.isNull()) {
     JsonArrayConst presets = meditation["preset_minutes"];
-    if (presets.size() > 0) meditationPresetMinutes[0] = constrain(presets[0].as<int>(), 1, 180);
-    if (presets.size() > 1) meditationPresetMinutes[1] = constrain(presets[1].as<int>(), 1, 180);
+    if (presets.size() > 0) meditationPresetMinutes[0] = constrain(presets[0].as<int>(), 1, 60);
+    if (presets.size() > 1) meditationPresetMinutes[1] = constrain(presets[1].as<int>(), 1, 60);
     if (meditation["sound_enabled"].is<bool>()) meditationSoundEnabled = meditation["sound_enabled"];
     if (meditation["start_sound"].is<int>()) meditationStartSound = constrain(meditation["start_sound"].as<int>(), 0, 3);
     if (meditation["start_volume"].is<int>()) meditationStartVolume = constrain(meditation["start_volume"].as<int>(), 5, 100);
@@ -5959,7 +6129,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
       page += "</div></details>";
     }
   } else if (pageId == "meditation") {
-    page += "<h2>" + tr("Meditation timer", "靜心時鐘") + "</h2><div class='grid'><label class='field'>" + tr("Preset time 1 (minutes)", "預設時間 1（分鐘）") + "<input type='number' min='1' max='180' name='medPreset1' value='" + String(meditationPresetMinutes[0]) + "'></label><label class='field'>" + tr("Preset time 2 (minutes)", "預設時間 2（分鐘）") + "<input type='number' min='1' max='180' name='medPreset2' value='" + String(meditationPresetMinutes[1]) + "'></label></div>";
+    page += "<h2>" + tr("Meditation timer", "靜心時鐘") + "</h2><div class='grid'><label class='field'>" + tr("Preset time 1 (minutes)", "預設時間 1（分鐘）") + "<input type='number' min='1' max='60' name='medPreset1' value='" + String(meditationPresetMinutes[0]) + "'></label><label class='field'>" + tr("Preset time 2 (minutes)", "預設時間 2（分鐘）") + "<input type='number' min='1' max='60' name='medPreset2' value='" + String(meditationPresetMinutes[1]) + "'></label></div>";
     page += "<label class='check'><input type='checkbox' name='medSoundEnabled'" + String(meditationSoundEnabled ? " checked" : "") + ">" + tr("Enable sound reminders", "啟用聲音提醒") + "</label>";
     const char* soundsEn[] = {"Da Ban", "Chime", "Stream", "Water drop"}; const char* soundsZh[] = {"打版", "磬聲", "流水聲", "水滴聲"};
     page += "<label class='field'>" + tr("Start sound", "開始計時音效") + "<select id='medStartSound' name='medStartSound'>";
@@ -6279,8 +6449,8 @@ void setupSettingsServer() {
         if (oldHour != alarms[i].hour || oldMinute != alarms[i].minute || oldWeekdays != alarms[i].weekdays || (!oldEnabled && alarms[i].enabled)) alarms[i].lastDay = -1;
       }
     } else if (pageId == "meditation") {
-      meditationPresetMinutes[0] = constrain(settingsServer.arg("medPreset1").toInt(), 1, 180);
-      meditationPresetMinutes[1] = constrain(settingsServer.arg("medPreset2").toInt(), 1, 180);
+      meditationPresetMinutes[0] = constrain(settingsServer.arg("medPreset1").toInt(), 1, 60);
+      meditationPresetMinutes[1] = constrain(settingsServer.arg("medPreset2").toInt(), 1, 60);
       meditationSoundEnabled = settingsServer.hasArg("medSoundEnabled");
       meditationStartSound = constrain(settingsServer.arg("medStartSound").toInt(), 0, 3);
       meditationStartVolume = constrain(settingsServer.arg("medStartVolume").toInt(), 5, 100);
@@ -6493,10 +6663,24 @@ void loop() {
     }
   }
   maintainSavedWifi(nowMs);
-  if (screenNow != Screen::EmotionObservation && screenNow != Screen::EmotionSettings
-      && screenNow != Screen::EmotionReminder && WiFi.status() == WL_CONNECTED
-      && emotionPendingCount && nowMs - emotionLastQueueSyncAt >= 5000UL) {
-    if (flushOneEmotionRecord()) Serial.printf("[emotion] queued record synced; remaining=%u\n", emotionPendingCount);
+  // Upload the offline emotion queue in the background on every screen.
+  // Skip only while audio must not stutter (alarm ringing, Assist recording
+  // or speaking), and back off after failures so a dead network does not
+  // keep freezing the UI with 8 s HTTPS timeouts.
+  static uint8_t emotionSyncFailures = 0;
+  uint32_t emotionSyncInterval = emotionSyncFailures ? min(300000UL, 15000UL << min<uint8_t>(emotionSyncFailures - 1, 5)) : 5000UL;
+  if (WiFi.status() == WL_CONNECTED && emotionPendingCount && alarmActive < 0
+      && !hassAssistMicRunning && !hassAssistAudioData && !hassAssistMp3Decoder
+      && nowMs - emotionLastQueueSyncAt >= emotionSyncInterval) {
+    if (flushOneEmotionRecord()) {
+      emotionSyncFailures = 0;
+      Serial.printf("[emotion] queued record synced; remaining=%u\n", emotionPendingCount);
+    } else {
+      emotionLastQueueSyncAt = millis();
+      if (emotionSyncFailures < 250) ++emotionSyncFailures;
+      Serial.printf("[emotion] background sync failed (%u); retry in %lu s\n", emotionSyncFailures,
+                    (unsigned long)(min(300000UL, 15000UL << min<uint8_t>(emotionSyncFailures - 1, 5)) / 1000));
+    }
   }
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings) {
     bool redrawConnection = false;

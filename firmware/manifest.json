@@ -1,7 +1,7 @@
 {
-  "version": "2.9.33",
+  "version": "2.9.34",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "dab61398fb65d87cc3f723c034c5a5ae199b769b5ffecc263b9801859ee4edce",
-  "size": 4611088,
-  "notes": "Smoother UI (fast font lookup), device name in the status bar, screen night light (long press), smoother Matrix rain with katakana, emotion: long-press middle to force sync, always-fresh statistics, offline storage auto-format."
+  "sha256": "147097ef2a4f6edf409ddd561610939b5760b4f65296233a37af61736733c777",
+  "size": 4614064,
+  "notes": "Four large rows per page on device and emotion settings/records, Wi-Fi setup Back button, interruptible HASS Assist replies, meditation preset sliders (1-60 min), emotion background sync on every screen with failure back-off."
 }
