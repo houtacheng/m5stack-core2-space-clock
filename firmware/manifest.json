@@ -1,7 +1,7 @@
 {
-  "version": "2.9.32",
+  "version": "2.9.33",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "4021c7957c4b6aebff47e5adca5d326840381b85abc52aab7a157bab428c4f8c",
-  "size": 4255280,
-  "notes": "New devices: invalid RTC no longer crashes the clock and the Wi-Fi setup hotspot opens automatically. Assist: common Chinese glyphs, wrapped replies, streaming voice playback, hold-to-talk from the clock, wake word on any screen."
+  "sha256": "dab61398fb65d87cc3f723c034c5a5ae199b769b5ffecc263b9801859ee4edce",
+  "size": 4611088,
+  "notes": "Smoother UI (fast font lookup), device name in the status bar, screen night light (long press), smoother Matrix rain with katakana, emotion: long-press middle to force sync, always-fresh statistics, offline storage auto-format."
 }
