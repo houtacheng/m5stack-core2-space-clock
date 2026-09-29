@@ -364,6 +364,11 @@ M5Canvas companionButtonCanvas(&M5.Display);
 M5Canvas meditationCardCanvas(&M5.Display);
 M5Canvas matrixCanvas(&M5.Display);
 M5Canvas firmwareProgressCanvas(&M5.Display);
+// Off-screen buffers so the clock can tick every second without clearing the
+// panel first (clearing then drawing is what shows up as a black flash).
+M5Canvas spaceTimeCanvas(&M5.Display);
+M5Canvas clockSecondsCanvas(&M5.Display);
+bool spaceTimeCanvasReady = false, clockSecondsCanvasReady = false;
 bool matrixCanvasReady = false;
 bool matrixMemoryErrorDrawn = false;
 bool firmwareProgressCanvasReady = false;
@@ -1241,7 +1246,7 @@ void drawMatrixClockPanel(M5Canvas& canvas) {
   char buf[24];
   drawMatrixGlassPanel(canvas);
   int shownHour = use24HourTime ? dt.time.hours : (dt.time.hours % 12 ? dt.time.hours % 12 : 12);
-  snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", shownHour, dt.time.minutes, dt.time.seconds);
   // The reference look uses a heavy white time with a quiet phosphor shadow,
   // while secondary information stays in the selected rain colour.
   canvas.setFont(&SourceHanSansTC_Medium28pt7b); canvas.setTextSize(1);
@@ -1478,16 +1483,36 @@ void drawClock(bool full = false) {
   if (clockFace == ClockFace::Space) {
     // The clock owns x >= 116; the astronaut owns x <= 112. Keeping these
     // regions disjoint prevents the minute repaint from cutting the sprite.
-    M5.Display.fillRect(116, 116, 204, 92, BG);
-    M5.Display.setTextColor(alarmActive >= 0 ? TFT_RED : FG, BG);
-    M5.Display.setTextDatum(top_left);
-    useUILargeFont();
     int shownHour = use24HourTime ? dt.time.hours : (dt.time.hours % 12 ? dt.time.hours % 12 : 12);
-    snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
-    M5.Display.drawString(buf, 120, 116);
-    useUIMediumFont();
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
-    M5.Display.drawString(buf, 120, 174);
+    uint16_t fg = alarmActive >= 0 ? TFT_RED : FG;
+    if (spaceTimeCanvasReady) {
+      // Compose time, seconds and date off-screen, then push in one go.
+      M5Canvas& c = spaceTimeCanvas;
+      c.fillSprite(BG);
+      c.setTextColor(fg, BG);
+      c.setTextDatum(top_left);
+      c.setFont(&SourceHanSansTC_Medium28pt7b); c.setTextSize(1);
+      snprintf(buf, sizeof(buf), "%02d:%02d", shownHour, dt.time.minutes);
+      c.drawString(buf, 4, 0);
+      int secondsX = 4 + c.textWidth(buf) + 4;
+      c.setFont(&SourceHanSansTC_UI14pt8b);
+      c.setTextColor(0x9CF3, BG);
+      snprintf(buf, sizeof(buf), "%02d", dt.time.seconds);
+      c.drawString(buf, secondsX, 20);
+      c.setTextColor(fg, BG);
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
+      c.drawString(buf, 4, 58);
+      c.pushSprite(116, 116);
+    } else {
+      M5.Display.setTextColor(fg, BG);
+      M5.Display.setTextDatum(top_left);
+      useUILargeFont();
+      snprintf(buf, sizeof(buf), "%02d:%02d:%02d", shownHour, dt.time.minutes, dt.time.seconds);
+      M5.Display.drawString(buf, 120, 116);
+      useUIMediumFont();
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
+      M5.Display.drawString(buf, 120, 174);
+    }
   } else if (clockFace == ClockFace::Matrix) {
     // Matrix is always composed as one complete sprite frame. This avoids
     // partial redraws that show up as flicker on the Core2 TFT.
@@ -1516,8 +1541,22 @@ void drawClock(bool full = false) {
       snprintf(buf, sizeof(buf), "%04d-%02d-%02d", dt.date.year, dt.date.month, dt.date.date);
       M5.Display.fillRect(0, 181, 320, 34, TFT_BLACK);
       M5.Display.setTextDatum(middle_center); useUIMediumFont(); M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      M5.Display.drawString(buf, 160, 197);
+      M5.Display.drawString(buf, 140, 197);
       shownDay = dt.date.date;
+    }
+    // Seconds tick in their own small buffer to the right of the date.
+    snprintf(buf, sizeof(buf), "%02d", dt.time.seconds);
+    if (clockSecondsCanvasReady) {
+      clockSecondsCanvas.fillSprite(TFT_BLACK);
+      clockSecondsCanvas.fillRoundRect(8, 1, 52, 30, 7, 0x2124);
+      clockSecondsCanvas.setFont(&SourceHanSansTC_UI14pt8b); clockSecondsCanvas.setTextSize(1);
+      clockSecondsCanvas.setTextDatum(middle_center);
+      clockSecondsCanvas.setTextColor(TFT_WHITE, 0x2124);
+      clockSecondsCanvas.drawString(buf, 34, 16);
+      clockSecondsCanvas.pushSprite(248, 182);
+    } else {
+      M5.Display.setTextDatum(middle_center); useUIMediumFont(); M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+      M5.Display.drawString(buf, 280, 197);
     }
   }
 }
@@ -6621,6 +6660,10 @@ void setup() {
   meditationCardCanvas.createSprite(98, 96);
   firmwareProgressCanvas.setColorDepth(16);
   firmwareProgressCanvasReady = firmwareProgressCanvas.createSprite(292, 44) != nullptr;
+  spaceTimeCanvas.setPsram(true); spaceTimeCanvas.setColorDepth(16);
+  spaceTimeCanvasReady = spaceTimeCanvas.createSprite(204, 92) != nullptr;
+  clockSecondsCanvas.setColorDepth(16);
+  clockSecondsCanvasReady = clockSecondsCanvas.createSprite(64, 32) != nullptr;
   matrixCanvas.setPsram(true);
   matrixCanvas.setColorDepth(16);
   matrixCanvasReady = matrixCanvas.createSprite(320, 240) != nullptr;
@@ -6746,7 +6789,7 @@ void loop() {
     if (minuteChanged) {
       lastMinute = dt.time.minutes;
     }
-    if (alarmActive < 0 && (minuteChanged || clockFace != ClockFace::Space)) drawClock(false);
+    if (alarmActive < 0) drawClock(false);  // every face now shows seconds
   }
   drawMatrixRainFrame(nowMs);
   if (screenNow == Screen::Meditation && nowMs - lastClockDraw >= 1000) {
