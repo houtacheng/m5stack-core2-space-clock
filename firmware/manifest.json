@@ -1,7 +1,7 @@
 {
-  "version": "2.9.35",
+  "version": "2.9.36",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "a849597424458d05fe8783e5579eb7fb8c6e69300761d703e4214ef53e0560f5",
-  "size": 4614704,
-  "notes": "All clock faces show seconds; the Space and flip clocks now update off-screen so the display never flashes black."
+  "sha256": "7c38576e28bea21248d296f889e8e671213163a0c68f1e283ed4ea1d73f8dd3c",
+  "size": 4633584,
+  "notes": "Calendar: iCal subscription (set the URL in the web settings), long-press the clock to open; day / month (swipe left) / week (swipe right) views, sync button, time zone display, colours follow the clock face."
 }

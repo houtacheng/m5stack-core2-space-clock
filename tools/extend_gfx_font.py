@@ -47,6 +47,7 @@ def main():
     p.add_argument("--font", required=True)
     p.add_argument("--pixels", type=int, required=True)
     p.add_argument("--kana-only", action="store_true", help="only add katakana (keeps large fonts small)")
+    p.add_argument("--from-source", type=Path, nargs="*", help="only add characters used in these source files")
     a = p.parse_args()
     text = a.header.read_text(encoding="utf-8")
     bm = re.search(r"(const uint8_t (\w+)Bitmaps\[\] PROGMEM = \{)(.*?)(\n\};)", text, re.S)
@@ -57,8 +58,14 @@ def main():
     y_advance = int(re.search(r"0x[0-9A-Fa-f]+,\s*0x[0-9A-Fa-f]+,\s*(\d+)", text[text.index(f"const GFXfont {name}"):]).group(1))
     font = ImageFont.truetype(a.font, a.pixels)
     added = 0
-    wanted = set(range(0x30A1, 0x30F7)) if a.kana_only else common_chinese()
-    for code in sorted(wanted - set(glyphs)):
+    if a.from_source:
+        text = "".join(f.read_text(encoding="utf-8") for f in a.from_source)
+        wanted = {ord(c) for c in text if 0x20 < ord(c) <= 0xFFFF}
+    else:
+        wanted = set(range(0x30A1, 0x30F7)) if a.kana_only else common_chinese()
+    # Gap-filler entries (width 0) are placeholders, not real glyphs.
+    present = {c for c, g in glyphs.items() if c < 0x7F or g[1] or g[2]}
+    for code in sorted(wanted - present):
         ch = chr(code)
         l, t, r, b = font.getbbox(ch, anchor="ls")
         w, h = max(1, r - l), max(1, b - t)
@@ -76,7 +83,7 @@ def main():
     lines += ["};", "", f"const GFXfont {name} PROGMEM = {{",
               f"  (uint8_t*){name}Bitmaps, (GFXglyph*){name}Glyphs,", f"  0x20, 0x{last:04X}, {y_advance} }};", ""]
     a.header.write_text(text[:bm.start()] + "\n".join(lines), encoding="utf-8")
-    compact(a.header, 256 if a.kana_only else 64)
+    compact(a.header, 256 if (a.kana_only or a.from_source) else 64)
     print(f"{a.header.name}: added {added} glyphs, bitmap {len(bitmap)} bytes")
 
 

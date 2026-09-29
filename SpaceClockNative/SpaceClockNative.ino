@@ -40,9 +40,27 @@
 #endif
 #include "mqtt_guide.h"
 
-enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight };
+enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight, Calendar };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
+// Calendar (iCal subscription) state; drawing and parsing live further down.
+struct CalEvent {
+  time_t start;
+  time_t end;
+  bool allDay;
+  char title[72];
+  char location[48];
+};
+enum class CalView : uint8_t { Day, Week, Month };
+String calendarIcalUrl;
+CalEvent* calEvents = nullptr;
+int calEventCount = 0;
+static constexpr int CAL_MAX_EVENTS = 400;
+time_t calWindowStart = 0, calWindowEnd = 0;
+uint32_t calFetchedAt = 0;
+String calError;
+CalView calView = CalView::Day;
+time_t calViewDay = 0;  // local midnight of the selected day
 
 struct Alarm {
   uint8_t hour = 7;
@@ -605,6 +623,7 @@ void saveSettings() {
   prefs.putUChar("hassVol", hassAssistVolume);
   prefs.putBool("hassWake", hassAssistWakeWordEnabled);
   prefs.putUChar("hassMode", hassAssistVoiceMode);
+  prefs.putString("icalUrl", calendarIcalUrl);
   prefs.putUChar("emoMode", emotionReminderMode);
   prefs.putUShort("emoInterval", emotionReminderIntervalMinutes);
   prefs.putUShort("emoWinStart", emotionReminderWindowStart);
@@ -701,6 +720,7 @@ void loadSettings() {
   hassAssistWakeWordEnabled = prefs.getBool("hassWake", false);
   hassAssistVoiceMode = constrain((int)prefs.getUChar("hassMode", hassAssistWakeWordEnabled ? HASS_MODE_WAKE : HASS_MODE_TAP), 0, 2);
   hassAssistWakeWordEnabled = hassAssistVoiceMode == HASS_MODE_WAKE;
+  calendarIcalUrl = prefs.getString("icalUrl", "");
   hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
   emotionReminderMode = constrain((int)prefs.getUChar("emoMode", 0), 0, 2);
   emotionReminderIntervalMinutes = prefs.getUShort("emoInterval", 60);
@@ -5268,6 +5288,489 @@ bool deviceIsFlat() {
   return fabsf(az) > 0.82f && fabsf(ax) < 0.42f && fabsf(ay) < 0.42f;
 }
 
+
+// ---------------------------------------------------------------------------
+// Calendar (iCal subscription)
+// ---------------------------------------------------------------------------
+
+// Days since 1970-01-01 for a civil date (proleptic Gregorian).
+int64_t calDaysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+time_t calLocalTime(int y, int mo, int d, int h = 0, int mi = 0, int sec = 0) {
+  struct tm t = {};
+  t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d;
+  t.tm_hour = h; t.tm_min = mi; t.tm_sec = sec; t.tm_isdst = -1;
+  return mktime(&t);
+}
+
+time_t calLocalMidnight(time_t when) {
+  struct tm t; localtime_r(&when, &t);
+  return calLocalTime(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+}
+
+time_t calAddDays(time_t localMidnight, int days) {
+  struct tm t; localtime_r(&localMidnight, &t);
+  return calLocalTime(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday + days);
+}
+
+// Parse 20260929, 20260929T090000 or 20260929T090000Z.
+bool calParseDateTime(const String& value, time_t& out, bool& allDay) {
+  if (value.length() < 8) return false;
+  int y = value.substring(0, 4).toInt(), mo = value.substring(4, 6).toInt(), d = value.substring(6, 8).toInt();
+  allDay = value.length() < 15;
+  if (allDay) { out = calLocalTime(y, mo, d); return true; }
+  int h = value.substring(9, 11).toInt(), mi = value.substring(11, 13).toInt(), sec = value.substring(13, 15).toInt();
+  if (value.endsWith("Z")) out = (time_t)(calDaysFromCivil(y, mo, d) * 86400LL + h * 3600 + mi * 60 + sec);
+  else out = calLocalTime(y, mo, d, h, mi, sec);  // TZID: treated as device-local time
+  return true;
+}
+
+String calUnescape(String v) {
+  v.replace("\\n", " "); v.replace("\\N", " "); v.replace("\\,", ","); v.replace("\;", ";"); v.replace("\\\\", "\\");
+  v.trim();
+  return v;
+}
+
+void calAddOccurrence(time_t start, time_t duration, bool allDay, const String& title, const String& location) {
+  if (calEventCount >= CAL_MAX_EVENTS) return;
+  time_t end = start + duration;
+  if (end <= calWindowStart || start >= calWindowEnd) return;
+  CalEvent& e = calEvents[calEventCount++];
+  e.start = start; e.end = end; e.allDay = allDay;
+  strlcpy(e.title, title.length() ? title.c_str() : "(無標題)", sizeof(e.title));
+  strlcpy(e.location, location.c_str(), sizeof(e.location));
+}
+
+String calRulePart(const String& rule, const char* key) {
+  String k = String(key) + "=";
+  int p = rule.indexOf(k);
+  if (p < 0) return "";
+  p += k.length();
+  int e = rule.indexOf(';', p);
+  return e < 0 ? rule.substring(p) : rule.substring(p, e);
+}
+
+// Expand one VEVENT (with an optional simple RRULE) into the window.
+void calEmitEvent(time_t start, time_t end, bool allDay, const String& rrule, const time_t* exdates, int exCount,
+                  const String& title, const String& location) {
+  if (!start) return;
+  if (end <= start) end = start + (allDay ? 86400 : 3600);
+  time_t duration = end - start;
+  auto excluded = [&](time_t when) {
+    for (int i = 0; i < exCount; ++i) if (exdates[i] == when) return true;
+    return false;
+  };
+  if (!rrule.length()) { if (!excluded(start)) calAddOccurrence(start, duration, allDay, title, location); return; }
+  String freq = calRulePart(rrule, "FREQ");
+  int interval = max(1, (int)calRulePart(rrule, "INTERVAL").toInt());
+  int count = calRulePart(rrule, "COUNT").toInt();
+  time_t until = 0; bool untilAllDay;
+  String untilText = calRulePart(rrule, "UNTIL");
+  if (untilText.length()) calParseDateTime(untilText, until, untilAllDay);
+  if (untilText.length() && untilAllDay) until += 86399;
+  String byDay = calRulePart(rrule, "BYDAY");
+  struct tm base; localtime_r(&start, &base);
+  int emitted = 0;
+  for (int step = 0; step < 3000; ++step) {
+    // Candidate occurrences for this period.
+    time_t candidates[7]; int n = 0;
+    if (freq == "WEEKLY" && byDay.length()) {
+      static const char* codes[] = {"SU", "MO", "TU", "WE", "TH", "FR", "SA"};
+      time_t weekStart = calLocalTime(base.tm_year + 1900, base.tm_mon + 1, base.tm_mday - base.tm_wday + step * 7 * interval,
+                                      base.tm_hour, base.tm_min, base.tm_sec);
+      for (int wd = 0; wd < 7; ++wd) {
+        if (byDay.indexOf(codes[wd]) < 0) continue;
+        struct tm w; localtime_r(&weekStart, &w);
+        time_t c = calLocalTime(w.tm_year + 1900, w.tm_mon + 1, w.tm_mday + wd, base.tm_hour, base.tm_min, base.tm_sec);
+        if (c >= start) candidates[n++] = c;
+      }
+    } else {
+      int y = base.tm_year + 1900, mo = base.tm_mon + 1, d = base.tm_mday;
+      if (freq == "DAILY") d += step * interval;
+      else if (freq == "WEEKLY") d += step * 7 * interval;
+      else if (freq == "MONTHLY") mo += step * interval;
+      else if (freq == "YEARLY") y += step * interval;
+      else { if (!excluded(start)) calAddOccurrence(start, duration, allDay, title, location); return; }
+      time_t c = calLocalTime(y, mo, d, base.tm_hour, base.tm_min, base.tm_sec);
+      struct tm check; localtime_r(&c, &check);
+      if ((freq == "MONTHLY" || freq == "YEARLY") && check.tm_mday != d) continue;  // e.g. 31st in a short month
+      candidates[n++] = c;
+    }
+    for (int i = 0; i < n; ++i) {
+      time_t c = candidates[i];
+      if (until && c > until) return;
+      if (count && emitted >= count) return;
+      ++emitted;
+      if (c >= calWindowEnd) return;
+      if (!excluded(c)) calAddOccurrence(c, duration, allDay, title, location);
+    }
+  }
+}
+
+bool fetchCalendar(time_t aroundDay) {
+  calError = "";
+  if (!calendarIcalUrl.length()) { calError = "請先在網頁後台「日曆」填入 iCal 網址"; return false; }
+  if (WiFi.status() != WL_CONNECTED) { calError = "Wi-Fi 未連線"; return false; }
+  if (!calEvents) calEvents = (CalEvent*)heap_caps_malloc(sizeof(CalEvent) * CAL_MAX_EVENTS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!calEvents) { calError = "記憶體不足"; return false; }
+  // Window: from a week before the viewed month to about six weeks after it.
+  struct tm v; localtime_r(&aroundDay, &v);
+  time_t monthStart = calLocalTime(v.tm_year + 1900, v.tm_mon + 1, 1);
+  calWindowStart = calAddDays(monthStart, -7);
+  calWindowEnd = calAddDays(monthStart, 45);
+  calEventCount = 0;
+
+  String url = calendarIcalUrl;
+  if (url.startsWith("webcal://")) url = "https://" + url.substring(9);
+  WiFiClientSecure secure; secure.setInsecure(); secure.setTimeout(15);
+  WiFiClient plain;
+  HTTPClient http;
+  http.useHTTP10(true);  // plain bytes, server closes when done
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  bool https = url.startsWith("https://");
+  if (!(https ? http.begin(secure, url) : http.begin(plain, url))) { calError = "無法開啟 iCal 網址"; return false; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); calError = "iCal 下載失敗 HTTP " + String(code); return false; }
+  WiFiClient* stream = http.getStreamPtr();
+  stream->setTimeout(8);
+
+  bool inEvent = false;
+  time_t evStart = 0, evEnd = 0; bool evAllDay = false, endAllDay;
+  String rrule, title, location;
+  time_t exdates[16]; int exCount = 0;
+  String line = stream->readStringUntil('\n');
+  uint32_t lines = 0;
+  while (line.length() || stream->available() || http.connected()) {
+    // Unfold continuation lines (RFC 5545: next line starts with a space).
+    while (stream->available() && (stream->peek() == ' ' || stream->peek() == '\t')) {
+      stream->read();
+      String more = stream->readStringUntil('\n');
+      if (line.endsWith("\r")) line.remove(line.length() - 1);
+      line += more;
+    }
+    if (line.endsWith("\r")) line.remove(line.length() - 1);
+    if (++lines % 200 == 0) delay(0);
+    int colon = line.indexOf(':');
+    String name = colon > 0 ? line.substring(0, colon) : line;
+    String value = colon > 0 ? line.substring(colon + 1) : "";
+    int semi = name.indexOf(';');
+    String key = semi > 0 ? name.substring(0, semi) : name;
+    if (line == "BEGIN:VEVENT") {
+      inEvent = true; evStart = evEnd = 0; evAllDay = false; rrule = ""; title = ""; location = ""; exCount = 0;
+    } else if (line == "END:VEVENT") {
+      if (inEvent && name.indexOf("RECURRENCE-ID") < 0) calEmitEvent(evStart, evEnd, evAllDay, rrule, exdates, exCount, title, location);
+      inEvent = false;
+    } else if (inEvent) {
+      if (key == "DTSTART") calParseDateTime(value, evStart, evAllDay);
+      else if (key == "DTEND") calParseDateTime(value, evEnd, endAllDay);
+      else if (key == "SUMMARY") title = calUnescape(value);
+      else if (key == "LOCATION") location = calUnescape(value);
+      else if (key == "RRULE") rrule = value;
+      else if (key == "RECURRENCE-ID") { evStart = 0; }  // modified instance: skip to avoid duplicates
+      else if (key == "EXDATE") {
+        int from = 0;
+        while (from < (int)value.length() && exCount < 16) {
+          int comma = value.indexOf(',', from); if (comma < 0) comma = value.length();
+          bool ad; time_t ex;
+          if (calParseDateTime(value.substring(from, comma), ex, ad)) exdates[exCount++] = ex;
+          from = comma + 1;
+        }
+      }
+    }
+    if (!stream->available() && !http.connected()) break;
+    line = stream->readStringUntil('\n');
+  }
+  http.end();
+  // Sort by start time (insertion sort; the list is small).
+  for (int i = 1; i < calEventCount; ++i) {
+    CalEvent tmp = calEvents[i]; int j = i - 1;
+    while (j >= 0 && calEvents[j].start > tmp.start) { calEvents[j + 1] = calEvents[j]; --j; }
+    calEvents[j + 1] = tmp;
+  }
+  calFetchedAt = millis();
+  Serial.printf("[calendar] %u lines, %d events in window\n", (unsigned)lines, calEventCount);
+  return true;
+}
+
+bool calEventOnDay(const CalEvent& e, time_t dayStart) {
+  time_t dayEnd = calAddDays(dayStart, 1);
+  return e.start < dayEnd && e.end > dayStart;
+}
+
+// Calendar colours follow the active clock face.
+struct CalTheme {
+  uint16_t bg, panel, panelAlt, border, accent, title, text, muted, today, todayText, dot, weekend, outside;
+};
+CalTheme calTheme;
+
+void applyCalendarTheme() {
+  if (clockFace == ClockFace::Matrix) {
+    // Phosphor palette derived from the user's Matrix rain colour.
+    calTheme = {TFT_BLACK, matrixColor(10), matrixColor(16), matrixColor(38), matrixColor(100), matrixColor(100),
+                M5.Display.color565(215, 255, 225), matrixColor(58), matrixColor(34), TFT_WHITE, matrixColor(100),
+                matrixColor(80), matrixColor(26)};
+  } else if (clockFace == ClockFace::Minimal) {
+    // Flip clock: charcoal cards on black, white digits, amber accent.
+    calTheme = {TFT_BLACK, 0x2124, 0x18C3, 0x4208, 0xFD20, 0xFD20, TFT_WHITE, 0x9CF3, 0xFD20, TFT_BLACK, 0xFD20,
+                0xFB2C, 0x528A};
+  } else {
+    // Space face: the existing blue-grey scheme.
+    calTheme = {BG, PANEL, UI_PANEL_ALT, UI_BORDER, ACCENT, 0x65DF, TFT_WHITE, UI_MUTED, UI_BLUE, TFT_WHITE, 0x07E0,
+                0xFB2C, 0x528A};
+  }
+}
+
+void drawCalendarBottomBar(const char* left, const char* middle, const char* right) {
+  M5.Display.fillRect(0, 212, 320, 28, calTheme.bg);
+  M5.Display.drawFastHLine(8, 212, 304, calTheme.border);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+  M5.Display.drawString(left, 53, 227);
+  M5.Display.drawString(middle, 160, 227);
+  M5.Display.drawString(right, 267, 227);
+}
+
+static const char* const CAL_WEEKDAYS[] = {"日", "一", "二", "三", "四", "五", "六"};
+
+void drawCalendarHeader(const String& text) {
+  M5.Display.fillScreen(calTheme.bg);
+  useUIMediumFont();
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  // Device time zone (city + UTC offset) just left of the sync button.
+  time_t now = time(nullptr);
+  struct tm utc; gmtime_r(&now, &utc); utc.tm_isdst = -1;
+  long offsetMin = (long)difftime(now, mktime(&utc)) / 60;
+  struct tm local; localtime_r(&now, &local);
+  if (local.tm_isdst > 0) offsetMin += 60;
+  char offset[12];
+  if (offsetMin % 60) snprintf(offset, sizeof(offset), "%+ld:%02ld", offsetMin / 60, labs(offsetMin % 60));
+  else snprintf(offset, sizeof(offset), "%+ld", offsetMin / 60);
+  String zone = timeZoneIndex == 0 ? String("UTC") : String(TIME_ZONES[timeZoneIndex].city) + " " + offset;
+  useUIFont(1);
+  int zoneWidth = M5.Display.textWidth(zone);
+  M5.Display.setTextDatum(middle_right);
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  M5.Display.drawString(zone, 256, 15);
+  useUIMediumFont();
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  M5.Display.setClipRect(0, 0, max(40, 256 - zoneWidth - 8), 30);
+  M5.Display.drawString(text, 10, 3);
+  M5.Display.clearClipRect();
+  // Top-right "同步" button: tap to download the calendar right away.
+  M5.Display.fillRoundRect(262, 3, 54, 24, 6, calTheme.panel);
+  M5.Display.drawRoundRect(262, 3, 54, 24, 6, calTheme.accent);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.accent, calTheme.panel);
+  M5.Display.drawString("同步", 289, 15);
+  M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+}
+
+void drawCalendarMessage(const String& text) {
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  M5.Display.drawString(text, 160, 120);
+}
+
+String calTimeText(time_t t) {
+  struct tm tm; localtime_r(&t, &tm);
+  char b[8]; snprintf(b, sizeof(b), "%02d:%02d", tm.tm_hour, tm.tm_min);
+  return String(b);
+}
+
+void drawCalendarDay() {
+  struct tm d; localtime_r(&calViewDay, &d);
+  time_t today = calLocalMidnight(time(nullptr));
+  char head[40];
+  snprintf(head, sizeof(head), "%d月%d日 週%s%s", d.tm_mon + 1, d.tm_mday, CAL_WEEKDAYS[d.tm_wday], calViewDay == today ? " · 今天" : "");
+  drawCalendarHeader(head);
+  int shown = 0, total = 0;
+  for (int i = 0; i < calEventCount; ++i) if (calEventOnDay(calEvents[i], calViewDay)) ++total;
+  const int maxRows = total > 5 ? 4 : 5;  // keep the last slot for "還有 N 項"
+  for (int i = 0; i < calEventCount; ++i) {
+    const CalEvent& e = calEvents[i];
+    if (!calEventOnDay(e, calViewDay)) continue;
+    if (shown >= maxRows) continue;
+    int y = 34 + shown * 35;
+    const bool isToday = false;  // day rows use the normal text colour
+    uint16_t fill = shown & 1 ? calTheme.panelAlt : calTheme.panel;
+    M5.Display.fillRoundRect(6, y, 308, 32, 6, fill);
+    useUIFont(1);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(calTheme.accent, fill);
+    M5.Display.drawString(e.allDay ? "全天" : calTimeText(e.start), 12, y + 7);
+    M5.Display.setTextColor(isToday ? calTheme.todayText : calTheme.text, fill);
+    M5.Display.setClipRect(62, y, 248, 32);
+    String line = e.title;
+    if (e.location[0]) line += String(" · ") + e.location;
+    M5.Display.drawString(line, 62, y + 7);
+    M5.Display.clearClipRect();
+    ++shown;
+  }
+  if (!total) drawCalendarMessage(calError.length() ? calError : "今天沒有行程");
+  else if (total > shown) {
+    useUIFont(1); M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+    M5.Display.drawString("還有 " + String(total - shown) + " 項", 160, 34 + shown * 35 + 16);
+  }
+  drawCalendarBottomBar("前一天", "今天", "後一天");
+}
+
+void drawCalendarWeek() {
+  struct tm d; localtime_r(&calViewDay, &d);
+  time_t weekStart = calAddDays(calViewDay, -d.tm_wday);
+  struct tm ws; localtime_r(&weekStart, &ws);
+  time_t today = calLocalMidnight(time(nullptr));
+  char head[40]; snprintf(head, sizeof(head), "%d月%d日 起一週", ws.tm_mon + 1, ws.tm_mday);
+  drawCalendarHeader(head);
+  for (int i = 0; i < 7; ++i) {
+    time_t day = calAddDays(weekStart, i);
+    struct tm t; localtime_r(&day, &t);
+    int y = 33 + i * 26;
+    const bool isToday = day == today;
+    uint16_t fill = day == today ? calTheme.today : (i & 1 ? calTheme.panelAlt : calTheme.panel);
+    M5.Display.fillRoundRect(6, y, 308, 24, 5, fill);
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.setTextColor(calTheme.accent, fill);
+    char label[16]; snprintf(label, sizeof(label), "%s %d/%d", CAL_WEEKDAYS[t.tm_wday], t.tm_mon + 1, t.tm_mday);
+    M5.Display.drawString(label, 12, y + 12);
+    String summary; int count = 0;
+    for (int k = 0; k < calEventCount; ++k) {
+      if (!calEventOnDay(calEvents[k], day)) continue;
+      if (!count) summary = String(calEvents[k].allDay ? "" : calTimeText(calEvents[k].start) + " ") + calEvents[k].title;
+      ++count;
+    }
+    if (count > 1) summary += " +" + String(count - 1);
+    M5.Display.setTextColor(isToday ? calTheme.todayText : calTheme.text, fill);
+    M5.Display.setClipRect(78, y, 232, 24);
+    M5.Display.drawString(summary, 78, y + 12);
+    M5.Display.clearClipRect();
+  }
+  drawCalendarBottomBar("上週", "本週", "下週");
+}
+
+void drawCalendarMonth() {
+  struct tm d; localtime_r(&calViewDay, &d);
+  time_t first = calLocalTime(d.tm_year + 1900, d.tm_mon + 1, 1);
+  struct tm f; localtime_r(&first, &f);
+  time_t today = calLocalMidnight(time(nullptr));
+  char head[24]; snprintf(head, sizeof(head), "%d年%d月", d.tm_year + 1900, d.tm_mon + 1);
+  drawCalendarHeader(head);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  for (int c = 0; c < 7; ++c) {
+    M5.Display.setTextColor(c == 0 || c == 6 ? calTheme.weekend : calTheme.muted, calTheme.bg);
+    M5.Display.drawString(CAL_WEEKDAYS[c], 23 + c * 45, 40);
+  }
+  time_t gridStart = calAddDays(first, -f.tm_wday);
+  for (int cell = 0; cell < 42; ++cell) {
+    time_t day = calAddDays(gridStart, cell);
+    struct tm t; localtime_r(&day, &t);
+    int x = 1 + (cell % 7) * 45, y = 50 + (cell / 7) * 27;
+    bool inMonth = t.tm_mon == d.tm_mon;
+    bool selected = day == calViewDay;
+    uint16_t fill = day == today ? calTheme.today : (selected ? calTheme.panelAlt : calTheme.bg);
+    if (fill != calTheme.bg) M5.Display.fillRoundRect(x + 1, y + 1, 43, 25, 5, fill);
+    M5.Display.setTextColor(day == today ? calTheme.todayText : (inMonth ? calTheme.text : calTheme.outside), fill);
+    M5.Display.drawString(String(t.tm_mday), x + 22, y + 11);
+    int count = 0;
+    for (int k = 0; k < calEventCount && count < 3; ++k) if (calEventOnDay(calEvents[k], day)) ++count;
+    for (int i = 0; i < count; ++i) M5.Display.fillCircle(x + 22 - (count - 1) * 4 + i * 8, y + 22, 2, day == today ? calTheme.todayText : calTheme.dot);
+  }
+  drawCalendarBottomBar("上月", "本月", "下月");
+}
+
+void drawCalendar() {
+  if (screenNow != Screen::Calendar) return;
+  applyCalendarTheme();
+  if (calView == CalView::Day) drawCalendarDay();
+  else if (calView == CalView::Week) drawCalendarWeek();
+  else drawCalendarMonth();
+}
+
+void refreshCalendarIfNeeded(bool force = false) {
+  bool outside = calViewDay < calWindowStart || calAddDays(calViewDay, 1) > calWindowEnd;
+  if (!force && calFetchedAt && !outside && millis() - calFetchedAt < 900000UL) return;
+  drawCalendar();
+  useUIFont(1); M5.Display.setTextDatum(top_right); M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+  M5.Display.fillRoundRect(262, 3, 54, 24, 6, calTheme.panel);
+  M5.Display.setTextDatum(middle_center); M5.Display.setTextColor(calTheme.accent, calTheme.panel);
+  M5.Display.drawString("同步中", 289, 15);
+  fetchCalendar(calViewDay);
+}
+
+void showCalendar() {
+  screenNow = Screen::Calendar;
+  calView = CalView::Day;
+  calViewDay = calLocalMidnight(time(nullptr));
+  refreshCalendarIfNeeded();
+  drawCalendar();
+}
+
+void calendarNavigate(int direction) {
+  if (direction == 0) calViewDay = calLocalMidnight(time(nullptr));
+  else if (calView == CalView::Day) calViewDay = calAddDays(calViewDay, direction);
+  else if (calView == CalView::Week) calViewDay = calAddDays(calViewDay, 7 * direction);
+  else {
+    struct tm d; localtime_r(&calViewDay, &d);
+    calViewDay = calLocalTime(d.tm_year + 1900, d.tm_mon + 1 + direction, 1);
+  }
+  refreshCalendarIfNeeded();
+  drawCalendar();
+}
+
+void handleCalendarTap(int x, int y) {
+  if (y < 30 && x >= 256) {
+    haptic(15);
+    refreshCalendarIfNeeded(true);
+    drawCalendar();
+    if (calError.length()) drawCalendarMessage(calError);
+    return;
+  }
+  if (y >= 210) {
+    haptic(12);
+    calendarNavigate(x < 107 ? -1 : (x < 214 ? 0 : 1));
+    return;
+  }
+  if (calView == CalView::Month && y >= 50) {
+    struct tm d; localtime_r(&calViewDay, &d);
+    time_t first = calLocalTime(d.tm_year + 1900, d.tm_mon + 1, 1);
+    struct tm f; localtime_r(&first, &f);
+    int cell = constrain(x / 45, 0, 6) + constrain((y - 50) / 27, 0, 5) * 7;
+    calViewDay = calAddDays(first, cell - f.tm_wday);
+    calView = CalView::Day;
+    haptic(12);
+    drawCalendar();
+  } else if (calView == CalView::Week && y >= 33) {
+    struct tm d; localtime_r(&calViewDay, &d);
+    calViewDay = calAddDays(calViewDay, constrain((y - 33) / 26, 0, 6) - d.tm_wday);
+    calView = CalView::Day;
+    haptic(12);
+    drawCalendar();
+  }
+}
+
+void handleCalendarSwipe(bool left) {
+  haptic(12);
+  if (calView == CalView::Day) calView = left ? CalView::Month : CalView::Week;
+  else if (calView == CalView::Month && !left) calView = CalView::Day;
+  else if (calView == CalView::Week && left) calView = CalView::Day;
+  else return;
+  drawCalendar();
+}
+
 void fillNightLightScreen() {
   M5.Display.fillScreen(M5.Display.color565((nightLightColor >> 16) & 255, (nightLightColor >> 8) & 255, nightLightColor & 255));
 }
@@ -5356,6 +5859,29 @@ void handleTouch() {
     pressHandled = true;
     haptic(20);
     enterNightLightScreen();
+    return;
+  }
+  // Calendar: long-press the clock face to open, long-press to go back.
+  if (longHeld && !screenSleeping && alarmActive < 0 && screenNow == Screen::Clock && t.y < 210) {
+    pressHandled = true;
+    haptic(20);
+    showCalendar();
+    return;
+  }
+  if (screenNow == Screen::Calendar && !screenSleeping && !wakeTouchConsumed) {
+    if (longHeld) {
+      pressHandled = true;
+      haptic(20);
+      screenNow = Screen::Clock;
+      drawClock(true); drawAstronaut();
+      wakeTouchConsumed = true;
+      return;
+    }
+    if (t.wasReleased() && !pressHandled) {
+      int dx = (int)t.x - pressX;
+      if (abs(dx) >= 60) handleCalendarSwipe(dx < 0);
+      else if (!sliding) handleCalendarTap(t.x, t.y);
+    }
     return;
   }
   if (screenSleeping) {
@@ -6075,23 +6601,23 @@ void maintainMqtt(uint32_t nowMs) {
 void sendSettingsPage(const String& message = "", const String& requestedPage = "", const String& requestedLanguage = "") {
   String pageId = requestedPage.length() ? requestedPage : settingsServer.arg("page");
   String language = requestedLanguage.length() ? requestedLanguage : settingsServer.arg("lang");
-  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "firmware") pageId = "clock";
+  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "firmware") pageId = "clock";
   bool zh = language == "zh" || (!language.length());
   auto tr = [zh](const char* en, const char* zhText) -> String { return zh ? String(zhText) : String(en); };
   String page;
   page.reserve(24000);
   page = "<!doctype html><html lang='" + String(zh ? "zh-Hant" : "en") + "'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<title>Space Clock</title><style>html{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#08111f;color:#eef4ff;max-width:760px;margin:auto;padding:18px}"
-         "header{display:flex;align-items:center;justify-content:space-between;gap:12px}h1{color:#65b9ff;font-size:25px;margin:8px 0}h2{font-size:19px;margin:24px 0 8px}.muted{color:#aabbd0;font-size:14px}.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.tabs a,.lang{border:1px solid #344b63;border-radius:999px;padding:8px 12px;color:#c8d9ee;text-decoration:none;font-size:14px}.tabs a.active{background:#1688e5;border-color:#1688e5;color:white}.lang{white-space:nowrap}.panel{background:#101d2e;border:1px solid #263b52;border-radius:16px;padding:16px}.field{display:block;margin-top:15px;font-size:15px}.field input:not([type=checkbox]):not([type=radio]),.field select{display:block;width:100%;padding:11px;margin-top:6px;border-radius:9px;border:1px solid #52657a;background:#142236;color:white;font-size:16px}.field input[type=range]{padding:0}.field input[type=color]{height:48px;padding:5px}.check{display:flex;align-items:center;gap:9px;margin:15px 0}.check input{flex:none;width:20px;height:20px;margin:0;accent-color:#1688e5}fieldset.field{border:1px solid #52657a;border-radius:12px;padding:4px 14px 2px}fieldset.field legend{padding:0 6px}.card{background:#0b1727;border:1px solid #344b63;border-radius:12px;padding:12px;margin:12px 0}.card summary{cursor:pointer;font-weight:700}.days{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px}.days label{white-space:nowrap}.btn,button{display:block;width:100%;padding:13px;margin-top:18px;border:0;border-radius:10px;background:#1688e5;color:white;font-size:16px;text-align:center;text-decoration:none;cursor:pointer}.btn.secondary{background:#20354e}.ok{color:#70e39a}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:520px){body{padding:12px}.panel{padding:13px}.grid{grid-template-columns:1fr}}</style></head><body>";
+         "header{display:flex;align-items:center;justify-content:space-between;gap:12px}h1{color:#65b9ff;font-size:25px;margin:8px 0}h2{font-size:19px;margin:24px 0 8px}.muted{color:#aabbd0;font-size:14px}.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.tabs a,.lang{border:1px solid #344b63;border-radius:999px;padding:8px 12px;color:#c8d9ee;text-decoration:none;font-size:14px}.tabs a.active{background:#1688e5;border-color:#1688e5;color:white}.lang{white-space:nowrap}.panel{background:#101d2e;border:1px solid #263b52;border-radius:16px;padding:16px}.field{display:block;margin-top:15px;font-size:15px}.field input:not([type=checkbox]):not([type=radio]),.field select{display:block;width:100%;padding:11px;margin-top:6px;border-radius:9px;border:1px solid #52657a;background:#142236;color:white;font-size:16px}.field input[type=range]{padding:0}.field input[type=color]{height:48px;padding:5px}.check{display:flex;align-items:center;gap:9px;margin:15px 0}.check input{flex:none;width:20px;height:20px;margin:0;accent-color:#1688e5}fieldset.field{border:1px solid #52657a;border-radius:12px;padding:4px 14px 2px}fieldset.field legend{padding:0 6px}.card{background:#0b1727;border:1px solid #344b63;border-radius:12px;padding:12px;margin:12px 0}.card summary{cursor:pointer;font-weight:700}.days{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px}.days label{white-space:nowrap}.btn,button{display:block;width:100%;padding:13px;margin-top:18px;border:0;border-radius:10px;background:#1688e5;color:white;font-size:16px;text-align:center;text-decoration:none;cursor:pointer}.btn.secondary{background:#20354e}.ok{color:#70e39a}.warn{color:#ffb454;background:#2a1f0e;border:1px solid #6b4b1a;border-radius:9px;padding:10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:520px){body{padding:12px}.panel{padding:13px}.grid{grid-template-columns:1fr}}</style></head><body>";
   m5::rtc_datetime_t webNow; getClockDateTime(&webNow);
   char webTime[24]; snprintf(webTime, sizeof(webTime), "%04d-%02d-%02d %02d:%02d:%02d", webNow.date.year, webNow.date.month, webNow.date.date, webNow.time.hours, webNow.time.minutes, webNow.time.seconds);
   page += "<header><div><h1>" + tr("Space Clock settings", "太空時鐘設定") + "</h1><div class='muted'>" + tr("Device", "設備") + ": <b>" + htmlEscape(deviceName) + "</b> · " + tr("Network name", "網路名稱") + ": <b>" + networkHostname() + "</b><br>" + tr("IP", "設備 IP") + ": <b>" + WiFi.localIP().toString() + "</b> · " + tr("Device time", "裝置時間") + ": <b>" + webTime + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</div></div>";
   page += "<a class='lang' href='/?page=" + pageId + "&lang=" + String(zh ? "en" : "zh") + "'>" + tr("中文", "English") + "</a></header>";
-  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "hass", "companion", "firmware"};
-  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "HASS Assist", "Companion", "Firmware"};
-  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "韌體更新"};
+  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "hass", "companion", "calendar", "firmware"};
+  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "HASS Assist", "Companion", "Calendar", "Firmware"};
+  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "日曆", "韌體更新"};
   page += "<nav class='tabs'>";
-  for (int i = 0; i < 9; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
+  for (int i = 0; i < 10; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
   page += "</nav>";
   if (message.length()) page += "<p class='ok'>" + htmlEscape(message) + "</p>";
   if (pageId == "emotion") {
@@ -6249,6 +6775,14 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "</select></label>";
     page += "<label class='field'>" + tr("Voice reply volume", "語音回覆音量") + ": <output id='hassVolumeOut'>" + String(hassAssistVolume) + "%</output><input type='range' min='5' max='100' step='5' name='hassVolume' value='" + String(hassAssistVolume) + "' oninput='hassVolumeOut.value=this.value+\"%\"'></label>";
     page += "<p class='muted'>" + tr("The token is stored only in this Core2's Preferences and is never published to GitHub or MQTT. Because this settings page is local HTTP, configure it only on a trusted Wi-Fi network. MP3 and WAV voice replies are supported.", "權杖只會保存在這台 Core2 的偏好設定，不會上傳 GitHub 或 MQTT。因本設定頁是區域網路 HTTP，請只在可信任的 Wi-Fi 設定。支援 MP3 與 WAV 語音回覆。") + "</p>";
+  } else if (pageId == "calendar") {
+    page += "<h2>" + tr("Calendar", "日曆") + "</h2><p class='muted'>" + tr("Paste an iCal (.ics) subscription URL, e.g. Google Calendar's \"Secret address in iCal format\". On the clock, long-press the screen to open the calendar; swipe left for month, right for week; long-press again to return.", "貼上 iCal（.ics）訂閱網址，例如 Google 日曆的「iCal 格式的私人網址」。在時鐘畫面長按進入日曆；往左滑為月模式、往右滑為週模式；再長按回到時鐘。") + "</p>";
+    page += "<label class='field'>" + tr("iCal URL", "iCal 網址") + "<input name='icalUrl' inputmode='url' placeholder='https://calendar.google.com/calendar/ical/.../basic.ics' value='" + htmlEscape(calendarIcalUrl) + "'></label>";
+    if (calendarIcalUrl.indexOf("calendar.google.com") >= 0 && calendarIcalUrl.indexOf("/public/") >= 0) {
+      page += "<p class='warn'>" + tr("This is Google's public address. Unless the calendar is public, it only shows \"busy\". Use \"Secret address in iCal format\" (contains private-...) to see event titles.", "這是 Google 的「公開網址」。日曆若未公開，只會顯示「busy」。請改用「iCal 格式的私人網址」（網址含 private-...）才能看到每筆標題。") + "</p>";
+    }
+    page += "<p class='muted'>" + tr("Events loaded: ", "已載入行程：") + String(calEventCount) + (calError.length() ? " · " + htmlEscape(calError) : String("")) + "</p>";
+    page += "<button class='btn secondary' type='submit' formaction='/calendar-sync' formmethod='post'>" + tr("Sync now", "立刻同步") + "</button>";
   } else if (pageId == "companion") {
     page += "<h2>Companion</h2><p class='muted'>" + tr("Local host is preferred automatically; the Internet URL is used when the local connection is unavailable. You may fill either or both.", "優先連接區域網路主機；連不上時改用網際網路網址。可填其中一種，也可兩者都填。") + "</p>";
     for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
@@ -6426,7 +6960,7 @@ void setupSettingsServer() {
   settingsServer.on("/save", HTTP_POST, []() {
     String pageId = settingsServer.arg("page");
     String language = settingsServer.arg("lang");
-    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "firmware") pageId = "clock";
+    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "firmware") pageId = "clock";
     bool wifiChanged = false;
     bool deviceNameChanged = false;
     bool emotionBaseRejected = false;
@@ -6571,6 +7105,11 @@ void setupSettingsServer() {
         hassAssistToken = settingsServer.arg("hassToken");
         hassAssistToken.trim();
       }
+    } else if (pageId == "calendar") {
+      String nextUrl = settingsServer.arg("icalUrl"); nextUrl.trim();
+      if (nextUrl != calendarIcalUrl) { calendarIcalUrl = nextUrl; calFetchedAt = 0; calEventCount = 0; }
+      // Load right away so the page can report how many events were found.
+      if (calendarIcalUrl.length()) fetchCalendar(calLocalMidnight(time(nullptr)));
     } else if (pageId == "companion") {
       for (int i = 0; i < COMPANION_PAGE_COUNT; ++i) {
         String nextHost = settingsServer.arg("compHost" + String(i));
@@ -6615,6 +7154,14 @@ void setupSettingsServer() {
         updateAlarmBaseLights(millis()); drawClock(true); drawAstronaut();
       }
     }
+  });
+  settingsServer.on("/calendar-sync", HTTP_POST, []() {
+    String language = settingsServer.arg("lang");
+    time_t around = calViewDay ? calViewDay : calLocalMidnight(time(nullptr));
+    bool ok = fetchCalendar(around);
+    if (screenNow == Screen::Calendar) drawCalendar();
+    sendSettingsPage(ok ? (language == "zh" ? "已同步，載入 " + String(calEventCount) + " 筆行程。" : "Synced: " + String(calEventCount) + " events.")
+                        : (language == "zh" ? "同步失敗：" : "Sync failed: ") + calError, "calendar", language);
   });
   settingsServer.on("/debug", HTTP_GET, []() {
     String out = "night_led=" + String(nightLedShowing) + " manual_override=" + String(manualNightLightOverride)
