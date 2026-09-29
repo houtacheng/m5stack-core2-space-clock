@@ -1,7 +1,7 @@
 {
-  "version": "2.9.36",
+  "version": "2.9.37",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "7c38576e28bea21248d296f889e8e671213163a0c68f1e283ed4ea1d73f8dd3c",
-  "size": 4633584,
-  "notes": "Calendar: iCal subscription (set the URL in the web settings), long-press the clock to open; day / month (swipe left) / week (swipe right) views, sync button, time zone display, colours follow the clock face."
+  "sha256": "ccbaebca17697b3abb9a44dc06d829fd59a417e97defb2f866a8e37d5812f0cd",
+  "size": 4913872,
+  "notes": "Signal + Teams messages (chat view, canned replies, shared read state), home/away network detection with external URLs, background networking, TLS buffers in PSRAM, Wi-Fi switcher, more Chinese glyphs."
 }

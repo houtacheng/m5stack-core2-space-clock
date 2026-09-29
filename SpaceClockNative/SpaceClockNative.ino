@@ -1,11 +1,14 @@
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiManager.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <mbedtls/platform.h>
 #include <Preferences.h>
+#include <nvs.h>
 #include <SPIFFS.h>
 #include <Adafruit_NeoPixel.h>
 #include <PubSubClient.h>
@@ -40,9 +43,47 @@
 #endif
 #include "mqtt_guide.h"
 
-enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight, Calendar };
+enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight, Calendar, Messages, MessageDetail, MessageReply, MessageFull, MessageHub, WifiSwitch };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
+struct WifiChoice { int8_t slot; int16_t rssi; };  // slot -1 = network stored by the setup hotspot
+// Signal messages via the NAS bridge (LAN first, Cloudflare Tunnel fallback).
+struct SignalMessage {
+  uint32_t id;
+  time_t when;
+  bool own;
+  uint8_t attachments;
+  bool unread;
+  char from[40];
+  char group[40];
+  char chat[128];     // conversation key (group id, phone number, or teams:<chat id> ~100 bytes)
+  char chatName[40];  // conversation title
+  char text[400];
+};
+String signalLanUrl, signalPublicUrl, signalToken;
+SignalMessage* signalMessages = nullptr;  // ring buffer in PSRAM, newest at the end
+static constexpr int SIGNAL_MAX_MESSAGES = 500;
+int signalMessageCount = 0;
+uint32_t signalLastId = 0;
+uint16_t signalUnread = 0;
+bool signalFirstPollDone = false;
+bool signalUsePublic = false;
+uint32_t signalLastPollAt = 0;
+uint32_t signalNextPollAt = 0;
+String signalStatus;
+uint8_t signalListPage = 0;
+int signalSelected = -1;  // index into signalMessages (unused by chat view)
+String signalChatKey;      // open conversation
+int signalChatScroll = 0;  // messages hidden below the view (0 = newest visible)
+uint32_t signalLastSendAt = 0;
+// Bubble hit areas of the current chat page (tap a bubble to read it whole).
+struct SignalBubbleHit { int16_t x0, y0, x1, y1; int16_t index; };
+SignalBubbleHit signalBubbleHits[12];
+int signalBubbleHitCount = 0;
+int signalChatVisible = 0;  // messages shown on the current chat page
+int signalFullIndex = -1, signalFullPage = 0;
+bool messageSourceTeams = false;  // which source the conversation list shows
+
 // Calendar (iCal subscription) state; drawing and parsing live further down.
 struct CalEvent {
   time_t start;
@@ -57,6 +98,25 @@ CalEvent* calEvents = nullptr;
 int calEventCount = 0;
 static constexpr int CAL_MAX_EVENTS = 400;
 time_t calWindowStart = 0, calWindowEnd = 0;
+// Background download buffer; swapped with calEvents when a fetch completes.
+CalEvent* calFill = nullptr;
+int calFillCount = 0;
+time_t calFillStart = 0, calFillEnd = 0;
+SemaphoreHandle_t calFetchMutex = nullptr;
+// Network work runs in a background task so slow links never freeze the UI.
+SemaphoreHandle_t netMutex = nullptr;      // recursive: one HTTPS connection at a time
+// Each TLS session needs ~40 KB of contiguous internal RAM; two at once (e.g.
+// the background Signal poll plus a calendar/emotion request) fails with -1.
+struct NetLock {
+  NetLock() {
+    if (!netMutex) netMutex = xSemaphoreCreateRecursiveMutex();
+    xSemaphoreTakeRecursive(netMutex, portMAX_DELAY);
+  }
+  ~NetLock() { xSemaphoreGiveRecursive(netMutex); }
+};
+SemaphoreHandle_t pendingMutex = nullptr;  // hands fetched data to the UI loop
+String signalPendingResponse;
+volatile int signalPendingCode = 0;        // 0 = nothing waiting
 uint32_t calFetchedAt = 0;
 String calError;
 CalView calView = CalView::Day;
@@ -164,6 +224,7 @@ bool nightLedShowing = false;
 uint8_t screenNightBrightness = 0;   // 0 = follow LED brightness
 uint32_t screenNightLabelUntil = 0;
 String touchDebugLog;  // recent touch events, served at /debug
+uint16_t settingsWriteFailures = 0;
 bool screenSleeping = false;
 bool automaticFirmwareUpdate = false;
 uint8_t firmwareCheckHour = 3;
@@ -201,6 +262,16 @@ uint32_t lastCompanionLocalProbe = 0;
 // stays in Preferences and is never emitted to MQTT, the UI, or public builds.
 bool hassAssistEnabled = false;
 String hassAssistBaseUrl;
+String hassAssistExternalUrl;   // used when the home LAN is not reachable
+// Home / away detection: probed on every Wi-Fi connect and every 5 minutes.
+bool homeLanReachable = true;
+uint32_t homeLanCheckAt = 0;
+volatile bool homeLanChanged = false;
+volatile bool homeLanChecked = false;  // services wait for the first home/away check
+volatile uint32_t wifiConnectedAt = 0;  // background DNS waits until SNTP has settled
+String hassAssistActiveUrl() {
+  return (!homeLanReachable && hassAssistExternalUrl.length()) ? hassAssistExternalUrl : hassAssistBaseUrl;
+}
 String hassAssistToken;
 String hassAssistPipeline;
 uint8_t hassAssistVolume = 70;
@@ -618,12 +689,16 @@ void saveSettings() {
   prefs.putString("deviceName", deviceName);
   prefs.putBool("hassOn", hassAssistEnabled);
   prefs.putString("hassUrl", hassAssistBaseUrl);
+  prefs.putString("hassExt", hassAssistExternalUrl);
   prefs.putString("hassToken", hassAssistToken);
   prefs.putString("hassPipe", hassAssistPipeline);
   prefs.putUChar("hassVol", hassAssistVolume);
   prefs.putBool("hassWake", hassAssistWakeWordEnabled);
   prefs.putUChar("hassMode", hassAssistVoiceMode);
   prefs.putString("icalUrl", calendarIcalUrl);
+  prefs.putString("sigLan", signalLanUrl);
+  prefs.putString("sigPub", signalPublicUrl);
+  prefs.putString("sigTok", signalToken);
   prefs.putUChar("emoMode", emotionReminderMode);
   prefs.putUShort("emoInterval", emotionReminderIntervalMinutes);
   prefs.putUShort("emoWinStart", emotionReminderWindowStart);
@@ -649,8 +724,11 @@ void saveSettings() {
   }
   for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
     String ssidKey = "wifiS" + String(i), passwordKey = "wifiP" + String(i);
-    prefs.putString(ssidKey.c_str(), savedWifiSsids[i]);
-    prefs.putString(passwordKey.c_str(), savedWifiPasswords[i]);
+    // putString returns 0 when NVS is full; record it so /debug can show it.
+    if (savedWifiSsids[i].length() && !prefs.putString(ssidKey.c_str(), savedWifiSsids[i])) settingsWriteFailures++;
+    else if (!savedWifiSsids[i].length()) prefs.remove(ssidKey.c_str());
+    if (savedWifiPasswords[i].length() && !prefs.putString(passwordKey.c_str(), savedWifiPasswords[i])) settingsWriteFailures++;
+    else if (!savedWifiPasswords[i].length()) prefs.remove(passwordKey.c_str());
   }
   prefs.putBytes("alarms", alarms, sizeof(alarms));
   prefs.putUChar("alarmRev", ALARM_SCHEMA_VERSION);
@@ -713,6 +791,7 @@ void loadSettings() {
   hassAssistBaseUrl = prefs.getString("hassUrl", "");
   hassAssistBaseUrl.trim();
   while (hassAssistBaseUrl.endsWith("/")) hassAssistBaseUrl.remove(hassAssistBaseUrl.length() - 1);
+  hassAssistExternalUrl = prefs.getString("hassExt", "");
   hassAssistToken = prefs.getString("hassToken", "");
   hassAssistPipeline = prefs.getString("hassPipe", "");
   hassAssistPipeline.trim();
@@ -721,6 +800,9 @@ void loadSettings() {
   hassAssistVoiceMode = constrain((int)prefs.getUChar("hassMode", hassAssistWakeWordEnabled ? HASS_MODE_WAKE : HASS_MODE_TAP), 0, 2);
   hassAssistWakeWordEnabled = hassAssistVoiceMode == HASS_MODE_WAKE;
   calendarIcalUrl = prefs.getString("icalUrl", "");
+  signalLanUrl = prefs.getString("sigLan", "");
+  signalPublicUrl = prefs.getString("sigPub", "");
+  signalToken = prefs.getString("sigTok", "");
   hassAssistState = hassAssistEnabled ? HassAssistState::Disconnected : HassAssistState::Disabled;
   emotionReminderMode = constrain((int)prefs.getUChar("emoMode", 0), 0, 2);
   emotionReminderIntervalMinutes = prefs.getUShort("emoInterval", 60);
@@ -895,6 +977,13 @@ void maintainSavedWifi(uint32_t nowMs) {
     wifiRecoveryPhaseStartedAt = nowMs;
     if (!settingsServerReady) setupSettingsServer();
     if (justConnected) {
+      // Arduino's hostByName() clears lwIP's DNS cache (without the TCPIP lock)
+      // the first time after the IP changes. If SNTP is resolving at that
+      // moment, lwIP asserts and the board reboots. Trigger that first lookup
+      // here, before SNTP starts, and keep background DNS off for a few seconds.
+      wifiConnectedAt = millis();
+      IPAddress warmup;
+      WiFi.hostByName("pool.ntp.org", warmup);
       syncTime();
       if (screenNow == Screen::Clock) { drawClock(true); drawAstronaut(); }
     }
@@ -1075,6 +1164,31 @@ void drawStatusDeviceName(Gfx& gfx, int ipRight, uint16_t color) {
   int left = ipRight + 8, right = 236;
   if (right - left < 24 || !deviceName.length()) return;
   String name = deviceName;
+  if (signalUnread) {
+    // Two badges: blue "S n" for Signal, purple "T n" for Teams.
+    int counts[2] = {0, 0};
+    for (int i = 0; i < signalMessageCount; ++i)
+      if (signalMessages[i].unread) ++counts[strncmp(signalMessages[i].chat, "teams:", 6) ? 0 : 1];
+    const uint16_t colors[2] = {0x3A7F, 0x6A7B};
+    const char* letters[2] = {"S ", "T "};
+    String labels[2]; int widths[2] = {0, 0}, total = 0;
+    for (int k = 0; k < 2; ++k) {
+      if (!counts[k]) continue;
+      labels[k] = String(letters[k]) + counts[k];
+      widths[k] = gfx.textWidth(labels[k]) + 12;
+      total += widths[k] + (total ? 6 : 0);
+    }
+    int x = (left + right) / 2 - total / 2;
+    gfx.setTextDatum(middle_center);
+    for (int k = 0; k < 2; ++k) {
+      if (!counts[k]) continue;
+      gfx.fillRoundRect(x, 4, widths[k], 21, 10, colors[k]);
+      gfx.setTextColor(TFT_WHITE, colors[k]);
+      gfx.drawString(labels[k], x + widths[k] / 2, 15);
+      x += widths[k] + 6;
+    }
+    return;
+  }
   while (name.length() > 1 && gfx.textWidth(name) > right - left) {
     int cut = name.length() - 1;
     while (cut > 0 && ((uint8_t)name[cut] & 0xC0) == 0x80) --cut;  // UTF-8 boundary
@@ -1334,8 +1448,21 @@ void drawMatrixNavigationIcons(M5Canvas& canvas) {
   canvas.drawPng(nav_nightlight_png, nav_nightlight_png_len, 271, 218);
 }
 
+void handleTouch();
+// Poll touch in the middle of a Matrix frame. Returns false when the touch
+// changed screens, so the caller must not push the (now stale) frame.
+bool matrixSampleTouch() {
+  M5.update();
+  handleTouch();
+  return screenNow == Screen::Clock && clockFace == ClockFace::Matrix && alarmActive < 0;
+}
+
 void drawMatrixRainFrame(uint32_t nowMs) {
   if (clockFace != ClockFace::Matrix || screenNow != Screen::Clock || alarmActive >= 0) return;
+  // matrixSampleTouch() may redraw the clock; never start a nested frame.
+  static bool inFrame = false;
+  if (inFrame) return;
+  struct FrameGuard { bool& flag; FrameGuard(bool& f) : flag(f) { flag = true; } ~FrameGuard() { flag = false; } } guard(inFrame);
   if (!matrixCanvasReady) {
     // Do not silently draw into a failed sprite. Keep navigation available and
     // display a diagnostic using a built-in font that needs no external assets.
@@ -1414,6 +1541,9 @@ void drawMatrixRainFrame(uint32_t nowMs) {
       matrixActive[i] = i < 3 || (esp_random() % 100) < matrixRainDensity;
     }
   }
+  // A Matrix frame takes ~100 ms; sample the touch panel mid-frame so quick
+  // taps (e.g. the triple tap for messages) are not lost between frames.
+  if (!matrixSampleTouch()) return;
   // Add the rare glows after the text is composed, then redraw the crisp symbol.
   for (int i = 0; i < MATRIX_COLUMNS; ++i) {
     if (!matrixActive[i] || i >= columns) continue;
@@ -1429,6 +1559,7 @@ void drawMatrixRainFrame(uint32_t nowMs) {
   }
   matrixCanvas.setTextDatum(top_left);
   drawMatrixClockPanel(matrixCanvas);
+  if (!matrixSampleTouch()) return;
   drawMatrixStatus(matrixCanvas);
   drawMatrixNavigationIcons(matrixCanvas);
   matrixCanvas.pushSprite(0, 0);
@@ -1754,7 +1885,8 @@ void drawAstronaut() {
 }
 
 uint8_t menuPage = 0;
-static const char* const MENU_ROWS[] = {"Wi-Fi & Companion", "Clock faces", "Clock settings", "Alarms", "Meditation settings", "Firmware update"};
+static const char* const MENU_ROWS[] = {"Wi-Fi & Companion", "Clock faces", "Clock settings", "Alarms", "Meditation settings", "Firmware update", "Wi-Fi networks"};
+static constexpr int MENU_ROW_COUNT = 7;
 // A settings row with a slider (used for the meditation preset times).
 static constexpr int SLIDER_LEFT = 24, SLIDER_RIGHT = 296;
 void drawSettingsSliderRow(uint8_t index, const String& label, int value, int minValue, int maxValue, const String& unit) {
@@ -1789,7 +1921,7 @@ void showMenu() {
   title(menuPage ? "Settings 2/2" : "Settings 1/2");
   for (int row = 0; row < 4; ++row) {
     int i = menuPage * 4 + row;
-    if (i < 6) drawSettingsRow(row, MENU_ROWS[i], ">");
+    if (i < MENU_ROW_COUNT) drawSettingsRow(row, MENU_ROWS[i], ">");
   }
   drawBottomBar(menuPage ? "Previous" : "", menuPage ? "" : "Next", "Close");
 }
@@ -2536,12 +2668,14 @@ void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
     serializeJson(auth, authPayload);
     hassAssistWebSocket.sendTXT(authPayload);
   } else if (messageType == "auth_ok") {
+    Serial.printf("[assist] Home Assistant connected via %s\n", hassAssistActiveUrl().c_str());
     hassAssistAuthenticated = true;
     hassAssistState = hassAssistWakeWordPaused ? HassAssistState::Paused : HassAssistState::Ready;
     hassAssistError = "";
     requestHassAssistPipelines();
     drawHassAssist();
   } else if (messageType == "auth_invalid") {
+    Serial.println("[assist] Home Assistant rejected the token");
     hassAssistAuthenticated = false;
     hassAssistError = "Home Assistant token was rejected";
     hassAssistState = HassAssistState::Error;
@@ -2565,7 +2699,7 @@ void onHassAssistWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
 }
 
 bool parseHassAssistUrl(String& host, uint16_t& port, String& websocketPath, bool& secure) {
-  String url = hassAssistBaseUrl;
+  String url = hassAssistActiveUrl();
   url.trim();
   secure = url.startsWith("https://");
   if (!secure && !url.startsWith("http://")) return false;
@@ -2587,6 +2721,13 @@ bool parseHassAssistUrl(String& host, uint16_t& port, String& websocketPath, boo
 
 void connectHassAssist() {
   if (hassAssistSocketStarted || WiFi.status() != WL_CONNECTED || !hassAssistEnabled) return;
+  if (!homeLanChecked) return;  // don't dial the LAN before we know we are home
+  if (!homeLanReachable && !hassAssistExternalUrl.length()) {
+    // Away from home without an external URL: do not keep dialling the LAN.
+    hassAssistState = HassAssistState::Disconnected;
+    hassAssistError = "Away from home: set the external URL on the web page";
+    return;
+  }
   if (!hassAssistBaseUrl.length() || !hassAssistToken.length()) {
     hassAssistState = HassAssistState::Disabled;
     hassAssistError = "Set the Home Assistant URL and token on the web page";
@@ -2603,7 +2744,9 @@ void connectHassAssist() {
     return;
   }
   hassAssistWebSocket.onEvent(onHassAssistWebSocketEvent);
-  hassAssistWebSocket.setReconnectInterval(4000);
+  // Away from home the external link is slower; retry less often so a
+  // failing TLS connect does not keep freezing the UI.
+  hassAssistWebSocket.setReconnectInterval(homeLanReachable ? 4000 : 30000);
   hassAssistWebSocket.enableHeartbeat(10000, 3000, 2);
   if (secure) hassAssistWebSocket.beginSSL(host.c_str(), port, path.c_str(), "", "");
   else hassAssistWebSocket.begin(host.c_str(), port, path.c_str(), "");
@@ -2661,10 +2804,11 @@ String absoluteHassAssistTtsUrl(String url) {
   url.trim();
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
   if (!url.startsWith("/")) url = "/" + url;
-  return hassAssistBaseUrl + url;
+  return hassAssistActiveUrl() + url;
 }
 
 bool downloadHassAssistAudio() {
+  NetLock netLock;  // one HTTPS session at a time
   String url = absoluteHassAssistTtsUrl(hassAssistTtsUrl);
   if (!url.length()) return false;
   uint32_t downloadStartedAt = millis();
@@ -2834,7 +2978,7 @@ void maintainHassAssist(uint32_t nowMs) {
   // stream) used to leave pipelineActive set forever, so every later tap was
   // ignored. Reset so the user can talk again.
   if (hassAssistPipelineActive && !hassAssistWakeSessionActive && !hassAssistMicRunning
-      && (int32_t)(millis() - hassAssistLastEventAt) > 20000) {
+      && (int32_t)(millis() - hassAssistLastEventAt) > (homeLanReachable ? 20000 : 60000)) {
     Serial.println("[assist] pipeline stalled; resetting");
     abortHassAssistMic();
     hassAssistPipelineActive = false;
@@ -3410,6 +3554,7 @@ void drawFirmwareVerificationStatus(uint8_t attempt, uint8_t attempts) {
 }
 
 bool readFirmwareManifest(bool redraw = true) {
+  NetLock netLock;  // one HTTPS session at a time
   if (WiFi.status() != WL_CONNECTED) {
     firmwareUpdateMessage = "Wi-Fi is not connected.";
     firmwareUpdateAvailable = false;
@@ -3505,6 +3650,7 @@ bool finalizeFirmwareUpdateSafely(bool exactSize = true) {
 }
 
 bool installLatestFirmware(bool redraw = true) {
+  NetLock netLock;  // one HTTPS session at a time
   if (!firmwareUpdateAvailable || !latestFirmwareUrl.length()) return false;
   static constexpr uint8_t MAX_ATTEMPTS = 2;
   static constexpr uint32_t STALL_TIMEOUT_MS = 12000;
@@ -4280,6 +4426,7 @@ String emotionApiHost(const String& base) {
 }
 
 bool emotionApiLogin(const String& identity, const String& password, String& message) {
+  NetLock netLock;  // one HTTPS session at a time
   emotionApiState = EmotionApiState::Checking;
   auto fail = [&](const String& reason) {
     message = reason; emotionApiState = EmotionApiState::Disconnected; emotionApiLastChecked = millis(); return false;
@@ -4368,6 +4515,7 @@ bool emotionApiLogin(const String& identity, const String& password, String& mes
 }
 
 bool refreshEmotionApiToken() {
+  NetLock netLock;  // one HTTPS session at a time
   if (!emotionApiToken.length() || !emotionApiUserId.length() || WiFi.status() != WL_CONNECTED) {
     emotionApiState = EmotionApiState::Disconnected;
     return false;
@@ -4380,6 +4528,12 @@ bool refreshEmotionApiToken() {
   http.addHeader("Authorization", "Bearer " + emotionApiToken);
   int code = http.POST("");
   String response = code > 0 ? http.getString() : "";
+  if (code != 200) {
+    char err[96] = {0};
+    secure.lastError(err, sizeof(err));
+    Serial.printf("[emotion] auth-refresh HTTP %d, TLS: %s, heap %u largest %u\n", code, err,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  }
   http.end(); secure.stop();
   if (code != 200) { emotionApiState = EmotionApiState::Disconnected; return false; }
   DynamicJsonDocument doc(4096);
@@ -4470,6 +4624,7 @@ void applyEmotionStatistics(DynamicJsonDocument& stats) {
 }
 
 bool flushOneEmotionRecord() {
+  NetLock netLock;  // one HTTPS session at a time
   if (!emotionStorageReady || WiFi.status() != WL_CONNECTED || !emotionApiConfigured() || millis() - emotionLastQueueSyncAt < 5000UL) return false;
   emotionLastQueueSyncAt = millis();
   File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
@@ -4550,6 +4705,7 @@ void forceEmotionSync() {
 }
 
 int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
+  NetLock netLock;  // one HTTPS session at a time
   String base = normalizeEmotionApiBase(emotionApiBase);
   if (!base.length()) return -10001;
 
@@ -4672,6 +4828,7 @@ void showEmotionRecords(bool refresh) {
 }
 
 bool submitEmotionObservation() {
+  NetLock netLock;  // one HTTPS session at a time
   if (!emotionApiConfigured()) { emotionSubmitMessage = "請先從網頁登入情緒觀察 API。"; drawEmotionObservation(); return false; }
   time_t now = time(nullptr); struct tm utcNow;
   bool hasUtc = now >= 1700000000 && gmtime_r(&now, &utcNow);
@@ -4784,6 +4941,7 @@ bool submitEmotionObservation() {
 }
 
 bool withdrawEmotionObservation() {
+  NetLock netLock;  // one HTTPS session at a time
   if (!emotionLastSubmittedId.length()) {
     emotionSubmitMessage = "找不到剛送出的紀錄，無法撤回。";
     drawEmotionObservation();
@@ -5339,10 +5497,10 @@ String calUnescape(String v) {
 }
 
 void calAddOccurrence(time_t start, time_t duration, bool allDay, const String& title, const String& location) {
-  if (calEventCount >= CAL_MAX_EVENTS) return;
+  if (calFillCount >= CAL_MAX_EVENTS) return;
   time_t end = start + duration;
-  if (end <= calWindowStart || start >= calWindowEnd) return;
-  CalEvent& e = calEvents[calEventCount++];
+  if (end <= calFillStart || start >= calFillEnd) return;
+  CalEvent& e = calFill[calFillCount++];
   e.start = start; e.end = end; e.allDay = allDay;
   strlcpy(e.title, title.length() ? title.c_str() : "(無標題)", sizeof(e.title));
   strlcpy(e.location, location.c_str(), sizeof(e.location));
@@ -5408,24 +5566,35 @@ void calEmitEvent(time_t start, time_t end, bool allDay, const String& rrule, co
       if (until && c > until) return;
       if (count && emitted >= count) return;
       ++emitted;
-      if (c >= calWindowEnd) return;
+      if (c >= calFillEnd) return;
       if (!excluded(c)) calAddOccurrence(c, duration, allDay, title, location);
     }
   }
 }
 
+bool fetchCalendarLocked(time_t aroundDay);
 bool fetchCalendar(time_t aroundDay) {
+  if (!calFetchMutex) calFetchMutex = xSemaphoreCreateMutex();
+  xSemaphoreTake(calFetchMutex, portMAX_DELAY);
+  bool ok = fetchCalendarLocked(aroundDay);
+  xSemaphoreGive(calFetchMutex);
+  return ok;
+}
+
+bool fetchCalendarLocked(time_t aroundDay) {
+  NetLock netLock;  // one HTTPS session at a time
   calError = "";
   if (!calendarIcalUrl.length()) { calError = "請先在網頁後台「日曆」填入 iCal 網址"; return false; }
   if (WiFi.status() != WL_CONNECTED) { calError = "Wi-Fi 未連線"; return false; }
   if (!calEvents) calEvents = (CalEvent*)heap_caps_malloc(sizeof(CalEvent) * CAL_MAX_EVENTS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!calEvents) { calError = "記憶體不足"; return false; }
+  if (!calFill) calFill = (CalEvent*)heap_caps_malloc(sizeof(CalEvent) * CAL_MAX_EVENTS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!calEvents || !calFill) { calError = "記憶體不足"; return false; }
   // Window: from a week before the viewed month to about six weeks after it.
   struct tm v; localtime_r(&aroundDay, &v);
   time_t monthStart = calLocalTime(v.tm_year + 1900, v.tm_mon + 1, 1);
-  calWindowStart = calAddDays(monthStart, -7);
-  calWindowEnd = calAddDays(monthStart, 45);
-  calEventCount = 0;
+  calFillStart = calAddDays(monthStart, -7);
+  calFillEnd = calAddDays(monthStart, 45);
+  calFillCount = 0;
 
   String url = calendarIcalUrl;
   if (url.startsWith("webcal://")) url = "https://" + url.substring(9);
@@ -5457,7 +5626,8 @@ bool fetchCalendar(time_t aroundDay) {
       line += more;
     }
     if (line.endsWith("\r")) line.remove(line.length() - 1);
-    if (++lines % 200 == 0) delay(0);
+    // Runs in the background task: yield so the idle task (watchdog) runs.
+    if (++lines % 100 == 0) vTaskDelay(1);
     int colon = line.indexOf(':');
     String name = colon > 0 ? line.substring(0, colon) : line;
     String value = colon > 0 ? line.substring(colon + 1) : "";
@@ -5490,11 +5660,18 @@ bool fetchCalendar(time_t aroundDay) {
   }
   http.end();
   // Sort by start time (insertion sort; the list is small).
-  for (int i = 1; i < calEventCount; ++i) {
-    CalEvent tmp = calEvents[i]; int j = i - 1;
-    while (j >= 0 && calEvents[j].start > tmp.start) { calEvents[j + 1] = calEvents[j]; --j; }
-    calEvents[j + 1] = tmp;
+  for (int i = 1; i < calFillCount; ++i) {
+    CalEvent tmp = calFill[i]; int j = i - 1;
+    while (j >= 0 && calFill[j].start > tmp.start) { calFill[j + 1] = calFill[j]; --j; }
+    calFill[j + 1] = tmp;
   }
+  // Publish the new data in one step.
+  CalEvent* previous = calEvents;
+  calEvents = calFill;
+  calEventCount = calFillCount;
+  calWindowStart = calFillStart;
+  calWindowEnd = calFillEnd;
+  calFill = previous;
   calFetchedAt = millis();
   Serial.printf("[calendar] %u lines, %d events in window\n", (unsigned)lines, calEventCount);
   return true;
@@ -5711,6 +5888,20 @@ void refreshCalendarIfNeeded(bool force = false) {
   fetchCalendar(calViewDay);
 }
 
+// Keep the calendar downloaded in the background (after Wi-Fi connects and
+// every 15 minutes) so opening it is instant.
+void maintainCalendar(uint32_t nowMs) {
+  static uint32_t nextFetchAt = 20000UL;
+  if (!calendarIcalUrl.length() || WiFi.status() != WL_CONNECTED) return;
+  if ((int32_t)(nowMs - nextFetchAt) < 0) return;
+  if (alarmActive >= 0 || hassAssistMicRunning || hassAssistAudioData || hassAssistMp3Decoder) return;
+  if (screenNow == Screen::Calendar) { nextFetchAt = nowMs + 60000UL; return; }  // don't stall while browsing
+  time_t around = calViewDay ? calViewDay : calLocalMidnight(time(nullptr));
+  bool ok = fetchCalendar(around);
+  nextFetchAt = millis() + (ok ? 900000UL : 120000UL);
+  Serial.printf("[calendar] background refresh %s (%d events)\n", ok ? "ok" : calError.c_str(), calEventCount);
+}
+
 void showCalendar() {
   screenNow = Screen::Calendar;
   calView = CalView::Day;
@@ -5771,8 +5962,785 @@ void handleCalendarSwipe(bool left) {
   drawCalendar();
 }
 
+
+// ---------------------------------------------------------------------------
+// Signal messages
+// ---------------------------------------------------------------------------
+static const char* const SIGNAL_REPLIES[] = {"OK", "收到", "會安排時間處理", "請稍等", "沒問題", "非常感恩"};
+static constexpr int SIGNAL_REPLY_COUNT = 6;
+
+bool signalConfigured() {
+  return signalToken.length() && (signalLanUrl.length() || signalPublicUrl.length());
+}
+
+// One HTTP call to the bridge; tries the LAN URL first, then the public one.
+int signalRequestLocked(const String& path, const String& body, String& response);
+int signalRequest(const String& path, const String& body, String& response) {
+  NetLock netLock;
+  return signalRequestLocked(path, body, response);
+}
+
+int signalRequestLocked(const String& path, const String& body, String& response) {
+  String bases[2];
+  int n = 0;
+  if (!homeLanReachable && signalPublicUrl.length()) {
+    bases[n++] = signalPublicUrl;  // away from home: skip the LAN entirely
+  } else {
+    if (!signalUsePublic && signalLanUrl.length()) bases[n++] = signalLanUrl;
+    if (signalPublicUrl.length()) bases[n++] = signalPublicUrl;
+    if (signalUsePublic && signalLanUrl.length()) bases[n++] = signalLanUrl;
+  }
+  int code = -1;
+  for (int i = 0; i < n; ++i) {
+    bool https = bases[i].startsWith("https://");
+    WiFiClientSecure secure; WiFiClient plain;
+    HTTPClient http;
+    http.useHTTP10(true);
+    http.setConnectTimeout(https ? 8000 : 1500);
+    http.setTimeout(https ? 20000 : 3000);  // replies via Cloudflare + signal-cli can take a while
+    if (https) secure.setInsecure();
+    if (!(https ? http.begin(secure, bases[i] + path) : http.begin(plain, bases[i] + path))) continue;
+    http.addHeader("X-Token", signalToken);
+    if (body.length()) { http.addHeader("Content-Type", "application/json"); code = http.POST(body); }
+    else code = http.GET();
+    if (code < 0 && https) {
+      char err[96] = {0};
+      secure.lastError(err, sizeof(err));
+      Serial.printf("[signal] %s failed: %d %s (heap %u)\n", bases[i].c_str(), code, err,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
+    if (code > 0) response = http.getString();
+    http.end();
+    if (code > 0) {
+      signalUsePublic = https;  // remember which path works
+      return code;
+    }
+  }
+  return code;
+}
+
+void signalNotify() {
+  haptic(60);  // one buzz; pollSignalMessages adds a second one for Teams
+  if (screenNow == Screen::Clock && clockFace != ClockFace::Matrix && !screenSleeping) drawClockStatus(clockFace == ClockFace::Minimal ? TFT_BLACK : BG);
+}
+
+// Background part: fetch new messages from the bridge (runs in netTask).
+void fetchSignalMessagesInBackground(uint32_t nowMs) {
+  if (!signalConfigured() || WiFi.status() != WL_CONNECTED || signalPendingCode) return;
+  if (signalNextPollAt && (int32_t)(nowMs - signalNextPollAt) < 0) return;
+  if (alarmActive >= 0 || hassAssistMicRunning || hassAssistAudioData || hassAssistMp3Decoder) return;
+  signalLastPollAt = nowMs;
+  signalNextPollAt = nowMs + 5000UL;
+  String response;
+  uint32_t started = millis();
+  int code = signalRequest("/api/messages?since=" + String(signalLastId), "", response);
+  if (code != 200 || millis() - started > 3000UL)
+    Serial.printf("[net] signal fetch HTTP %d in %lu ms via %s\n", code, (unsigned long)(millis() - started), signalUsePublic ? "public" : "LAN");
+  if (code != 200) signalNextPollAt = millis() + 20000UL;  // back off after a failure
+  xSemaphoreTake(pendingMutex, portMAX_DELAY);
+  signalPendingResponse = response;
+  signalPendingCode = code <= 0 ? -1 : code;
+  xSemaphoreGive(pendingMutex);
+}
+
+// UI part: apply a fetched batch (fast; runs in loop()).
+void pollSignalMessages(uint32_t nowMs) {
+  if (!signalPendingCode) return;
+  if (!signalMessages) {
+    signalMessages = (SignalMessage*)heap_caps_calloc(SIGNAL_MAX_MESSAGES, sizeof(SignalMessage), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!signalMessages) return;
+  }
+  String response;
+  xSemaphoreTake(pendingMutex, portMAX_DELAY);
+  int pendingCode = signalPendingCode;
+  response = signalPendingResponse;
+  signalPendingResponse = "";
+  signalPendingCode = 0;
+  xSemaphoreGive(pendingMutex);
+  uint16_t fresh = 0, freshTeams = 0;
+  static uint32_t unreadIds[SIGNAL_MAX_MESSAGES];
+  int unreadIdCount = -1;  // -1: the bridge did not send the list
+  // One batch per fetch (up to 100); a backlog is paged on the next fetches.
+  for (int batch = 0; batch < 1; ++batch) {
+    int code = pendingCode;
+    if (code != 200) {
+      signalStatus = code == 401 ? "權杖錯誤" : "連不到轉接服務";
+      return;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, response)) return;
+    String nextStatus = signalUsePublic ? "外網連線" : "內網連線";
+    if (nextStatus != signalStatus) Serial.printf("[signal] connected via %s\n", signalUsePublic ? "public (Cloudflare)" : "LAN");
+    signalStatus = nextStatus;
+    if (doc["unread"].is<JsonArray>()) {
+      // Shared read state: anything read on another clock, phone or desktop
+      // is no longer in this list.
+      unreadIdCount = 0;
+      for (JsonVariant v : doc["unread"].as<JsonArray>())
+        if (unreadIdCount < SIGNAL_MAX_MESSAGES) unreadIds[unreadIdCount++] = v.as<uint32_t>();
+    }
+    JsonArray list = doc["messages"].as<JsonArray>();
+    for (JsonObject m : list) {
+      uint32_t id = m["id"] | 0;
+      if (id <= signalLastId) continue;
+      signalLastId = id;
+      if (signalMessageCount == SIGNAL_MAX_MESSAGES) {
+        // Full: drop the oldest READ message; unread ones are never dropped.
+        int drop = 0;
+        while (drop < signalMessageCount && signalMessages[drop].unread) ++drop;
+        if (drop == signalMessageCount) drop = 0;
+        memmove(signalMessages + drop, signalMessages + drop + 1, sizeof(SignalMessage) * (signalMessageCount - drop - 1));
+        --signalMessageCount;
+        if (signalFullIndex >= drop) --signalFullIndex;
+      }
+      SignalMessage& s = signalMessages[signalMessageCount++];
+      s.id = id;
+      s.when = (time_t)((m["ts"] | 0ULL) / 1000ULL);
+      s.own = m["own"] | false;
+      s.attachments = m["attachments"] | 0;
+      strlcpy(s.from, m["from"] | "", sizeof(s.from));
+      strlcpy(s.group, m["group"] | "", sizeof(s.group));
+      strlcpy(s.text, m["text"] | "", sizeof(s.text));
+      strlcpy(s.chat, m["chat"] | "", sizeof(s.chat));
+      strlcpy(s.chatName, m["chat_name"] | "", sizeof(s.chatName));
+      if (!s.chat[0]) strlcpy(s.chat, s.group[0] ? s.group : s.from, sizeof(s.chat));
+      if (!s.chatName[0]) strlcpy(s.chatName, s.group[0] ? s.group : s.from, sizeof(s.chatName));
+      s.unread = !s.own && !(m["read"] | true);
+      if (s.unread && signalFirstPollDone) { ++fresh; if (!strncmp(s.chat, "teams:", 6)) ++freshTeams; }
+    }
+    if (list.size() >= 100) signalNextPollAt = 0;  // more waiting: fetch again right away
+  }
+  signalFirstPollDone = true;
+  if (unreadIdCount >= 0) {
+    for (int i = 0; i < signalMessageCount; ++i) {
+      bool unread = false;
+      for (int k = 0; k < unreadIdCount; ++k) if (unreadIds[k] == signalMessages[i].id) { unread = true; break; }
+      signalMessages[i].unread = unread;
+    }
+  }
+  uint16_t previousUnread = signalUnread;
+  signalUnread = 0;
+  for (int i = 0; i < signalMessageCount; ++i) if (signalMessages[i].unread) ++signalUnread;
+  if (fresh) {
+    Serial.printf("[signal] %u new message(s), %u from Teams\n", fresh, freshTeams);
+    signalNotify();
+    if (freshTeams) { delay(140); haptic(60); }  // Teams: a second buzz
+  } else if (signalUnread != previousUnread) {
+    // Read elsewhere: refresh the badges without a buzz.
+    if (screenNow == Screen::Clock && clockFace != ClockFace::Matrix && !screenSleeping) drawClockStatus(clockFace == ClockFace::Minimal ? TFT_BLACK : BG);
+    if (screenNow == Screen::Messages) drawSignalList();
+    if (screenNow == Screen::MessageHub) drawMessageHub();
+  }
+  if (fresh && screenNow == Screen::Messages) drawSignalList();
+  if (fresh && screenNow == Screen::MessageHub) drawMessageHub();
+  if (fresh && screenNow == Screen::MessageDetail) {
+    // Viewing this conversation: new messages in it are read immediately.
+    if (signalChatUnread(signalChatKey.c_str())) {
+      for (int i = 0; i < signalMessageCount; ++i)
+        if (signalMessages[i].unread && signalChatKey == signalMessages[i].chat) { signalMessages[i].unread = false; if (signalUnread) --signalUnread; }
+      JsonDocument req; req["chat"] = signalChatKey;
+      String body, response; serializeJson(req, body);
+      signalRequest("/api/read", body, response);
+    }
+    drawSignalDetail();
+  }
+}
+
+String signalWhenText(time_t when) {
+  struct tm t; localtime_r(&when, &t);
+  time_t today = calLocalMidnight(time(nullptr));
+  char b[16];
+  if (when >= today) snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
+  else snprintf(b, sizeof(b), "%d/%d", t.tm_mon + 1, t.tm_mday);
+  return String(b);
+}
+
+String signalBodyText(const SignalMessage& m) {
+  String body = m.text;
+  if (m.attachments) body += (body.length() ? " " : "") + String("[附件 ") + m.attachments + "]";
+  return body;
+}
+
+bool messageIsTeams(const SignalMessage& m) { return !strncmp(m.chat, "teams:", 6); }
+
+// Conversation title without the bridge's "Teams · " prefix.
+String messageChatTitle(const SignalMessage& m) {
+  String name = m.chatName;
+  if (name.startsWith("Teams · ")) name = name.substring(strlen("Teams · "));
+  return name;
+}
+
+int messageUnreadFor(bool teams) {
+  int count = 0;
+  for (int i = 0; i < signalMessageCount; ++i) if (signalMessages[i].unread && messageIsTeams(signalMessages[i]) == teams) ++count;
+  return count;
+}
+
+// Conversations of the selected source, ordered by their newest message.
+int signalConversations(int* newestIndex, int maxCount) {
+  int n = 0;
+  for (int i = signalMessageCount - 1; i >= 0 && n < maxCount; --i) {
+    if (messageIsTeams(signalMessages[i]) != messageSourceTeams) continue;
+    bool seen = false;
+    for (int k = 0; k < n; ++k) if (!strcmp(signalMessages[newestIndex[k]].chat, signalMessages[i].chat)) { seen = true; break; }
+    if (!seen) newestIndex[n++] = i;
+  }
+  return n;
+}
+
+int signalChatUnread(const char* chat) {
+  int count = 0;
+  for (int i = 0; i < signalMessageCount; ++i) if (signalMessages[i].unread && !strcmp(signalMessages[i].chat, chat)) ++count;
+  return count;
+}
+
+void drawSignalSyncButton(const char* label = "同步") {
+  M5.Display.fillRoundRect(262, 3, 54, 26, 6, calTheme.panel);
+  M5.Display.drawRoundRect(262, 3, 54, 26, 6, calTheme.accent);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.accent, calTheme.panel);
+  M5.Display.drawString(label, 289, 16);
+}
+
+void drawSignalList() {
+  if (screenNow != Screen::Messages) return;
+  applyCalendarTheme();
+  int chats[20];
+  int chatCount = signalMessages ? signalConversations(chats, 20) : 0;
+  int pages = max(1, (chatCount + 3) / 4);
+  if (signalListPage >= pages) signalListPage = pages - 1;
+  M5.Display.fillScreen(calTheme.bg);
+  useUIMediumFont();
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  M5.Display.drawString(messageSourceTeams ? "Teams" : "Signal", 10, 4);
+  useUIFont(1);
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  M5.Display.drawString((signalStatus.length() ? signalStatus : String("連線中…")) + "  " + String(signalListPage + 1) + "/" + String(pages), 96, 10);
+  drawSignalSyncButton();
+  M5.Display.drawFastHLine(8, 34, 304, calTheme.border);
+  if (!signalConfigured() || !chatCount) {
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+    M5.Display.drawString(signalConfigured() ? "尚無訊息" : "請先在網頁後台「Signal」填入網址與權杖", 160, 120);
+  }
+  for (int row = 0; row < 4; ++row) {
+    int k = signalListPage * 4 + row;
+    if (k >= chatCount) break;
+    const SignalMessage& m = signalMessages[chats[k]];
+    int unread = signalChatUnread(m.chat);
+    int y = SETTINGS_ROW_TOP + row * SETTINGS_ROW_PITCH;
+    uint16_t fill = row & 1 ? calTheme.panelAlt : calTheme.panel;
+    M5.Display.fillRoundRect(6, y, 308, SETTINGS_ROW_PITCH - 4, 7, fill);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(unread ? calTheme.text : calTheme.accent, fill);
+    M5.Display.setClipRect(12, y, 200, 20);
+    M5.Display.drawString(messageChatTitle(m), 12, y + 1);
+    M5.Display.clearClipRect();
+    M5.Display.setTextDatum(top_right);
+    M5.Display.setTextColor(calTheme.muted, fill);
+    M5.Display.drawString(signalWhenText(m.when), unread ? 272 : 308, y + 1);
+    if (unread) {
+      M5.Display.fillRoundRect(278, y + 2, 30, 17, 8, 0xFD20);
+      M5.Display.setTextDatum(middle_center);
+      M5.Display.setTextColor(TFT_BLACK, 0xFD20);
+      M5.Display.drawString(String(unread), 293, y + 10);
+    }
+    String preview = m.own ? String("我：") + signalBodyText(m) : (m.group[0] ? String(m.from) + "：" + signalBodyText(m) : signalBodyText(m));
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(unread ? calTheme.text : calTheme.muted, fill);
+    M5.Display.setClipRect(12, y + 19, 296, 20);
+    M5.Display.drawString(preview, 12, y + 19);
+    M5.Display.clearClipRect();
+  }
+  drawCalendarBottomBar(signalListPage ? "上一頁" : "", signalListPage + 1 < pages ? "下一頁" : "", "返回");
+}
+
+void drawMessageHubTile(int x, bool teams) {
+  const int y = 44, w = 146, h = 150;
+  uint16_t accent = teams ? 0x6A7B : 0x3A7F;  // Teams purple / Signal blue
+  M5.Display.fillRoundRect(x, y, w, h, 16, calTheme.panel);
+  M5.Display.drawRoundRect(x, y, w, h, 16, accent);
+  int cx = x + w / 2, cy = y + 58;
+  if (teams) {
+    // Teams mark: rounded square with a "T"
+    M5.Display.fillRoundRect(cx - 30, cy - 30, 60, 60, 12, accent);
+    M5.Display.fillRect(cx - 16, cy - 16, 32, 7, TFT_WHITE);
+    M5.Display.fillRect(cx - 4, cy - 16, 8, 34, TFT_WHITE);
+  } else {
+    // Signal mark: speech bubble
+    M5.Display.fillCircle(cx, cy, 30, accent);
+    M5.Display.fillTriangle(cx - 22, cy + 16, cx - 32, cy + 34, cx - 6, cy + 26, accent);
+    M5.Display.drawCircle(cx, cy, 18, TFT_WHITE);
+    M5.Display.drawCircle(cx, cy, 17, TFT_WHITE);
+  }
+  useUIMediumFont();
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.text, calTheme.panel);
+  M5.Display.drawString(teams ? "Teams" : "Signal", cx, y + 118);
+  int unread = messageUnreadFor(teams);
+  if (unread) {
+    M5.Display.fillRoundRect(x + w - 44, y + 8, 36, 22, 11, 0xFD20);
+    useUIFont(1);
+    M5.Display.setTextColor(TFT_BLACK, 0xFD20);
+    M5.Display.drawString(String(unread), x + w - 26, y + 19);
+  }
+}
+
+void drawMessageHub() {
+  if (screenNow != Screen::MessageHub) return;
+  applyCalendarTheme();
+  M5.Display.fillScreen(calTheme.bg);
+  useUIMediumFont();
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  M5.Display.drawString("訊息", 10, 4);
+  useUIFont(1);
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  M5.Display.drawString(signalStatus.length() ? signalStatus : String("連線中…"), 72, 10);
+  drawSignalSyncButton();
+  M5.Display.drawFastHLine(8, 36, 304, calTheme.border);
+  drawMessageHubTile(8, false);
+  drawMessageHubTile(166, true);
+  drawCalendarBottomBar("", "", "返回");
+}
+
+void showMessageHub() {
+  screenNow = Screen::MessageHub;
+  signalNextPollAt = 0;  // refresh right away
+  drawMessageHub();
+}
+
+void showSignalMessages() {
+  screenNow = Screen::Messages;
+  signalListPage = 0;
+  drawSignalList();
+}
+
+// Split text into lines that fit maxWidth (current font), max maxLines.
+int signalWrap(const String& text, int maxWidth, String* lines, int maxLines) {
+  int count = 0;
+  size_t pos = 0;
+  while (pos < text.length() && count < maxLines) {
+    size_t end = pos, lastFit = pos;
+    while (end < text.length()) {
+      uint8_t c = (uint8_t)text[end];
+      size_t next = end + (c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : 4);
+      if (text[end] == '\n') { lastFit = end; break; }
+      if (M5.Display.textWidth(text.substring(pos, next)) > maxWidth) break;
+      end = next; lastFit = end;
+    }
+    if (lastFit == pos) lastFit = min(text.length(), pos + 1);
+    lines[count] = text.substring(pos, lastFit);
+    pos = lastFit;
+    while (pos < text.length() && (text[pos] == ' ' || text[pos] == '\n')) ++pos;
+    ++count;
+  }
+  if (pos < text.length() && count) lines[count - 1] += "…";
+  return count;
+}
+
+void drawSignalDetail() {
+  if (screenNow != Screen::MessageDetail) return;
+  applyCalendarTheme();
+  const SignalMessage* last = nullptr;
+  int total = 0;
+  for (int i = 0; i < signalMessageCount; ++i) if (signalChatKey == signalMessages[i].chat) { last = &signalMessages[i]; ++total; }
+  M5.Display.fillScreen(calTheme.bg);
+  useUIFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+  M5.Display.setClipRect(10, 4, 244, 26);
+  M5.Display.drawString(last ? messageChatTitle(*last) : String(""), 10, 8);
+  M5.Display.clearClipRect();
+  drawSignalSyncButton();
+  M5.Display.drawFastHLine(8, 32, 304, calTheme.border);
+  signalChatScroll = constrain(signalChatScroll, 0, max(0, total - 1));
+  signalBubbleHitCount = 0;
+  signalChatVisible = 0;
+  // Chat bubbles from the bottom up: incoming left, own right.
+  M5.Display.setClipRect(0, 34, 320, 176);
+  int y = 208, skipped = 0;
+  bool isGroup = last && last->group[0];
+  for (int i = signalMessageCount - 1; i >= 0; --i) {
+    const SignalMessage& m = signalMessages[i];
+    if (signalChatKey != m.chat) continue;
+    if (skipped++ < signalChatScroll) continue;
+    String lines[5];
+    int n = signalWrap(signalBodyText(m), 196, lines, 5);
+    int width = 0;
+    for (int k = 0; k < n; ++k) width = max(width, (int)M5.Display.textWidth(lines[k]));
+    String meta = (isGroup && !m.own ? String(m.from) + " · " : String("")) + signalWhenText(m.when);
+    int bubbleW = max(width, (int)M5.Display.textWidth(meta)) + 16;
+    int bubbleH = n * 20 + 26;
+    y -= bubbleH + 4;
+    if (y < 34 - bubbleH) break;
+    int x = m.own ? 282 - bubbleW : 38;  // leave the edge strips for paging
+    uint16_t fill = m.own ? calTheme.today : calTheme.panel;
+    M5.Display.fillRoundRect(x, y, bubbleW, bubbleH, 9, fill);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(m.own ? calTheme.todayText : calTheme.muted, fill);
+    M5.Display.drawString(meta, x + 8, y + 3);
+    M5.Display.setTextColor(m.own ? calTheme.todayText : calTheme.text, fill);
+    for (int k = 0; k < n; ++k) M5.Display.drawString(lines[k], x + 8, y + 22 + k * 20);
+    if (signalBubbleHitCount < 12) signalBubbleHits[signalBubbleHitCount++] = {(int16_t)x, (int16_t)max(y, 34), (int16_t)(x + bubbleW), (int16_t)(y + bubbleH), (int16_t)i};
+    ++signalChatVisible;
+    if (y < 34) break;
+  }
+  M5.Display.clearClipRect();
+  // Page markers: left = older, right = newer.
+  useUIMediumFont();
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(signalChatScroll + signalChatVisible < total ? calTheme.accent : calTheme.border, calTheme.bg);
+  M5.Display.drawString("<", 16, 121);
+  M5.Display.setTextColor(signalChatScroll > 0 ? calTheme.accent : calTheme.border, calTheme.bg);
+  M5.Display.drawString(">", 304, 121);
+  drawCalendarBottomBar("返回", "回覆", "關閉");
+}
+
+// One message in full, paged; tap right half = next page, left half = previous.
+void drawSignalFull() {
+  if (screenNow != Screen::MessageFull || signalFullIndex < 0 || signalFullIndex >= signalMessageCount) return;
+  applyCalendarTheme();
+  const SignalMessage& m = signalMessages[signalFullIndex];
+  M5.Display.fillScreen(calTheme.bg);
+  useUIFont(1);
+  String lines[48];
+  int n = signalWrap(signalBodyText(m), 300, lines, 48);
+  const int perPage = 7;
+  int pages = max(1, (n + perPage - 1) / perPage);
+  signalFullPage = constrain(signalFullPage, 0, pages - 1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+  M5.Display.setClipRect(10, 4, 230, 26);
+  M5.Display.drawString(m.own ? String("我") : String(m.from), 10, 8);
+  M5.Display.clearClipRect();
+  M5.Display.setTextDatum(top_right);
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  M5.Display.drawString(signalWhenText(m.when) + "  " + String(signalFullPage + 1) + "/" + String(pages), 312, 8);
+  M5.Display.drawFastHLine(8, 32, 304, calTheme.border);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.text, calTheme.bg);
+  for (int k = 0; k < perPage && signalFullPage * perPage + k < n; ++k)
+    M5.Display.drawString(lines[signalFullPage * perPage + k], 10, 40 + k * 24);
+  drawCalendarBottomBar(signalFullPage ? "上一頁" : "", "返回", signalFullPage + 1 < pages ? "下一頁" : "");
+}
+
+void openSignalChat(const char* chat) {
+  signalChatKey = chat;
+  signalChatScroll = 0;
+  if (signalChatUnread(chat)) {
+    JsonDocument req; req["chat"] = chat;
+    String body, response; serializeJson(req, body);
+    signalRequest("/api/read", body, response);  // shared read state on the NAS
+  }
+  for (int i = 0; i < signalMessageCount; ++i)
+    if (signalMessages[i].unread && !strcmp(signalMessages[i].chat, chat)) { signalMessages[i].unread = false; if (signalUnread) --signalUnread; }
+  screenNow = Screen::MessageDetail;
+  drawSignalDetail();
+}
+
+// Canned replies as a 3 x 2 grid of large buttons.
+void drawSignalReplyPicker(const String& note = "") {
+  if (screenNow != Screen::MessageReply) return;
+  applyCalendarTheme();
+  M5.Display.fillScreen(calTheme.bg);
+  useUIFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  String name;
+  for (int i = 0; i < signalMessageCount; ++i) if (signalChatKey == signalMessages[i].chat) name = messageChatTitle(signalMessages[i]);
+  M5.Display.setClipRect(10, 4, 300, 24);
+  M5.Display.drawString("回覆 " + name, 10, 8);
+  M5.Display.clearClipRect();
+  M5.Display.drawFastHLine(8, 32, 304, calTheme.border);
+  for (int i = 0; i < SIGNAL_REPLY_COUNT; ++i) {
+    int col = i % 3, row = i / 3;
+    int x = 6 + col * 104, y = 38 + row * 86;
+    uint16_t fill = calTheme.panel;
+    M5.Display.fillRoundRect(x, y, 100, 80, 12, fill);
+    M5.Display.drawRoundRect(x, y, 100, 80, 12, calTheme.accent);
+    String label = SIGNAL_REPLIES[i];
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(calTheme.text, fill);
+    useUIMediumFont();
+    if (M5.Display.textWidth(label) <= 92) {
+      M5.Display.drawString(label, x + 50, y + 40);
+    } else {
+      useUIFont(1);
+      String lines[3];
+      int n = signalWrap(label, 88, lines, 3);
+      for (int k = 0; k < n; ++k) M5.Display.drawString(lines[k], x + 50, y + 40 + (k * 2 - (n - 1)) * 11);
+    }
+  }
+  if (note.length()) {
+    useUIFont(1);
+    M5.Display.fillRoundRect(40, 104, 240, 40, 10, calTheme.today);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(calTheme.todayText, calTheme.today);
+    M5.Display.drawString(note, 160, 124);
+  }
+  drawCalendarBottomBar("返回", "", "關閉");
+}
+
+void sendSignalReply(int choice) {
+  if (choice < 0 || choice >= SIGNAL_REPLY_COUNT || !signalChatKey.length()) return;
+  // Ignore bounced / repeated taps so a reply is never sent twice.
+  if (signalLastSendAt && millis() - signalLastSendAt < 2000UL) return;
+  signalLastSendAt = millis();
+  drawSignalReplyPicker("送出中…");
+  JsonDocument req;
+  req["chat"] = signalChatKey;
+  req["text"] = SIGNAL_REPLIES[choice];
+  String body, response;
+  serializeJson(req, body);
+  int code = signalRequest("/api/reply", body, response);
+  Serial.printf("[signal] reply %d -> HTTP %d\n", choice, code);
+  signalLastSendAt = millis();
+  if (code == 200) {
+    haptic(30);
+    signalNextPollAt = 0;  // fetch the recorded reply so it shows at once
+    uint32_t started = millis();
+    while (!signalPendingCode && millis() - started < 5000UL) delay(20);
+    pollSignalMessages(millis());
+    screenNow = Screen::MessageDetail;
+    drawSignalDetail();
+  } else {
+    drawSignalReplyPicker(code == 401 ? "權杖錯誤，未送出" : "送出失敗，請稍後再試");
+  }
+}
+
+void signalSyncNow() {
+  haptic(15);
+  drawSignalSyncButton("同步中");
+  signalNextPollAt = 0;  // the background task fetches right away
+  uint32_t started = millis();
+  while (!signalPendingCode && millis() - started < 8000UL) delay(20);
+  pollSignalMessages(millis());
+  if (screenNow == Screen::Messages) drawSignalList();
+  else if (screenNow == Screen::MessageHub) drawMessageHub();
+  else drawSignalDetail();
+}
+
+void handleSignalTap(int x, int y) {
+  if (screenNow != Screen::MessageReply) haptic(12);
+  if ((screenNow == Screen::Messages || screenNow == Screen::MessageDetail || screenNow == Screen::MessageHub) && y < 34 && x >= 256) { signalSyncNow(); return; }
+  if (screenNow == Screen::MessageHub) {
+    if (y >= 210 && x >= 214) { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); return; }
+    if (y >= 44 && y < 194) {
+      if (x >= 8 && x < 154) { messageSourceTeams = false; showSignalMessages(); }
+      else if (x >= 166 && x < 312) { messageSourceTeams = true; showSignalMessages(); }
+    }
+    return;
+  }
+  if (screenNow == Screen::Messages) {
+    int chats[20];
+    int chatCount = signalMessages ? signalConversations(chats, 20) : 0;
+    int pages = max(1, (chatCount + 3) / 4);
+    if (y >= 210) {
+      if (x < 107 && signalListPage) { --signalListPage; drawSignalList(); }
+      else if (x >= 107 && x < 214 && signalListPage + 1 < pages) { ++signalListPage; drawSignalList(); }
+      else if (x >= 214) { showMessageHub(); }
+      return;
+    }
+    int row = settingsRowAt(y);
+    int k = row < 0 ? -1 : signalListPage * 4 + row;
+    if (k >= 0 && k < chatCount) openSignalChat(signalMessages[chats[k]].chat);
+  } else if (screenNow == Screen::MessageDetail) {
+    if (y < 210) {
+      if (y < 34) return;
+      if (x < 36) { signalChatScroll += max(1, signalChatVisible); drawSignalDetail(); return; }      // older
+      if (x >= 284) { signalChatScroll = max(0, signalChatScroll - max(1, signalChatVisible)); drawSignalDetail(); return; }  // newer
+      for (int k = 0; k < signalBubbleHitCount; ++k) {
+        const SignalBubbleHit& h = signalBubbleHits[k];
+        if (x >= h.x0 && x < h.x1 && y >= h.y0 && y < h.y1) {
+          signalFullIndex = h.index; signalFullPage = 0;
+          screenNow = Screen::MessageFull; drawSignalFull();
+          return;
+        }
+      }
+      return;
+    }
+    if (x < 107) { screenNow = Screen::Messages; drawSignalList(); }
+    else if (x < 214) { screenNow = Screen::MessageReply; drawSignalReplyPicker(); }
+    else { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); }
+  } else if (screenNow == Screen::MessageFull) {
+    if (y >= 210 && x >= 107 && x < 214) { screenNow = Screen::MessageDetail; drawSignalDetail(); return; }
+    if (y >= 34) {
+      if (x < 160) { if (signalFullPage) { --signalFullPage; drawSignalFull(); } }
+      else { ++signalFullPage; drawSignalFull(); }
+    }
+  } else if (screenNow == Screen::MessageReply) {
+    if (y >= 210) {
+      haptic(12);
+      if (x < 107) { screenNow = Screen::MessageDetail; drawSignalDetail(); }
+      else if (x >= 214) { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); }
+      return;
+    }
+    if (y >= 38 && y < 38 + 2 * 86) {
+      int col = constrain((x - 6) / 104, 0, 2), row = (y - 38) / 86;
+      haptic(20);
+      sendSignalReply(row * 3 + col);
+    }
+  }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Wi-Fi switcher: saved networks that are currently in range
+// ---------------------------------------------------------------------------
+String wifiLegacySsid;  // the ESP32's own stored network (set via the setup hotspot)
+
+String wifiChoiceSsid(const WifiChoice& c) { return c.slot < 0 ? wifiLegacySsid : savedWifiSsids[c.slot]; }
+WifiChoice wifiChoices[SAVED_WIFI_COUNT];
+int wifiChoiceCount = 0;
+uint8_t wifiSwitchPage = 0;
+String wifiSwitchMessage;
+
+void scanWifiChoices() {
+  wifiChoiceCount = 0;
+  wifi_config_t stored = {};
+  wifiLegacySsid = esp_wifi_get_config(WIFI_IF_STA, &stored) == ESP_OK ? String((const char*)stored.sta.ssid) : String("");
+  int found = WiFi.scanNetworks(false, true);
+  if (wifiLegacySsid.length()) {
+    bool duplicate = false;
+    for (int slot = 0; slot < SAVED_WIFI_COUNT; ++slot) if (savedWifiSsids[slot] == wifiLegacySsid) duplicate = true;
+    int best = -1000;
+    for (int n = 0; n < found; ++n) if (WiFi.SSID(n) == wifiLegacySsid) best = max(best, (int)WiFi.RSSI(n));
+    if (!duplicate && best > -1000) wifiChoices[wifiChoiceCount++] = {-1, (int16_t)best};
+  }
+  for (int slot = 0; slot < SAVED_WIFI_COUNT; ++slot) {
+    if (!savedWifiSsids[slot].length()) continue;
+    int best = -1000;
+    for (int n = 0; n < found; ++n) if (WiFi.SSID(n) == savedWifiSsids[slot]) best = max(best, (int)WiFi.RSSI(n));
+    if (best > -1000) wifiChoices[wifiChoiceCount++] = {(int8_t)slot, (int16_t)best};
+  }
+  WiFi.scanDelete();
+  // Strongest first.
+  for (int i = 1; i < wifiChoiceCount; ++i) {
+    WifiChoice c = wifiChoices[i]; int j = i - 1;
+    while (j >= 0 && wifiChoices[j].rssi < c.rssi) { wifiChoices[j + 1] = wifiChoices[j]; --j; }
+    wifiChoices[j + 1] = c;
+  }
+}
+
+void drawWifiSwitch() {
+  if (screenNow != Screen::WifiSwitch) return;
+  int pages = max(1, (wifiChoiceCount + 3) / 4);
+  if (wifiSwitchPage >= pages) wifiSwitchPage = pages - 1;
+  title("Wi-Fi");
+  // Current network, home/away and page, under the title.
+  useUIFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(0x9EFF, BG);
+  String now = WiFi.status() == WL_CONNECTED
+    ? "目前：" + WiFi.SSID() + (homeLanReachable ? "（在家）" : "（在外）")
+    : String("目前：未連線");
+  M5.Display.setClipRect(80, 6, 176, 24);
+  M5.Display.drawString(now, 80, 11);
+  M5.Display.clearClipRect();
+  // Rescan button (top right).
+  M5.Display.fillRoundRect(262, 5, 54, 26, 6, PANEL);
+  M5.Display.drawRoundRect(262, 5, 54, 26, 6, ACCENT);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(ACCENT, PANEL);
+  M5.Display.drawString("掃描", 289, 18);
+  String current = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String("");
+  for (int row = 0; row < 4; ++row) {
+    int i = wifiSwitchPage * 4 + row;
+    if (i >= wifiChoiceCount) break;
+    const WifiChoice& c = wifiChoices[i];
+    String strength = c.rssi >= -60 ? "強" : (c.rssi >= -72 ? "中" : "弱");
+    bool connected = wifiChoiceSsid(c) == current;
+    drawSettingsRow(row, wifiChoiceSsid(c), connected ? "已連線 · " + strength : strength);
+  }
+  if (!wifiChoiceCount) {
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(UI_MUTED, BG);
+    M5.Display.drawString("附近沒有已儲存的 Wi-Fi", 160, 110);
+    M5.Display.drawString("請在網頁後台「Wi-Fi 網路」新增", 160, 136);
+  }
+  if (wifiSwitchMessage.length()) {
+    useUIFont(1);
+    M5.Display.fillRoundRect(30, 96, 260, 44, 10, UI_BLUE);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(TFT_WHITE, UI_BLUE);
+    M5.Display.drawString(wifiSwitchMessage, 160, 118);
+  }
+  drawBottomBar(wifiSwitchPage ? "Previous" : "", wifiSwitchPage + 1 < pages ? String("Next " + String(wifiSwitchPage + 1) + "/" + String(pages)).c_str() : "", "Close");
+}
+
+void showWifiSwitch() {
+  screenNow = Screen::WifiSwitch;
+  wifiSwitchPage = 0;
+  wifiSwitchMessage = "掃描附近的 Wi-Fi…";
+  drawWifiSwitch();
+  scanWifiChoices();
+  wifiSwitchMessage = "";
+  drawWifiSwitch();
+}
+
+void connectWifiChoice(int index) {
+  if (index < 0 || index >= wifiChoiceCount) return;
+  int slot = wifiChoices[index].slot;
+  String ssid = wifiChoiceSsid(wifiChoices[index]);
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
+    wifiSwitchMessage = "已經連在這個網路";
+    drawWifiSwitch(); delay(900); wifiSwitchMessage = ""; drawWifiSwitch();
+    return;
+  }
+  wifiSwitchMessage = "連線到 " + ssid + "…";
+  drawWifiSwitch();
+  if (slot < 0) {
+    beginLegacyWifiRetry(millis());  // the network stored by the setup hotspot
+  } else {
+    // Reuse the saved-profile recovery path so a failure falls back normally.
+    wifiRecoverySlots[0] = slot;
+    wifiRecoveryCount = 1;
+    wifiRecoveryIndex = 0;
+    beginSavedWifiAttempt(millis());
+  }
+  uint32_t started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < 15000UL) { delay(100); M5.update(); }
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiSwitchMessage = "已連線，IP " + WiFi.localIP().toString();
+    syncTime();
+  } else {
+    wifiSwitchMessage = "連線失敗，恢復自動連線";
+  }
+  drawWifiSwitch();
+  delay(1500);
+  wifiSwitchMessage = "";
+  drawWifiSwitch();
+}
+
+void handleWifiSwitchTap(int x, int y) {
+  haptic(12);
+  if (y < 34 && x >= 256) { showWifiSwitch(); return; }
+  int pages = max(1, (wifiChoiceCount + 3) / 4);
+  if (y >= 210) {
+    if (x < 107 && wifiSwitchPage) { --wifiSwitchPage; drawWifiSwitch(); }
+    else if (x >= 107 && x < 214 && wifiSwitchPage + 1 < pages) { ++wifiSwitchPage; drawWifiSwitch(); }
+    else if (x >= 214) { screenNow = Screen::Clock; drawClock(true); drawAstronaut(); }
+    return;
+  }
+  int row = settingsRowAt(y);
+  if (row >= 0) connectWifiChoice(wifiSwitchPage * 4 + row);
+}
+
 void fillNightLightScreen() {
   M5.Display.fillScreen(M5.Display.color565((nightLightColor >> 16) & 255, (nightLightColor >> 8) & 255, nightLightColor & 255));
+}
+
+// The time card of each face; only a long press here opens the calendar.
+bool inClockBox(int x, int y) {
+  if (clockFace == ClockFace::Matrix) return x >= 42 && x < 278 && y >= 72 && y < 185;
+  if (clockFace == ClockFace::Minimal) return x >= 27 && x < 293 && y >= 57 && y < 180;
+  return x >= 116 && y >= 116 && y < 208;  // Space: time + date block
 }
 
 void enterNightLightScreen() {
@@ -5814,12 +6782,12 @@ void handleTouch() {
   // changes brightness. One press can only trigger one action, so the press
   // that enters never immediately leaves again.
   static uint32_t pressStartedAt = 0;
-  static int16_t pressX = 0;
+  static int16_t pressX = 0, pressY = 0;
   static uint8_t pressBrightness = 0;
   static bool sliding = false;
   static bool pressHandled = false;
   if (t.wasPressed()) {
-    pressStartedAt = millis(); pressX = t.x; pressBrightness = screenNightBrightness;
+    pressStartedAt = millis(); pressX = t.x; pressY = t.y; pressBrightness = screenNightBrightness;
     sliding = false; pressHandled = false;
   }
   if (t.isPressed() && abs((int)t.x - pressX) > 12) sliding = true;
@@ -5833,6 +6801,17 @@ void handleTouch() {
     if (touchDebugLog.length() > 1500) touchDebugLog.remove(0, touchDebugLog.length() - 1500);
   }
 
+  if (screenNow == Screen::WifiSwitch) {
+    if (!screenSleeping && !wakeTouchConsumed && t.wasReleased() && !pressHandled && !sliding && abs((int)t.y - pressY) < 20)
+      handleWifiSwitchTap(t.x, t.y);
+    if (screenSleeping || wakeTouchConsumed) { /* fall through to wake handling */ } else return;
+  }
+  if (screenNow == Screen::Messages || screenNow == Screen::MessageDetail || screenNow == Screen::MessageReply
+      || screenNow == Screen::MessageFull || screenNow == Screen::MessageHub) {
+    if (!screenSleeping && !wakeTouchConsumed && t.wasReleased() && !pressHandled && !sliding && abs((int)t.y - pressY) < 20)
+      handleSignalTap(t.x, t.y);
+    if (screenSleeping || wakeTouchConsumed) { /* fall through to wake handling */ } else return;
+  }
   if (screenNow == Screen::NightLight) {
     if (sliding && t.isPressed() && !pressHandled) {
       int next = constrain((int)pressBrightness + ((int)t.x - pressX) * 100 / 280, 1, 100);
@@ -5861,8 +6840,17 @@ void handleTouch() {
     enterNightLightScreen();
     return;
   }
+  // Messages: long-press the top bar (IP address and the S/T badges).
+  // Generous target so it is easy to hit even on the busy Matrix face.
+  if (longHeld && !screenSleeping && !wakeTouchConsumed && alarmActive < 0
+      && screenNow == Screen::Clock && pressY < 70 && pressX < 220) {
+    pressHandled = true;
+    haptic(20);
+    showMessageHub();
+    return;
+  }
   // Calendar: long-press the clock face to open, long-press to go back.
-  if (longHeld && !screenSleeping && alarmActive < 0 && screenNow == Screen::Clock && t.y < 210) {
+  if (longHeld && !screenSleeping && alarmActive < 0 && screenNow == Screen::Clock && inClockBox(pressX, pressY)) {
     pressHandled = true;
     haptic(20);
     showCalendar();
@@ -6093,6 +7081,7 @@ void handleTouch() {
     else if (item == 3) showAlarms();
     else if (item == 4) { meditationSettingsPage = 0; showMeditationSettings(); }
     else if (item == 5) showFirmwareUpdate();
+    else if (item == 6) showWifiSwitch();
   } else if (screenNow == Screen::Faces) {
     if (t.y >= 52 && t.y < 196) {
       int selected = (t.y - 52) / 48;
@@ -6168,8 +7157,34 @@ void handleTouch() {
   }
 }
 
+// Serial self-test commands (for checking a clock that is away from home):
+//   t:cal  download the calendar      t:emo  check the emotion journal API
+//   t:sig  call the Signal bridge     t:net  print network/heap state
 void handleSerialConfig() {
-  while (Serial.available()) Serial.read();
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') { if (line.length() < 32) line += c; continue; }
+    String cmd = line; line = "";
+    uint32_t t0 = millis();
+    if (cmd == "t:cal") {
+      bool ok = fetchCalendar(calLocalMidnight(time(nullptr)));
+      Serial.printf("[test] calendar %s: %d events, %s, %lu ms\n", ok ? "ok" : "FAILED", calEventCount, calError.c_str(), (unsigned long)(millis() - t0));
+    } else if (cmd == "t:emo") {
+      bool ok = verifyEmotionApiConnection(true);
+      Serial.printf("[test] emotion API %s, %lu ms\n", ok ? "ok" : "FAILED", (unsigned long)(millis() - t0));
+    } else if (cmd == "t:sig") {
+      String response;
+      int code = signalRequest("/api/messages?since=999999", "", response);
+      Serial.printf("[test] signal bridge HTTP %d via %s, %lu ms\n", code, signalUsePublic ? "public" : "LAN", (unsigned long)(millis() - t0));
+    } else if (cmd == "t:touch") {
+      Serial.printf("[test] screen=%d sleeping=%d\n%s\n", (int)screenNow, screenSleeping, touchDebugLog.c_str());
+    } else if (cmd == "t:net") {
+      Serial.printf("[test] wifi=%s home=%d signal=%s msgs=%d cal=%d hass=%d heap=%u largest=%u\n", WiFi.SSID().c_str(),
+                    homeLanReachable, signalStatus.c_str(), signalMessageCount, calEventCount, hassAssistAuthenticated,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+  }
 }
 
 String htmlEscape(String value) {
@@ -6571,14 +7586,24 @@ void mqttMessage(char* topicChars, byte* payload, unsigned int length) {
   } else if (command == "settings" && value == "get") publishMqttSettings();
 }
 
+bool hostIsPrivate(const String& host) {
+  IPAddress ip;
+  if (!ip.fromString(host)) return host.endsWith(".local") || host.indexOf('.') < 0;
+  return ip[0] == 10 || (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) || (ip[0] == 192 && ip[1] == 168);
+}
+
 void maintainMqtt(uint32_t nowMs) {
   if (!mqttEnabled || !mqttHost.length() || WiFi.status()!=WL_CONNECTED) { if(mqttClient.connected()) mqttClient.disconnect(); return; }
+  // Away from home: a LAN broker cannot be reached; don't block on it.
+  if (!homeLanChecked) return;
+  if (!homeLanReachable && hostIsPrivate(mqttHost)) { if (mqttClient.connected()) mqttClient.disconnect(); return; }
   if (!mqttClient.connected()) {
     if (nowMs-lastMqttReconnect < 5000UL) return;
     lastMqttReconnect=nowMs;
     mqttClient.setServer(mqttHost.c_str(), mqttPort);
     mqttClient.setCallback(mqttMessage);
     mqttClient.setBufferSize(8192);
+    mqttClient.setSocketTimeout(3);  // never block the UI for 15 s on a dead link
     String clientId="SpaceClock-"+String((uint32_t)ESP.getEfuseMac(),HEX);
     bool ok = mqttUsername.length() ? mqttClient.connect(clientId.c_str(),mqttUsername.c_str(),mqttPassword.c_str()) : mqttClient.connect(clientId.c_str());
     if(ok) {
@@ -6601,7 +7626,7 @@ void maintainMqtt(uint32_t nowMs) {
 void sendSettingsPage(const String& message = "", const String& requestedPage = "", const String& requestedLanguage = "") {
   String pageId = requestedPage.length() ? requestedPage : settingsServer.arg("page");
   String language = requestedLanguage.length() ? requestedLanguage : settingsServer.arg("lang");
-  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "firmware") pageId = "clock";
+  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "signal" && pageId != "firmware") pageId = "clock";
   bool zh = language == "zh" || (!language.length());
   auto tr = [zh](const char* en, const char* zhText) -> String { return zh ? String(zhText) : String(en); };
   String page;
@@ -6613,11 +7638,11 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   char webTime[24]; snprintf(webTime, sizeof(webTime), "%04d-%02d-%02d %02d:%02d:%02d", webNow.date.year, webNow.date.month, webNow.date.date, webNow.time.hours, webNow.time.minutes, webNow.time.seconds);
   page += "<header><div><h1>" + tr("Space Clock settings", "太空時鐘設定") + "</h1><div class='muted'>" + tr("Device", "設備") + ": <b>" + htmlEscape(deviceName) + "</b> · " + tr("Network name", "網路名稱") + ": <b>" + networkHostname() + "</b><br>" + tr("IP", "設備 IP") + ": <b>" + WiFi.localIP().toString() + "</b> · " + tr("Device time", "裝置時間") + ": <b>" + webTime + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</div></div>";
   page += "<a class='lang' href='/?page=" + pageId + "&lang=" + String(zh ? "en" : "zh") + "'>" + tr("中文", "English") + "</a></header>";
-  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "hass", "companion", "calendar", "firmware"};
-  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "HASS Assist", "Companion", "Calendar", "Firmware"};
-  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "日曆", "韌體更新"};
+  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "hass", "companion", "calendar", "signal", "firmware"};
+  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "HASS Assist", "Companion", "Calendar", "Signal", "Firmware"};
+  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "日曆", "Signal", "韌體更新"};
   page += "<nav class='tabs'>";
-  for (int i = 0; i < 10; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
+  for (int i = 0; i < 11; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
   page += "</nav>";
   if (message.length()) page += "<p class='ok'>" + htmlEscape(message) + "</p>";
   if (pageId == "emotion") {
@@ -6637,6 +7662,10 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   page += "<form method='post' action='/save'><input type='hidden' name='page' value='" + pageId + "'><input type='hidden' name='lang' value='" + String(zh ? "zh" : "en") + "'><section class='panel'>";
 
   if (pageId == "wifi") {
+    page += "<div class='card'><b>" + tr("Current Wi-Fi", "目前連線的 Wi-Fi") + "</b><p>" + (WiFi.status() == WL_CONNECTED
+      ? htmlEscape(WiFi.SSID()) + " · " + tr("signal ", "訊號 ") + String(WiFi.RSSI()) + " dBm · " + WiFi.localIP().toString() + " · "
+        + (homeLanReachable ? tr("at home (LAN services)", "在家（使用內網服務）") : tr("away (external URLs)", "在外（使用外網網址）"))
+      : String(tr("Not connected", "未連線"))) + "</p></div>";
     page += "<h2>" + tr("Device identity", "設備識別") + "</h2><label class='field'>" + tr("Device name", "設備名稱") + "<input name='deviceName' maxlength='32' value='" + htmlEscape(deviceName) + "'></label><p class='muted'>" + tr("The network hostname is derived from this name and a unique chip ID. Saving a changed name restarts Wi-Fi so your router can update its device list.", "網路主機名稱會由此名稱加上晶片唯一編號產生。變更名稱並儲存後，設備會重新啟動 Wi-Fi，讓路由器更新設備清單。") + "</p>";
     page += "<h2>" + tr("Saved Wi-Fi networks", "已儲存的 Wi-Fi 網路") + "</h2><p class='muted'>" + tr("Up to 10 networks. Passwords stay on this Core2 and are never displayed. Leave a password blank to keep it unchanged.", "最多儲存 10 組網路。密碼只保存在 Core2，不會顯示；密碼留白即可保留原密碼。") + "</p>";
     for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
@@ -6751,6 +7780,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<div class='card'><b>Sherpa ONNX TTS/STT · Wyoming</b><p class='muted'>" + tr("Supported through Home Assistant's Assist Pipeline. In Home Assistant, finish adding the automatically discovered Wyoming service, then create or edit a Voice Assistant pipeline that uses Sherpa for both speech-to-text and text-to-speech. The Core2 must still use the Home Assistant URL below; do not enter ports 10400 or 10500 here.", "已透過 Home Assistant Assist Pipeline 支援。請先在 Home Assistant 完成加入自動探索到的 Wyoming 服務，再建立或編輯語音助理 Pipeline，將語音轉文字與文字轉語音都選為 Sherpa。Core2 下方仍應填 Home Assistant 網址；請勿在這裡填入 10400 或 10500 連接埠。") + "</p><p id='hassLiveStatus' class='muted'>" + tr("Checking Home Assistant connection...", "正在檢查 Home Assistant 連線……") + "</p><button class='btn secondary' type='button' onclick='refreshHassStatus(true)'>" + tr("Refresh connection and pipelines", "重新偵測連線與 Pipeline") + "</button></div>";
     page += "<label class='check'><input type='checkbox' name='hassEnabled'" + String(hassAssistEnabled ? " checked" : "") + ">" + tr("Enable HASS Assist", "啟用 HASS Assist") + "</label>";
     page += "<label class='field'>" + tr("Home Assistant base URL", "Home Assistant 基礎網址") + "<input name='hassBaseUrl' inputmode='url' placeholder='http://homeassistant.local:8123' value='" + htmlEscape(hassAssistBaseUrl) + "'></label>";
+    page += "<label class='field'>" + tr("External URL (used away from home)", "外網網址（不在家時使用）") + "<input name='hassExternalUrl' inputmode='url' placeholder='https://xxxx.ui.nabu.casa' value='" + htmlEscape(hassAssistExternalUrl) + "'></label>";
     page += "<label class='field'>" + tr("Long-lived access token", "長期存取權杖") + "<input type='password' name='hassToken' autocomplete='new-password' placeholder='" + tr(hassAssistToken.length() ? "Saved — leave blank to keep current" : "Paste a Home Assistant long-lived token", hassAssistToken.length() ? "已儲存—留白即可保留目前權杖" : "貼上 Home Assistant 長期存取權杖") + "'></label>";
     page += "<label class='check'><input type='checkbox' name='hassClearToken'>" + tr("Forget the saved token", "清除已儲存的權杖") + "</label>";
     page += "<fieldset class='field'><legend>" + tr("Voice mode", "發話方式") + "</legend>";
@@ -6775,6 +7805,12 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "</select></label>";
     page += "<label class='field'>" + tr("Voice reply volume", "語音回覆音量") + ": <output id='hassVolumeOut'>" + String(hassAssistVolume) + "%</output><input type='range' min='5' max='100' step='5' name='hassVolume' value='" + String(hassAssistVolume) + "' oninput='hassVolumeOut.value=this.value+\"%\"'></label>";
     page += "<p class='muted'>" + tr("The token is stored only in this Core2's Preferences and is never published to GitHub or MQTT. Because this settings page is local HTTP, configure it only on a trusted Wi-Fi network. MP3 and WAV voice replies are supported.", "權杖只會保存在這台 Core2 的偏好設定，不會上傳 GitHub 或 MQTT。因本設定頁是區域網路 HTTP，請只在可信任的 Wi-Fi 設定。支援 MP3 與 WAV 語音回覆。") + "</p>";
+  } else if (pageId == "signal") {
+    page += "<h2>Signal</h2><p class='muted'>" + tr("Messages come from the Signal bridge on your NAS. The LAN URL is tried first; the public (Cloudflare Tunnel) URL is used when the LAN is unreachable. Copy the token from the bridge admin page. Triple-tap any screen to open messages.", "訊息來自 NAS 上的 Signal 轉接服務。會先試內網網址，連不到時改用外網（Cloudflare Tunnel）網址。權杖請從轉接後台複製。任一畫面點三下即可開啟訊息。") + "</p>";
+    page += "<label class='field'>" + tr("LAN URL", "內網網址") + "<input name='sigLan' inputmode='url' placeholder='http://10.41.10.5:18081' value='" + htmlEscape(signalLanUrl) + "'></label>";
+    page += "<label class='field'>" + tr("Public URL", "外網網址") + "<input name='sigPub' inputmode='url' placeholder='https://174mqtt.theoakhouse.org' value='" + htmlEscape(signalPublicUrl) + "'></label>";
+    page += "<label class='field'>" + tr("Access token", "存取權杖") + "<input type='password' name='sigTok' autocomplete='new-password' placeholder='" + tr(signalToken.length() ? "Saved - leave blank to keep" : "Paste the token from the bridge admin page", signalToken.length() ? "已儲存—留白即保留" : "貼上轉接後台的權杖") + "'></label>";
+    page += "<p class='muted'>" + tr("Status: ", "狀態：") + htmlEscape(signalStatus.length() ? signalStatus : String(tr("not connected yet", "尚未連線"))) + " · " + tr("messages: ", "訊息數：") + String(signalMessageCount) + "</p>";
   } else if (pageId == "calendar") {
     page += "<h2>" + tr("Calendar", "日曆") + "</h2><p class='muted'>" + tr("Paste an iCal (.ics) subscription URL, e.g. Google Calendar's \"Secret address in iCal format\". On the clock, long-press the screen to open the calendar; swipe left for month, right for week; long-press again to return.", "貼上 iCal（.ics）訂閱網址，例如 Google 日曆的「iCal 格式的私人網址」。在時鐘畫面長按進入日曆；往左滑為月模式、往右滑為週模式；再長按回到時鐘。") + "</p>";
     page += "<label class='field'>" + tr("iCal URL", "iCal 網址") + "<input name='icalUrl' inputmode='url' placeholder='https://calendar.google.com/calendar/ical/.../basic.ics' value='" + htmlEscape(calendarIcalUrl) + "'></label>";
@@ -6960,7 +7996,7 @@ void setupSettingsServer() {
   settingsServer.on("/save", HTTP_POST, []() {
     String pageId = settingsServer.arg("page");
     String language = settingsServer.arg("lang");
-    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "firmware") pageId = "clock";
+    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "signal" && pageId != "firmware") pageId = "clock";
     bool wifiChanged = false;
     bool deviceNameChanged = false;
     bool emotionBaseRejected = false;
@@ -7094,6 +8130,11 @@ void setupSettingsServer() {
       if (reconnectHassAssist) hassAssistWakeWordPaused = false;
       hassAssistEnabled = nextEnabled;
       hassAssistBaseUrl = nextBase;
+      String nextExternal = settingsServer.arg("hassExternalUrl"); nextExternal.trim();
+      while (nextExternal.endsWith("/")) nextExternal.remove(nextExternal.length() - 1);
+      if (nextExternal.length() && !nextExternal.startsWith("https://") && !nextExternal.startsWith("http://")) nextExternal = hassAssistExternalUrl;
+      reconnectHassAssist |= nextExternal != hassAssistExternalUrl;
+      hassAssistExternalUrl = nextExternal;
       hassAssistPipeline = nextPipeline;
       hassAssistWakeWordEnabled = nextWakeWordEnabled;
       hassAssistVolume = constrain(settingsServer.arg("hassVolume").toInt(), 5, 100);
@@ -7105,6 +8146,12 @@ void setupSettingsServer() {
         hassAssistToken = settingsServer.arg("hassToken");
         hassAssistToken.trim();
       }
+    } else if (pageId == "signal") {
+      signalLanUrl = settingsServer.arg("sigLan"); signalLanUrl.trim(); while (signalLanUrl.endsWith("/")) signalLanUrl.remove(signalLanUrl.length() - 1);
+      signalPublicUrl = settingsServer.arg("sigPub"); signalPublicUrl.trim(); while (signalPublicUrl.endsWith("/")) signalPublicUrl.remove(signalPublicUrl.length() - 1);
+      String nextToken = settingsServer.arg("sigTok"); nextToken.trim();
+      if (nextToken.length()) signalToken = nextToken;
+      signalUsePublic = false; signalNextPollAt = 0;
     } else if (pageId == "calendar") {
       String nextUrl = settingsServer.arg("icalUrl"); nextUrl.trim();
       if (nextUrl != calendarIcalUrl) { calendarIcalUrl = nextUrl; calFetchedAt = 0; calEventCount = 0; }
@@ -7164,7 +8211,14 @@ void setupSettingsServer() {
                         : (language == "zh" ? "同步失敗：" : "Sync failed: ") + calError, "calendar", language);
   });
   settingsServer.on("/debug", HTTP_GET, []() {
-    String out = "night_led=" + String(nightLedShowing) + " manual_override=" + String(manualNightLightOverride)
+    nvs_stats_t nvs = {};
+    nvs_get_stats(NULL, &nvs);
+    int wifiProfiles = 0;
+    for (int i = 0; i < SAVED_WIFI_COUNT; ++i) if (savedWifiSsids[i].length()) ++wifiProfiles;
+    String out = "nvs_used=" + String(nvs.used_entries) + " nvs_free=" + String(nvs.free_entries)
+      + " nvs_total=" + String(nvs.total_entries) + " write_failures=" + String(settingsWriteFailures)
+      + " wifi_profiles=" + String(wifiProfiles) + "\n";
+    out += "night_led=" + String(nightLedShowing) + " manual_override=" + String(manualNightLightOverride)
       + " manual_active=" + String(manualNightLightActive) + " sleeping=" + String(screenSleeping)
       + " screen=" + String((int)screenNow) + "\n" + touchDebugLog;
     settingsServer.send(200, "text/plain; charset=utf-8", out);
@@ -7173,6 +8227,16 @@ void setupSettingsServer() {
   settingsServer.begin();
   settingsServerReady = true;
 }
+
+// TLS buffers in PSRAM: each TLS session needs ~40 KB and internal RAM ran
+// out away from home (HA websocket + a second HTTPS request => X509/alloc
+// failures, HTTP -1). mbedTLS is built with MBEDTLS_PLATFORM_MEMORY, so its
+// allocator can be redirected at runtime; fall back to internal RAM.
+static void* tlsCalloc(size_t n, size_t size) {
+  void* p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p ? p : heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+static void tlsFree(void* p) { heap_caps_free(p); }
 
 void setup() {
   auto cfg = M5.config();
@@ -7221,6 +8285,22 @@ void setup() {
   }
   Serial.printf("[display] Matrix canvas: %s (%d bpp)\n", matrixCanvasReady ? "ready" : "FAILED", matrixCanvas.getColorDepth());
   loadSettings();
+  if (!netMutex) netMutex = xSemaphoreCreateRecursiveMutex();
+  mbedtls_platform_set_calloc_free(tlsCalloc, tlsFree);
+  pendingMutex = xSemaphoreCreateMutex();
+  calFetchMutex = xSemaphoreCreateMutex();
+  // Network work (Signal, calendar, home/away probe) runs in its own task on
+  // core 1 so slow links never freeze the UI. On core 0 (with the Wi-Fi/lwIP
+  // stack) TLS reads busy-waited and starved IDLE0, tripping its watchdog.
+  xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 1);
+  {
+    nvs_stats_t nvs = {};
+    nvs_get_stats(NULL, &nvs);
+    int profiles = 0;
+    for (int i = 0; i < SAVED_WIFI_COUNT; ++i) if (savedWifiSsids[i].length()) ++profiles;
+    Serial.printf("[settings] NVS used=%u free=%u total=%u, wifi profiles=%d\n",
+                  (unsigned)nvs.used_entries, (unsigned)nvs.free_entries, (unsigned)nvs.total_entries, profiles);
+  }
   sanitizeRtcOnBoot();
   lastUserActivity = millis();
   m5::rtc_datetime_t startupTime; getClockDateTime(&startupTime); applyDisplayBrightness(startupTime);
@@ -7229,6 +8309,71 @@ void setup() {
   wifiRecoveryPhaseStartedAt = millis();
   drawClock(true); drawAstronaut();
 }
+
+// Report any loop section that blocks the UI for more than 300 ms.
+#define SLOW_SECTION(name, code) do { uint32_t _t0 = millis(); code; uint32_t _dt = millis() - _t0; \
+  if (_dt > 300) Serial.printf("[slow] %s took %lu ms\n", name, (unsigned long)_dt); } while (0)
+
+// Is the home network reachable? Try the Home Assistant / MQTT host briefly.
+void checkHomeLan(uint32_t nowMs) {
+  static bool wasConnected = false;
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected && !wasConnected) { homeLanCheckAt = 0; homeLanChecked = false; }  // new Wi-Fi: check right away
+  wasConnected = connected;
+  if (!connected || (homeLanCheckAt && (int32_t)(nowMs - homeLanCheckAt) < 0)) return;
+  homeLanCheckAt = nowMs + 300000UL;
+  // Probe the first home-LAN host among Home Assistant, MQTT and the Signal bridge.
+  String host; uint16_t port = 0;
+  auto parse = [&](String url, uint16_t defaultPort) {
+    bool secure = url.startsWith("https://");
+    if (url.startsWith("http://") || secure) url.remove(0, secure ? 8 : 7);
+    int slash = url.indexOf('/'); if (slash >= 0) url.remove(slash);
+    int colon = url.lastIndexOf(':');
+    String h = colon > 0 ? url.substring(0, colon) : url;
+    if (!h.length() || !hostIsPrivate(h)) return false;
+    host = h; port = colon > 0 ? url.substring(colon + 1).toInt() : (secure ? 443 : defaultPort);
+    return true;
+  };
+  if (!(hassAssistBaseUrl.length() && parse(hassAssistBaseUrl, 80))
+      && !(mqttHost.length() && parse(mqttHost + ":" + String(mqttPort), mqttPort))
+      && !(signalLanUrl.length() && parse(signalLanUrl, 80))) host = "";
+  if (!host.length() || !hostIsPrivate(host)) { homeLanReachable = true; homeLanChecked = true; return; }
+  WiFiClient probe;
+  bool reachable = probe.connect(host.c_str(), port, 700);
+  probe.stop();
+  homeLanChecked = true;
+  if (reachable == homeLanReachable) return;
+  homeLanReachable = reachable;
+  Serial.printf("[network] %s (%s)\n", reachable ? "at home: using LAN services" : "away: using external URLs", WiFi.SSID().c_str());
+  // Switch services to the matching addresses. The sockets belong to the UI
+  // loop, so only raise a flag here; loop() performs the reconnects.
+  signalUsePublic = !reachable;
+  signalNextPollAt = 0;
+  homeLanChanged = true;
+}
+
+void applyHomeLanChange() {
+  if (!homeLanChanged) return;
+  homeLanChanged = false;
+  if (hassAssistSocketStarted) { hassAssistWebSocket.disconnect(); hassAssistSocketStarted = false; hassAssistSocketConnected = false; hassAssistAuthenticated = false; }
+  if (!homeLanReachable && mqttClient.connected()) mqttClient.disconnect();
+}
+
+// Background network task (core 0): home/away probe, Signal fetch, calendar.
+void netTask(void*) {
+  for (;;) {
+    uint32_t nowMs = millis();
+    if (WiFi.status() != WL_CONNECTED || !wifiConnectedAt || nowMs - wifiConnectedAt < 8000UL) {
+      vTaskDelay(pdMS_TO_TICKS(200));  // let the connect-time DNS/SNTP finish first
+      continue;
+    }
+    checkHomeLan(nowMs);
+    fetchSignalMessagesInBackground(nowMs);
+    maintainCalendar(nowMs);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 
 void loop() {
   M5.update();
@@ -7242,7 +8387,7 @@ void loop() {
   handleTouch();
   handleSerialConfig();
   uint32_t nowMs = millis();
-  maintainHassAssist(nowMs);
+  SLOW_SECTION("hass", maintainHassAssist(nowMs));
   if (alarmActive >= 0 && screenNow == Screen::Clock && clockFace == ClockFace::Matrix
       && nowMs - lastAlarmChallengeDraw >= 65UL) {
     lastAlarmChallengeDraw = nowMs;
@@ -7252,7 +8397,11 @@ void loop() {
       dismissAlarm();
     }
   }
-  maintainSavedWifi(nowMs);
+  SLOW_SECTION("wifi", maintainSavedWifi(nowMs));
+  applyHomeLanChange();
+
+  SLOW_SECTION("signal", pollSignalMessages(nowMs));
+
   // Upload the offline emotion queue in the background on every screen.
   // Skip only while audio must not stutter (alarm ringing, Assist recording
   // or speaking), and back off after failures so a dead network does not
@@ -7293,7 +8442,7 @@ void loop() {
       else showEmotionSettings();
     }
   }
-  maintainMqtt(nowMs);
+  SLOW_SECTION("mqtt", maintainMqtt(nowMs));
   if (meditationAmbientPendingAt && (int32_t)(nowMs - meditationAmbientPendingAt) >= 0) {
     meditationAmbientPendingAt = 0;
     playMeditationAmbient();

@@ -1,0 +1,26 @@
+services:
+  signal-cli:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: signal-cli
+    environment:
+      MODE: "json-rpc"
+      JAVA_OPTS: "-Xmx256m"
+    volumes:
+      - ./data:/home/.local/share/signal-cli
+    ports:
+      # LAN only; the REST API has no authentication of its own.
+      - "10.41.10.5:18080:8080"
+    restart: unless-stopped
+  signal-bridge:
+    build: ./bridge
+    image: signal-bridge:local
+    container_name: signal-bridge
+    environment:
+      SIGNAL_API: "http://signal-cli:8080"
+    volumes:
+      - ./bridge-data:/data
+    ports:
+      - "10.41.10.5:18081:8081"
+    depends_on:
+      - signal-cli
+    restart: unless-stopped

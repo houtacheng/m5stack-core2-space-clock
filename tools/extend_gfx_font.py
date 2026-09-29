@@ -26,6 +26,11 @@ def common_chinese():
         for lo in list(range(0x40, 0x7F)) + list(range(0xA1, 0xFF)):
             try: chars.add(bytes([hi, lo]).decode("big5"))
             except UnicodeDecodeError: pass
+    # Big5 level 2 (less common hanzi): names of people and groups use them.
+    for hi in range(0xC9, 0xFA):
+        for lo in list(range(0x40, 0x7F)) + list(range(0xA1, 0xFF)):
+            try: chars.add(bytes([hi, lo]).decode("big5"))
+            except UnicodeDecodeError: pass
     chars.update("，。、；：？！「」『』（）《》〈〉…—～·％＋－＝／")
     chars.update(chr(c) for c in range(0x30A1, 0x30F7))  # katakana for Matrix rain
     return {ord(c) for c in chars if 0x20 < ord(c) <= 0xFFFF}
