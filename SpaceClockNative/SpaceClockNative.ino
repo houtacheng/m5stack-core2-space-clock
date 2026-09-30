@@ -188,6 +188,7 @@ uint8_t alarmSound = 0;
 bool use24HourTime = true;
 bool flatVirtualButtonsEnabled = false;
 uint16_t screenOffSeconds = 300;
+bool wakeByTouch = true;  // false: only the power button wakes a sleeping screen
 bool meditationSoundEnabled = true;
 uint16_t meditationPresetMinutes[2] = {5, 15};
 uint8_t meditationStartSound = 1;
@@ -658,6 +659,7 @@ void saveSettings() {
   prefs.putBool("time24", use24HourTime);
   prefs.putBool("flatBtns", flatVirtualButtonsEnabled);
   prefs.putUShort("screenOff", screenOffSeconds);
+  prefs.putBool("wakeTouch", wakeByTouch);
   prefs.putBool("fwAuto", automaticFirmwareUpdate);
   prefs.putUChar("fwHour", firmwareCheckHour);
   prefs.putBool("medSound", meditationSoundEnabled);
@@ -756,6 +758,7 @@ void loadSettings() {
   use24HourTime = prefs.getBool("time24", true);
   flatVirtualButtonsEnabled = prefs.getBool("flatBtns", false);
   screenOffSeconds = prefs.getUShort("screenOff", 300);
+  wakeByTouch = prefs.getBool("wakeTouch", true);
   automaticFirmwareUpdate = prefs.getBool("fwAuto", false);
   firmwareCheckHour = constrain((int)prefs.getUChar("fwHour", 3), 0, 23);
   meditationSoundEnabled = prefs.getBool("medSound", true);
@@ -1138,8 +1141,15 @@ void wakeDisplay() {
   applyDisplayBrightness(wakeTime);
 }
 
+void sleepDisplay(uint32_t nowMs) {
+  screenSleeping = true;
+  screenSleepStarted = nowMs;
+  motionBaselineReady = false;
+  M5.Display.setBrightness(0);
+}
+
 void checkMotionWake(uint32_t nowMs) {
-  if (!screenSleeping || !M5.Imu.isEnabled() || nowMs - lastMotionSample < 100) return;
+  if (!wakeByTouch || !screenSleeping || !M5.Imu.isEnabled() || nowMs - lastMotionSample < 100) return;
   lastMotionSample = nowMs;
   M5.Imu.update();
   float ax, ay, az, gx, gy, gz;
@@ -3437,7 +3447,7 @@ void cycleScreenOffTime() {
 uint8_t clockSettingsPage = 0;
 void showSettings() {
   screenNow = Screen::Settings;
-  char heading[24]; snprintf(heading, sizeof(heading), "Clock settings %u/3", clockSettingsPage + 1);
+  char heading[24]; snprintf(heading, sizeof(heading), "Clock settings %u/4", clockSettingsPage + 1);
   title(heading);
   if (clockSettingsPage == 0) {
     drawSettingsRow(0, "Time zone", TIME_ZONES[timeZoneIndex].city);
@@ -3449,6 +3459,8 @@ void showSettings() {
     drawSettingsRow(1, "Screen off", screenOffText());
     drawSettingsRow(2, "Time format", use24HourTime ? "24 hour" : "12 hour");
     drawSettingsRow(3, "Flat buttons", flatVirtualButtonsEnabled ? "ON" : "OFF");
+  } else if (clockSettingsPage == 3) {
+    drawSettingsRow(0, "Wake screen", wakeByTouch ? "Touch" : "Button");
   } else {
     const char* modes[] = {"Stay on", "Timed off", "Timed fade"};
     drawSettingsRow(0, "Night light", nightLightEnabled ? "ON" : "OFF");
@@ -3456,7 +3468,7 @@ void showSettings() {
     drawSettingsRow(2, "LED brightness", String(nightLightBrightness) + "%");
     drawSettingsRow(3, "Mode", modes[nightLightMode]);
   }
-  drawBottomBar(clockSettingsPage ? "Previous" : "NTP sync", clockSettingsPage < 2 ? "Next" : "", "Close");
+  drawBottomBar(clockSettingsPage ? "Previous" : "NTP sync", clockSettingsPage < 3 ? "Next" : "", "Close");
 }
 
 int compareFirmwareVersions(const String& left, const String& right) {
@@ -3902,7 +3914,7 @@ void updateAlarmBaseLights(uint32_t nowMs) {
     color = alarmLightColor;
   } else if (screenNow == Screen::NightLight) {
     color = nightLightColor;
-    strength = nightLightBrightness;
+    strength = screenNightBrightness ? screenNightBrightness : nightLightBrightness;
   } else if (manualNightLightOverride) {
     if (manualNightLightActive) {
       color = nightLightColor;
@@ -6825,6 +6837,7 @@ void handleTouch() {
         screenNightBrightness = next;
         M5.Display.setBrightness((uint8_t)max(1, screenNightBrightness * 255 / 100));
         showNightBrightnessLabel();
+        updateAlarmBaseLights(millis() + 1000);  // LEDs follow the slider
       }
     }
     if (longHeld) {
@@ -6879,7 +6892,7 @@ void handleTouch() {
     return;
   }
   if (screenSleeping) {
-    if (t.wasPressed() || t.isPressed()) {
+    if (wakeByTouch && (t.wasPressed() || t.isPressed())) {
       wakeDisplay();
       wakeTouchConsumed = true;
     }
@@ -7121,7 +7134,7 @@ void handleTouch() {
     if (t.y >= 210) {
       if (t.x < 107) {
         if (clockSettingsPage) --clockSettingsPage; else syncTime();
-      } else if (t.x < 214 && clockSettingsPage < 2) {
+      } else if (t.x < 214 && clockSettingsPage < 3) {
         ++clockSettingsPage;
       }
     } else if (row < 0) {
@@ -7136,6 +7149,8 @@ void handleTouch() {
       else if (row == 1) cycleScreenOffTime();
       else if (row == 2) use24HourTime = !use24HourTime;
       else flatVirtualButtonsEnabled = !flatVirtualButtonsEnabled;
+    } else if (clockSettingsPage == 3) {
+      if (row == 0) wakeByTouch = !wakeByTouch;
     } else {
       if (row == 0) nightLightEnabled = !nightLightEnabled;
       else if (row == 1) {
@@ -7391,6 +7406,7 @@ void publishMqttSettings() {
   doc["day_brightness"] = dayBrightness;
   doc["night_brightness"] = nightBrightness;
   doc["screen_off_seconds"] = screenOffSeconds;
+  doc["wake_by_touch"] = wakeByTouch;
   doc["alarm_volume"] = alarmVolume;
   doc["alarm_sound"] = alarmSound;
   JsonObject night = doc["night_light"].to<JsonObject>();
@@ -7456,6 +7472,7 @@ bool applyMqttSettings(const String& payload, String& error) {
   if (root["adaptive_brightness"].is<bool>()) adaptiveBrightness = root["adaptive_brightness"].as<bool>();
   if (root["day_brightness"].is<int>()) dayBrightness = constrain(root["day_brightness"].as<int>(), 10, 100);
   if (root["night_brightness"].is<int>()) nightBrightness = constrain(root["night_brightness"].as<int>(), 5, 100);
+  if (root["wake_by_touch"].is<bool>()) wakeByTouch = root["wake_by_touch"].as<bool>();
   if (root["screen_off_seconds"].is<int>()) screenOffSeconds = constrain(root["screen_off_seconds"].as<int>(), 0, 1800);
   if (root["alarm_volume"].is<int>()) alarmVolume = constrain(root["alarm_volume"].as<int>(), 10, 100);
   if (root["alarm_sound"].is<int>()) alarmSound = constrain(root["alarm_sound"].as<int>(), 0, 3);
@@ -7702,6 +7719,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     const uint16_t offValues[] = {0,30,60,300,600,1800}; const char* offEn[] = {"Never","30 seconds","1 minute","5 minutes","10 minutes","30 minutes"}; const char* offZh[] = {"永不","30 秒","1 分鐘","5 分鐘","10 分鐘","30 分鐘"};
     for (int i = 0; i < 6; ++i) page += "<option value='" + String(offValues[i]) + "'" + (screenOffSeconds == offValues[i] ? " selected" : "") + ">" + tr(offEn[i], offZh[i]) + "</option>";
     page += "</select></label>";
+    page += "<label class='field'>" + tr("Wake the screen by", "喚醒螢幕方式") + "<select name='wakeMode'><option value='1'" + String(wakeByTouch ? " selected" : "") + ">" + tr("Touch, movement or power button", "碰觸、移動或電源鍵") + "</option><option value='0'" + String(!wakeByTouch ? " selected" : "") + ">" + tr("Power button only", "只用電源鍵") + "</option></select></label>";
     page += "<h2>" + tr("Night light", "小夜燈") + "</h2><p class='muted'>" + tr("Long-press the gear icon on the clock to manually toggle the light. This setting controls automatic lighting while the display is off.", "在時鐘首頁長按齒輪可手動開關小夜燈。以下設定控制螢幕關閉時的自動亮燈。") + "</p>";
     page += "<label class='check'><input type='checkbox' name='nightLight'" + String(nightLightEnabled ? " checked" : "") + ">" + tr("Enable automatic Bottom2 night light while screen is off", "螢幕關閉時自動開啟 Bottom2 小夜燈") + "</label>";
     page += "<div class='grid'><label class='field'>" + tr("LED color", "LED 顏色") + "<input type='color' name='nightColor' value='" + colorHex(nightLightColor) + "'></label>";
@@ -8037,6 +8055,7 @@ void setupSettingsServer() {
       dayBrightness = constrain(settingsServer.arg("dayBrightness").toInt(), 10, 100);
       nightBrightness = constrain(settingsServer.arg("nightBrightness").toInt(), 5, 100);
       screenOffSeconds = constrain(settingsServer.arg("screenOff").toInt(), 0, 1800);
+      wakeByTouch = settingsServer.arg("wakeMode").toInt() != 0;
       nightLightEnabled = settingsServer.hasArg("nightLight");
       nightLightColor = parseWebColor(settingsServer.arg("nightColor"), nightLightColor);
       nightLightBrightness = constrain(settingsServer.arg("nightLedBrightness").toInt(), 1, 100);
@@ -8393,6 +8412,16 @@ void loop() {
   handleTouch();
   handleSerialConfig();
   uint32_t nowMs = millis();
+  if (M5.BtnPWR.wasClicked()) {
+    // Short press of the power button: wake a sleeping screen, otherwise
+    // turn the screen off right away.
+    if (screenSleeping) wakeDisplay();
+    else if (alarmActive < 0) {
+      if (screenNow == Screen::NightLight) exitNightLightScreen();
+      haptic(12);
+      sleepDisplay(nowMs);
+    }
+  }
   SLOW_SECTION("hass", maintainHassAssist(nowMs));
   if (alarmActive >= 0 && screenNow == Screen::Clock && clockFace == ClockFace::Matrix
       && nowMs - lastAlarmChallengeDraw >= 65UL) {
@@ -8463,10 +8492,7 @@ void loop() {
   }
   updateAlarmBaseLights(nowMs);
   if (!screenSleeping && alarmActive < 0 && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
-    screenSleeping = true;
-    screenSleepStarted = nowMs;
-    motionBaselineReady = false;
-    M5.Display.setBrightness(0);
+    sleepDisplay(nowMs);
   }
   checkMotionWake(nowMs);
   static uint32_t lastAlarmCheck = 0;
