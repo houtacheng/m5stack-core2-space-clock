@@ -1175,16 +1175,15 @@ void drawStatusDeviceName(Gfx& gfx, int ipRight, uint16_t color) {
   if (right - left < 24 || !deviceName.length()) return;
   String name = deviceName;
   if (signalUnread) {
-    // Two badges: blue "S n" for Signal, purple "T n" for Teams.
+    // Two count bubbles: blue for Signal, purple for Teams.
     int counts[2] = {0, 0};
     for (int i = 0; i < signalMessageCount; ++i)
       if (signalMessages[i].unread) ++counts[strncmp(signalMessages[i].chat, "teams:", 6) ? 0 : 1];
     const uint16_t colors[2] = {0x3A7F, 0x6A7B};
-    const char* letters[2] = {"S ", "T "};
     String labels[2]; int widths[2] = {0, 0}, total = 0;
     for (int k = 0; k < 2; ++k) {
       if (!counts[k]) continue;
-      labels[k] = String(letters[k]) + counts[k];
+      labels[k] = String(counts[k]);
       widths[k] = gfx.textWidth(labels[k]) + 12;
       total += widths[k] + (total ? 6 : 0);
     }
@@ -6859,7 +6858,7 @@ void handleTouch() {
     enterNightLightScreen();
     return;
   }
-  // Messages: long-press the top bar (IP address and the S/T badges).
+  // Messages: long-press the top bar (IP address and the unread bubbles).
   // Generous target so it is easy to hit even on the busy Matrix face.
   if (longHeld && !screenSleeping && !wakeTouchConsumed && alarmActive < 0
       && screenNow == Screen::Clock && pressY < 70 && pressX < 220) {
