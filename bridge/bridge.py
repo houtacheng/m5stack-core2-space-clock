@@ -20,6 +20,8 @@ CONFIG = "/data/config.json"
 MAX_KEEP = 500
 
 lock = threading.Lock()
+reply_dedupe = {}
+reply_dedupe_lock = threading.Lock()
 messages = []  # pruned by prune(): oldest READ messages go first, unread are kept
 next_id = 1
 groups = {}
@@ -677,7 +679,26 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         target = next((m for m in messages if m["id"] == int(req.get("id", -1))), None)
                 text = str(req.get("text") or "").strip()[:200]
+                # A retry (lost answer, failover, double tap) must not send twice:
+                # drop the same request id, or the same text to the same chat
+                # within a few seconds.
+                now_s = time.time()
+                key_rid = str(req.get("rid") or "")
+                key_txt = (str(req.get("chat") or req.get("id")), text)
+                with reply_dedupe_lock:
+                    for k in [k for k, t0 in reply_dedupe.items() if now_s - t0 > 60]:
+                        del reply_dedupe[k]
+                    dup = (key_rid and ("rid", key_rid) in reply_dedupe) or \
+                          (("txt",) + key_txt in reply_dedupe and now_s - reply_dedupe[("txt",) + key_txt] < 8)
+                    if not dup:
+                        if key_rid: reply_dedupe[("rid", key_rid)] = now_s
+                        reply_dedupe[("txt",) + key_txt] = now_s
+                if dup:
+                    print("duplicate reply ignored:", text[:20], flush=True)
+                    return self.send(200, {"ok": True, "duplicate": True})
                 if not target or not target.get("_to") or not text:
+                    with reply_dedupe_lock:
+                        reply_dedupe.pop(("rid", key_rid), None); reply_dedupe.pop(("txt",) + key_txt, None)
                     print("reply rejected: unknown chat", str(req.get("chat") or req.get("id"))[:40], flush=True)
                     return self.send(400, {"error": "unknown message or empty text"})
                 if str(target["_to"]).startswith("teams:"):
@@ -706,6 +727,10 @@ class Handler(BaseHTTPRequestHandler):
                 print("reply sent to message", target["id"], flush=True)
                 return self.send(200, {"ok": True})
             except Exception as e:
+                # Sending failed, so a retry must be allowed through.
+                with reply_dedupe_lock:
+                    for k in (("rid", locals().get("key_rid")), ("txt",) + tuple(locals().get("key_txt") or ())):
+                        reply_dedupe.pop(k, None)
                 print("reply failed:", e, flush=True)
                 return self.send(502, {"error": str(e)})
         if not self.is_local_admin():

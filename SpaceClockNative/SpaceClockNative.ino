@@ -1120,6 +1120,11 @@ void getClockDateTime(m5::rtc_datetime_t* dt) {
   }
 }
 
+// Battery saver: active automatically whenever no external power is present.
+bool powerSaveMode = false;
+const uint8_t POWER_SAVE_MAX_BRIGHTNESS = 40;  // percent
+const uint32_t POWER_SAVE_POLL_MS = 30000UL;   // message polling while the screen is off
+
 void applyDisplayBrightness(const m5::rtc_datetime_t& dt) {
   if (screenSleeping) return;
   if (screenNow == Screen::NightLight) {
@@ -1128,12 +1133,15 @@ void applyDisplayBrightness(const m5::rtc_datetime_t& dt) {
   }
   uint8_t percent = dayBrightness;
   if (adaptiveBrightness && (dt.time.hours < 7 || dt.time.hours >= 21)) percent = nightBrightness;
+  if (powerSaveMode && percent > POWER_SAVE_MAX_BRIGHTNESS) percent = POWER_SAVE_MAX_BRIGHTNESS;
   M5.Display.setBrightness((uint8_t)(percent * 255 / 100));
 }
 
 void wakeDisplay() {
   if (!screenSleeping) return;
   screenSleeping = false;
+  if (getCpuFrequencyMhz() != 160) setCpuFrequencyMhz(160);
+  signalNextPollAt = 0;  // catch up on messages right away
   lastUserActivity = millis();
   motionBaselineReady = false;
   m5::rtc_datetime_t wakeTime;
@@ -1148,8 +1156,30 @@ void sleepDisplay(uint32_t nowMs) {
   M5.Display.setBrightness(0);
 }
 
+// External power = USB/dock voltage present or the battery is charging. The
+// mode only flips after the state has been stable for a few seconds.
+void updatePowerSaveMode(uint32_t nowMs) {
+  static uint32_t lastCheck = 0, changedAt = 0;
+  static bool candidate = false;
+  if (nowMs - lastCheck >= 1000UL) {
+    lastCheck = nowMs;
+    bool external = M5.Power.getVBUSVoltage() >= 4000 || M5.Power.isCharging();
+    bool wanted = !external;
+    if (wanted != candidate) { candidate = wanted; changedAt = nowMs; }
+    if (candidate != powerSaveMode && nowMs - changedAt >= 3000UL) {
+      powerSaveMode = candidate;
+      Serial.printf("[power] battery saver %s\n", powerSaveMode ? "ON" : "OFF");
+      m5::rtc_datetime_t now; getClockDateTime(&now); applyDisplayBrightness(now);
+      if (!powerSaveMode) signalNextPollAt = 0;
+    }
+  }
+  // 80 MHz while the screen is off on battery; back to 160 MHz otherwise.
+  uint32_t wantMhz = powerSaveMode && screenSleeping ? 80 : 160;
+  if (getCpuFrequencyMhz() != wantMhz) setCpuFrequencyMhz(wantMhz);
+}
+
 void checkMotionWake(uint32_t nowMs) {
-  if (!wakeByTouch || !screenSleeping || !M5.Imu.isEnabled() || nowMs - lastMotionSample < 100) return;
+  if (!wakeByTouch || !screenSleeping || !M5.Imu.isEnabled() || nowMs - lastMotionSample < (powerSaveMode ? 1000UL : 100UL)) return;
   lastMotionSample = nowMs;
   M5.Imu.update();
   float ax, ay, az, gx, gy, gz;
@@ -1489,7 +1519,7 @@ void drawMatrixRainFrame(uint32_t nowMs) {
   }
   // 20 fps: smooth enough to read as falling rain while leaving time for the
   // SPI push of the full 320x240 frame and the rest of loop().
-  uint32_t frameInterval = 50;
+  uint32_t frameInterval = powerSaveMode ? 150 : 50;
   if (nowMs - lastMatrixFrame < frameInterval) return;
   float dt = lastMatrixFrame ? (nowMs - lastMatrixFrame) / 1000.0f : frameInterval / 1000.0f;
   if (dt > 0.25f) dt = 0.25f;
@@ -6008,7 +6038,10 @@ int signalRequestLocked(const String& path, const String& body, String& response
     HTTPClient http;
     http.useHTTP10(true);
     http.setConnectTimeout(https ? 8000 : 1500);
-    http.setTimeout(https ? 20000 : 3000);  // replies via Cloudflare + signal-cli can take a while
+    // Sending a reply goes through signal-cli / Graph and can take a while; a
+    // short LAN timeout would fail over to the public URL and send it twice.
+    bool isReply = path == "/api/reply";
+    http.setTimeout(isReply ? 25000 : (https ? 20000 : 3000));
     if (https) secure.setInsecure();
     if (!(https ? http.begin(secure, bases[i] + path) : http.begin(plain, bases[i] + path))) continue;
     http.addHeader("X-Token", signalToken);
@@ -6026,6 +6059,9 @@ int signalRequestLocked(const String& path, const String& body, String& response
       signalUsePublic = https;  // remember which path works
       return code;
     }
+    // A reply may already have been delivered when the answer was lost or
+    // timed out: only try the other URL if we never even connected (-1).
+    if (isReply && code != HTTPC_ERROR_CONNECTION_REFUSED) return code;
   }
   return code;
 }
@@ -6041,7 +6077,7 @@ void fetchSignalMessagesInBackground(uint32_t nowMs) {
   if (signalNextPollAt && (int32_t)(nowMs - signalNextPollAt) < 0) return;
   if (alarmActive >= 0 || hassAssistMicRunning || hassAssistAudioData || hassAssistMp3Decoder) return;
   signalLastPollAt = nowMs;
-  signalNextPollAt = nowMs + 5000UL;
+  signalNextPollAt = nowMs + (powerSaveMode && screenSleeping ? POWER_SAVE_POLL_MS : 5000UL);
   String response;
   uint32_t started = millis();
   int code = signalRequest("/api/messages?since=" + String(signalLastId), "", response);
@@ -6508,6 +6544,7 @@ void sendSignalReply(int choice) {
   JsonDocument req;
   req["chat"] = signalChatKey;
   req["text"] = SIGNAL_REPLIES[choice];
+  req["rid"] = String(millis()) + "-" + String((uint32_t)esp_random(), HEX);  // lets the bridge drop duplicates
   String body, response;
   serializeJson(req, body);
   int code = signalRequest("/api/reply", body, response);
@@ -7197,6 +7234,10 @@ void handleSerialConfig() {
       String response;
       int code = signalRequest("/api/messages?since=999999", "", response);
       Serial.printf("[test] signal bridge HTTP %d via %s, %lu ms\n", code, signalUsePublic ? "public" : "LAN", (unsigned long)(millis() - t0));
+    } else if (cmd == "t:pwr") {
+      Serial.printf("[test] saver=%d vbus=%d mV charging=%d battery=%d%% %d mV cpu=%u MHz\n", powerSaveMode,
+                    (int)M5.Power.getVBUSVoltage(), (int)M5.Power.isCharging(), (int)M5.Power.getBatteryLevel(),
+                    (int)M5.Power.getBatteryVoltage(), (unsigned)getCpuFrequencyMhz());
     } else if (cmd == "t:touch") {
       Serial.printf("[test] screen=%d sleeping=%d\n%s\n", (int)screenNow, screenSleeping, touchDebugLog.c_str());
     } else if (cmd == "t:net") {
@@ -8489,6 +8530,7 @@ void loop() {
     playMeditationSound(meditationEndSound, meditationEndVolume);
     drawMeditation();
   }
+  updatePowerSaveMode(nowMs);
   updateAlarmBaseLights(nowMs);
   if (!screenSleeping && alarmActive < 0 && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
     sleepDisplay(nowMs);
@@ -8528,7 +8570,7 @@ void loop() {
     lastPowerStatusDraw = nowMs;
     drawClockStatus(clockFace == ClockFace::Matrix ? TFT_BLACK : BG);
   }
-  uint32_t astronautFrameMs = M5.Power.isCharging() ? 120UL : 220UL;
+  uint32_t astronautFrameMs = powerSaveMode ? 600UL : (M5.Power.isCharging() ? 120UL : 220UL);
   if (screenNow == Screen::Clock && clockFace == ClockFace::Space && alarmActive < 0 && nowMs - lastAnim >= astronautFrameMs) {
     lastAnim = nowMs;
     astronautX += astronautDX; astronautY += astronautDY;
