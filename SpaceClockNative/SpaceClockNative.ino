@@ -6106,6 +6106,10 @@ void pollSignalMessages(uint32_t nowMs) {
       if (!s.chat[0]) strlcpy(s.chat, s.group[0] ? s.group : s.from, sizeof(s.chat));
       if (!s.chatName[0]) strlcpy(s.chatName, s.group[0] ? s.group : s.from, sizeof(s.chatName));
       s.unread = !s.own && !(m["read"] | true);
+      // Keep the list chronological (the bridge may backfill older messages).
+      for (int k = signalMessageCount - 1; k > 0 && signalMessages[k - 1].when > signalMessages[k].when; --k) {
+        SignalMessage tmp = signalMessages[k]; signalMessages[k] = signalMessages[k - 1]; signalMessages[k - 1] = tmp;
+      }
       if (s.unread && signalFirstPollDone) { ++fresh; if (!strncmp(s.chat, "teams:", 6)) ++freshTeams; }
     }
     if (list.size() >= 100) signalNextPollAt = 0;  // more waiting: fetch again right away
@@ -6514,6 +6518,8 @@ void sendSignalReply(int choice) {
 void signalSyncNow() {
   haptic(15);
   drawSignalSyncButton("同步中");
+  String ignored;
+  signalRequest("/api/sync", "{}", ignored);  // ask the bridge to check Teams right now
   signalNextPollAt = 0;  // the background task fetches right away
   uint32_t started = millis();
   while (!signalPendingCode && millis() - started < 8000UL) delay(20);

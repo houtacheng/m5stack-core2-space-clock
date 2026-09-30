@@ -244,6 +244,25 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 TEAMS_SCOPES = "offline_access User.Read Chat.ReadWrite"
 teams_state = {"access": "", "expires": 0, "device": None, "error": "", "last_poll": 0,
                "chat_seen": {}, "chat_names": {}, "baseline": 0}
+TEAMS_SEEN = "/data/teams_seen.json"
+teams_wake = threading.Event()  # set by /api/sync to poll Teams right away
+teams_poll_lock = threading.Lock()  # the loop and /api/sync must not poll at once
+
+
+def load_teams_seen():
+    try:
+        with open(TEAMS_SEEN, encoding="utf-8") as f:
+            teams_state["chat_seen"] = json.load(f)
+        teams_state["baseline"] = 1  # resume where we stopped; no messages lost across restarts
+    except (FileNotFoundError, ValueError):
+        pass
+
+
+def save_teams_seen():
+    tmp = TEAMS_SEEN + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(teams_state["chat_seen"], f)
+    os.replace(tmp, TEAMS_SEEN)
 
 
 def http_json(url, data=None, headers=None, method=None, form=False, timeout=20):
@@ -372,8 +391,11 @@ def teams_add(chat, msg):
     global next_id
     if msg.get("messageType") != "message" or msg.get("deletedDateTime"):
         return
-    text = html_to_text((msg.get("body") or {}).get("content"))
+    content = (msg.get("body") or {}).get("content") or ""
+    text = html_to_text(content)
     attachments = len(msg.get("attachments") or [])
+    if not text and "<img" in content.lower():
+        text = "[圖片]"  # pasted/inline images carry no text and no attachment entry
     if not text and not attachments:
         return
     sender = ((msg.get("from") or {}).get("user") or {})
@@ -397,47 +419,91 @@ def teams_add(chat, msg):
 
 
 def teams_poll_once():
+    with teams_poll_lock:
+        teams_poll_locked()
+
+
+def teams_poll_locked():
     if not (config.get("teams_client") and config.get("teams_tenant") and config.get("teams_refresh")):
         return
     res = teams_graph("GET", "/me/chats?$expand=lastMessagePreview&$orderby=lastMessagePreview/createdDateTime%20desc&$top=30")
     chats = res.get("value", [])
     first = not teams_state["baseline"]
+    changed = False
     for chat in chats:
         preview = chat.get("lastMessagePreview") or {}
         stamp = preview.get("createdDateTime") or ""
         read_until = (chat.get("viewpoint") or {}).get("lastMessageReadDateTime") or ""
+        seen = teams_state["chat_seen"].get(chat["id"])
+        if first:
+            # Very first run: remember where each chat is; nothing is imported.
+            teams_state["chat_seen"][chat["id"]] = stamp
+            changed = True
+            continue
+        if stamp and stamp != seen:
+            msgs = teams_graph("GET", f"/chats/{chat['id']}/messages?$top=20&$orderby=createdDateTime%20desc").get("value", [])
+            for msg in reversed(msgs):
+                if not seen or msg.get("createdDateTime", "") > seen:
+                    teams_add(chat, msg)
+            # Only now is it safe to move the marker (a failed fetch retries next time).
+            teams_state["chat_seen"][chat["id"]] = stamp
+            changed = True
         if read_until:
-            # Read in Teams (phone/desktop): mark older messages read here.
             key = "teams:" + chat["id"]
             with lock:
-                changed = 0
+                marked = 0
                 for m in messages:
                     if m.get("chat") == key and not m.get("read") and m.get("_created", "") and m["_created"] <= read_until:
                         m["read"] = True
-                        changed += 1
-                if changed:
+                        marked += 1
+                if marked:
                     save()
-        seen = teams_state["chat_seen"].get(chat["id"])
-        teams_state["chat_seen"][chat["id"]] = stamp
-        if first or not stamp or stamp == seen:
-            continue  # first pass only records the baseline
-        msgs = teams_graph("GET", f"/chats/{chat['id']}/messages?$top=10&$orderby=createdDateTime%20desc").get("value", [])
-        for msg in reversed(msgs):
-            if not seen or msg.get("createdDateTime", "") > seen:
-                teams_add(chat, msg)
+    if changed:
+        save_teams_seen()
     teams_state["baseline"] = 1
     teams_state["last_poll"] = int(time.time())
     teams_state["error"] = ""
 
 
+def teams_backfill(hours=24):
+    """One-off: import messages from the last `hours` that were missed; mark them read."""
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - hours * 3600))
+    chats = teams_graph("GET", "/me/chats?$expand=lastMessagePreview&$orderby=lastMessagePreview/createdDateTime%20desc&$top=30").get("value", [])
+    added = 0
+    for chat in chats:
+        if ((chat.get("lastMessagePreview") or {}).get("createdDateTime") or "") < cutoff:
+            continue
+        msgs = teams_graph("GET", f"/chats/{chat['id']}/messages?$top=30&$orderby=createdDateTime%20desc").get("value", [])
+        for msg in reversed(msgs):
+            if msg.get("createdDateTime", "") >= cutoff and not any(m.get("_teams_id") == msg.get("id") for m in messages):
+                before = len(messages)
+                teams_add(chat, msg)
+                if len(messages) > before:
+                    messages[-1]["read"] = True  # history, not new
+                    added += 1
+    with lock:
+        messages.sort(key=lambda m: m["ts"])  # keep chronological order after backfill
+        save()
+    print("teams backfill added", added, flush=True)
+    return added
+
+
 def teams_loop():
+    load_teams_seen()
+    if not os.path.exists("/data/teams_backfill_done"):
+        try:
+            teams_backfill()
+            open("/data/teams_backfill_done", "w").close()
+        except Exception as e:
+            print("teams backfill failed:", e, flush=True)
     while True:
         try:
             teams_poll_once()
         except Exception as e:
             teams_state["error"] = str(e)[:200]
             print("teams poll failed:", e, flush=True)
-        time.sleep(20)
+        teams_wake.wait(10)  # every 10 s, or immediately after /api/sync
+        teams_wake.clear()
 
 
 def teams_send(chat_key, text):
@@ -571,6 +637,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
+        if u.path == "/api/sync":
+            if not self.token_ok(q):
+                return self.send(401, {"error": "invalid token"})
+            try:
+                teams_poll_once()  # check Teams right now (Signal is already live)
+            except Exception as e:
+                print("teams sync failed:", e, flush=True)
+            return self.send(200, {"ok": True})
         if u.path == "/api/read":
             if not self.token_ok(q):
                 return self.send(401, {"error": "invalid token"})
