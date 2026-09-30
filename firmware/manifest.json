@@ -1,7 +1,7 @@
 {
-  "version": "2.9.37",
+  "version": "2.9.40",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "ccbaebca17697b3abb9a44dc06d829fd59a417e97defb2f866a8e37d5812f0cd",
-  "size": 4913872,
-  "notes": "Signal + Teams messages (chat view, canned replies, shared read state), home/away network detection with external URLs, background networking, TLS buffers in PSRAM, Wi-Fi switcher, more Chinese glyphs."
+  "sha256": "da0db0c03571c3777631cae532643f85f0d6600d4905cd5d3a6c439273d239a8",
+  "size": 4915536,
+  "notes": "Night light LED follows the brightness slider, power button turns the screen off/on, choose touch or button to wake, message bubbles show colour-coded counts, Teams messages no longer missed and Sync checks Teams immediately."
 }
