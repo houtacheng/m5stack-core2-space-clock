@@ -33,6 +33,7 @@ volatile bool finished = false;     // track ended by itself
 volatile bool seekReq = false;
 volatile float seekFrac = 0;
 volatile uint32_t posBytes = 0, totalBytes = 0, dataStart = 0;
+volatile uint32_t durationSec = 0;   // from the Xing/Info/VBRI header when the file has one (0 = unknown)
 volatile int bitrate = 0;
 volatile uint32_t decodeErrors = 0, underruns = 0;
 volatile uint32_t busyPermille = 0;   // decode task CPU share, for diagnostics
@@ -416,6 +417,39 @@ static size_t id3Size(File& f) {
   return (((h[6] & 0x7F) << 21) | ((h[7] & 0x7F) << 14) | ((h[8] & 0x7F) << 7) | (h[9] & 0x7F)) + 10;
 }
 
+// Duration from a Xing/Info/VBRI header in the first frame (variable bit rate files).
+static uint32_t headerDuration(File& f, size_t skip) {
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);   // not on the small task stack
+  if (!buf) return 0;
+  struct Free { uint8_t* p; ~Free() { free(p); } } guard{buf};
+  f.seek(skip);
+  int n = f.read(buf, 2048);
+  if (n < 64) return 0;
+  int sync = MP3FindSyncWord(buf, n);
+  if (sync < 0 || sync + 48 > n) return 0;
+  const uint8_t* h = buf + sync;
+  int ver = (h[1] >> 3) & 3, layer = (h[1] >> 1) & 3;
+  if (ver == 1 || layer != 1) return 0;                    // reserved version / not layer III
+  bool mpeg1 = ver == 3, mono = ((h[3] >> 6) & 3) == 3;
+  int idx = (h[2] >> 2) & 3;
+  static const int rates[3][3] = {{11025, 12000, 8000}, {0, 0, 0}, {22050, 24000, 16000}};
+  int rate = ver == 3 ? (idx == 0 ? 44100 : idx == 1 ? 48000 : 32000) : rates[ver][idx];
+  if (!rate || idx == 3) return 0;
+  int spf = mpeg1 ? 1152 : 576;
+  int base = sync + 4 + ((h[1] & 1) ? 0 : 2);                // header + optional CRC
+  int xing = base + (mpeg1 ? (mono ? 17 : 32) : (mono ? 9 : 17));
+  if (xing + 12 < n && (!memcmp(buf + xing, "Xing", 4) || !memcmp(buf + xing, "Info", 4)) && (buf[xing + 7] & 1)) {
+    uint32_t frames = ((uint32_t)buf[xing + 8] << 24) | (buf[xing + 9] << 16) | (buf[xing + 10] << 8) | buf[xing + 11];
+    return (uint32_t)((uint64_t)frames * spf / rate);
+  }
+  int vbri = base + 32;
+  if (vbri + 18 < n && !memcmp(buf + vbri, "VBRI", 4)) {
+    uint32_t frames = ((uint32_t)buf[vbri + 14] << 24) | (buf[vbri + 15] << 16) | (buf[vbri + 16] << 8) | buf[vbri + 17];
+    return (uint32_t)((uint64_t)frames * spf / rate);
+  }
+  return 0;
+}
+
 static void decodeTask(void* arg) {
   Track t = queue[(int)(intptr_t)arg];
   File f;
@@ -435,11 +469,9 @@ static void decodeTask(void* arg) {
   int slot = 0, acc = 0, rate = 44100;
   int64_t startUs = esp_timer_get_time(), busyUs = 0, waitUs = 0;
   uint8_t usedSpeed = 2;
-  // Bluetooth first: if the remembered headphones are still connecting, wait for them.
-  for (int i = 0; ok && i < 160 && !stopReq && lbt::linking(); ++i) vTaskDelay(pdMS_TO_TICKS(50));
   if (ok) {
     size_t skip;
-    { SdLock lock; skip = id3Size(f); f.seek(skip); }
+    { SdLock lock; skip = id3Size(f); durationSec = headerDuration(f, skip); f.seek(skip); }
     dataStart = skip; totalBytes = f.size(); posBytes = skip;
     Serial.printf("[listen] playing %s (%u bytes, speed %s)\n", t.path.c_str(), (unsigned)totalBytes, SPEED_LABELS[speedCode]);
   }
@@ -625,8 +657,9 @@ bool startIndex(int index) {
   current = index;
   speedCode = speedFor(queue[index].path);
   stopReq = false; paused = false; finished = false; seekReq = false;
-  posBytes = 0; dataStart = 0; totalBytes = queue[index].size; decodeErrors = 0; underruns = 0;
+  posBytes = 0; dataStart = 0; totalBytes = queue[index].size; decodeErrors = 0; underruns = 0; durationSec = 0;
   pausedByLink = false;
+  if (lbt::hasSaved && !lbt::connected()) { paused = true; pausedByLink = true; }   // wait for the headphones, silently
   if (lbt::hasSaved || lbt::connected()) M5.Speaker.end();   // sound goes to the headphones: give the RAM back
   else {
     if (!M5.Speaker.isRunning()) M5.Speaker.begin();

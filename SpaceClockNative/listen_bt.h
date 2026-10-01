@@ -11,7 +11,43 @@ namespace lbt {
 
 struct Device { String name; uint8_t addr[6]; int rssi; };
 
-BluetoothA2DPSource a2dp;
+// The library sleeps 10 s inside its stack-up handler before it connects (and
+// polls every 10 s afterwards). This copy of that handler starts connecting at
+// once and polls every 2 s.
+class LinkSource : public BluetoothA2DPSource {
+ protected:
+  void av_hdl_stack_evt(uint16_t event, void* p_param) override {
+    if (event != 0 /* BT_APP_EVT_STACK_UP */) { BluetoothA2DPSource::av_hdl_stack_evt(event, p_param); return; }
+    esp_bt_gap_set_device_name(dev_name);
+    esp_bt_gap_register_callback(ccall_app_gap_callback);
+    esp_avrc_ct_init();
+    esp_avrc_ct_register_callback(ccall_app_rc_ct_callback);
+    if (is_passthru_active) {
+      esp_avrc_tg_init();
+      esp_avrc_tg_register_callback(ccall_app_rc_tg_callback);
+    }
+    esp_avrc_rn_evt_cap_mask_t evt_set = {0};
+    for (auto ev : avrc_rn_events) esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_set, ev);
+    if (esp_avrc_tg_set_rn_evt_cap(&evt_set) != ESP_OK) Serial.println("[bt] esp_avrc_tg_set_rn_evt_cap failed");
+    esp_a2d_source_init();
+    esp_a2d_register_callback(&ccall_app_a2d_callback);
+    esp_a2d_source_register_data_callback(&ccall_bt_app_a2d_data_cb);
+    set_scan_mode_connectable(false);
+    if (reconnect_status == AutoReconnect && has_last_connection()) {
+      memcpy(peer_bd_addr, last_connection, ESP_BD_ADDR_LEN);
+      connect_to(last_connection);
+      s_a2d_state = APP_AV_STATE_CONNECTING;
+      Serial.println("[bt] connecting right away");
+    } else {
+      s_a2d_state = APP_AV_STATE_DISCOVERING;
+      esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+    }
+    int tmr_id = 0;
+    s_tmr = xTimerCreate("connTmr", (2000 / portTICK_PERIOD_MS), pdTRUE, (void*)&tmr_id, ccall_a2d_app_heart_beat);
+    xTimerStart(s_tmr, portMAX_DELAY);
+  }
+};
+LinkSource a2dp;
 std::vector<Device> found;          // discovered while scanning
 Device saved;                       // remembered headphone
 bool hasSaved = false;
@@ -144,7 +180,7 @@ static void startTask(void*) {
   a2dp.set_data_callback_in_frames(dataCb);
   a2dp.set_avrc_passthru_command_callback(onKey);
   a2dp.set_on_audio_state_changed(onAudioState);
-  if (connectByAddr) a2dp.set_auto_reconnect(connectAddr, 3);   // page the device directly
+  if (connectByAddr) a2dp.set_auto_reconnect(connectAddr, 100000);   // keep paging the remembered device (never fall back to scanning)
   else a2dp.set_auto_reconnect(false);
   a2dp.start();
   a2dp.set_volume(volume127);
@@ -214,12 +250,11 @@ void retryConnect(uint32_t nowMs) {
   if (!hasSaved || !running || starting || linkUp || connecting || scanOnly) return;
   // Right after start the profile is not ready yet: try every 2 s for the first
   // 20 s (a connect that is refused costs nothing), then every 12 s.
-  uint32_t every = nowMs - startedAtMs < 20000UL ? 2000UL : 12000UL;
-  if (nowMs - last < every) return;
-  if (nowMs - startedAtMs < 1500UL) return;        // the profile needs a moment before it accepts a connect
+  if (nowMs - last < 20000UL) return;   // the library keeps paging itself; this is only a safety net
+  if (nowMs - startedAtMs < 8000UL) return;        // the library already pages on its own at start
   last = nowMs;
-  Serial.println("[bt] paging the remembered headphones");
-  a2dp.connect_to(connectAddr);
+  bool ok = a2dp.connect_to(connectAddr);
+  Serial.printf("[bt] paging the remembered headphones (%s)\n", ok ? "request accepted" : "refused");
 }
 // A remembered headphone is being (re)connected: playback waits for it a few seconds.
 inline bool linking() { return hasSaved && running && !scanOnly && !linkUp; }

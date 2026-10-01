@@ -27,6 +27,8 @@ bool listenModeActive = false;
 size_t listenEnterThreshold = 256;   // malloc size from which PSRAM is preferred while listening (t:thr to experiment)
 void enterListenMode();
 void leaveListenMode();
+WiFiServer sdRawServer(8081);       // fast SD upload endpoint (see sdRawHandle)
+bool sdRawStarted = false;
 volatile bool wifiPaused = false;  // Wi-Fi deliberately off (listening mode frees RAM for Bluetooth)
 #include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
@@ -997,6 +999,7 @@ void maintainSavedWifi(uint32_t nowMs) {
     wifiRecoveryPhaseStartedAt = nowMs;
     if (!settingsServerReady) setupSettingsServer();
     else if (settingsServerStopped) { settingsServer.begin(); settingsServerStopped = false; }
+    if (!sdRawStarted) { sdRawServer.begin(); sdRawStarted = true; }
     if (justConnected) {
       // Arduino's hostByName() clears lwIP's DNS cache (without the TCPIP lock)
       // the first time after the IP changes. If SNTP is resolving at that
@@ -7055,7 +7058,12 @@ void drawListenDynamic(bool force) {
   uint32_t pos = listen::posBytes > listen::dataStart ? listen::posBytes - listen::dataStart : 0;
   float frac = span ? min(1.0f, (float)pos / (float)span) : 0.0f;
   uint32_t total = 0, elapsed = 0, remain = 0;
-  if (listen::bitrate > 0 && span) {
+  if (listen::durationSec > 0 && span) {          // header says how long it is (variable bit rate)
+    total = listen::durationSec;
+    elapsed = (uint32_t)((uint64_t)total * pos / span);
+    remain = total > elapsed ? total - elapsed : 0;
+    remain = (uint32_t)(remain / listen::SPEEDS[listen::speedCode]);
+  } else if (listen::bitrate > 0 && span) {
     total = (uint32_t)((uint64_t)span * 8 / listen::bitrate);
     elapsed = (uint32_t)((uint64_t)pos * 8 / listen::bitrate);
     remain = total > elapsed ? total - elapsed : 0;
@@ -7063,7 +7071,7 @@ void drawListenDynamic(bool force) {
   }
   int barPx = frac > 0 ? max(8, (int)(280 * frac)) : 0;
   static uint32_t lastKey = 0xFFFFFFFF;
-  uint32_t key = elapsed * 31 + remain * 7 + barPx * 131 + listen::volume * 977 + listen::speedCode;
+  uint32_t key = elapsed * 31 + remain * 7 + barPx * 131 + listen::volume * 977 + listen::speedCode + (listen::pausedByLink ? 99991 : 0);
   if (!force && key == lastKey) return;
   lastKey = key;
   if (!listenCanvasReady) {
@@ -7079,7 +7087,11 @@ void drawListenDynamic(bool force) {
   c.setFont(&SourceHanSansTC_UI8pt8b);
   c.setTextSize(1);
   c.setTextColor(calTheme.muted, calTheme.bg);
-  if (total) {
+  if (listen::pausedByLink) {
+    c.setTextDatum(middle_center);
+    c.setTextColor(calTheme.accent, calTheme.bg);
+    c.drawString("等待藍牙耳機連線…", 160, 26);
+  } else if (total) {
     c.setTextDatum(middle_left);
     c.drawString("已播放 " + listenTime(elapsed), 12, 26);
     c.setTextDatum(middle_center);
@@ -7529,6 +7541,11 @@ void listenMaintain(uint32_t nowMs) {
     }
     if (nv) { int n = nv > 0 ? listen::indexForNext() : listen::indexForPrev(); if (n >= 0) { listen::startIndex(n); changed = true; } }
     if (changed && screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) drawListenNow(true);
+  }
+  static bool lastWaiting = false;
+  if (listen::pausedByLink != lastWaiting) {
+    lastWaiting = listen::pausedByLink;
+    if (screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) { drawListenNowBottomBar(); drawListenDynamic(true); }
   }
   if (screenNow == Screen::Listen && !screenSleeping && listenView != ListenView::Bluetooth && lbt::connected() != listenBtIconShown) drawListenBtIcon();
   if (listenBtPendingSave && lbt::connected()) {          // the headphones accepted: remember them
@@ -8222,10 +8239,28 @@ void handleSerialConfig() {
       }
       Serial.printf("[test] %d unread of %d messages (signalUnread=%u)\n", shown, signalMessageCount, (unsigned)signalUnread);
     } else if (cmd == "t:lstat") {
-      Serial.printf("[test] listen playing=%d paused=%d cur=%d pos=%u/%u kbps=%d err=%u underruns=%u speed=%s mode=%d busy=%u.%u%% heap=%u\n", listen::playing, listen::paused,
-                    listen::current, (unsigned)listen::posBytes, (unsigned)listen::totalBytes, listen::bitrate / 1000,
+      Serial.printf("[test] listen playing=%d paused=%d cur=%d pos=%u/%u kbps=%d dur=%us err=%u underruns=%u speed=%s mode=%d busy=%u.%u%% heap=%u\n", listen::playing, listen::paused,
+                    listen::current, (unsigned)listen::posBytes, (unsigned)listen::totalBytes, listen::bitrate / 1000, (unsigned)listen::durationSec,
                     (unsigned)listen::decodeErrors, (unsigned)listen::underruns, listen::SPEED_LABELS[listen::speedCode], listen::mode, (unsigned)(listen::busyPermille / 10), (unsigned)(listen::busyPermille % 10),
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    } else if (cmd.startsWith("t:sdw ")) {
+      // SD throughput: write N MB in 32 KB blocks, then read it back
+      int mb = max(1, (int)cmd.substring(6).toInt());
+      listen::begin();
+      uint8_t* b = (uint8_t*)heap_caps_malloc(32768, MALLOC_CAP_SPIRAM);
+      if (b) {
+        memset(b, 0x5A, 32768);
+        uint32_t t1 = millis();
+        { listen::SdLock lock; SD.remove("/.speed.tmp"); File f = SD.open("/.speed.tmp", FILE_WRITE); for (int i = 0; i < mb * 32; ++i) f.write(b, 32768); f.close(); }
+        uint32_t t2 = millis();
+        { listen::SdLock lock; File f = SD.open("/.speed.tmp"); while (f.read(b, 32768) > 0) {} f.close(); SD.remove("/.speed.tmp"); }
+        uint32_t t3 = millis();
+        Serial.printf("[test] SD write %.0f KB/s, read %.0f KB/s\n", mb * 1024.0 * 1000.0 / (t2 - t1), mb * 1024.0 * 1000.0 / (t3 - t2));
+        free(b);
+      }
+    } else if (cmd.startsWith("t:seek ")) {
+      listen::seekFrac = cmd.substring(7).toFloat(); listen::seekReq = true;
+      Serial.printf("[test] seek to %.2f\n", (float)listen::seekFrac);
     } else if (cmd == "t:lstop") {
       listen::stop();
       Serial.println("[test] stopped");
@@ -9006,9 +9041,41 @@ String sdSizeText(uint32_t bytes) {
   return String(bytes) + " B";
 }
 
+uint32_t sdWifiAwakeUntil = 0;
 File sdUploadFile;
+String sdUploadTarget;
+static const char* SD_UPLOAD_TMP = "/.upload.tmp";   // written first, renamed when complete (a reset leaves no half file)
 bool sdUploadOk = false;
 String sdUploadMessage;
+// SD writes of 1.4 KB at a time are slow; collect 32 KB in PSRAM first.
+static const size_t SD_UPLOAD_BUF = 32768;
+uint8_t* sdUploadBuf = nullptr;
+size_t sdUploadFill = 0;
+
+void sdUploadFlush() {
+  if (!sdUploadFill || !sdUploadFile) { sdUploadFill = 0; return; }
+  listen::SdLock lock;
+  if (sdUploadFile.write(sdUploadBuf, sdUploadFill) != sdUploadFill) { sdUploadMessage = "SD write failed (card full?)"; sdUploadFile.close(); }
+  sdUploadFill = 0;
+}
+
+// The upload runs inside one handleClient() call, so loop() is not running:
+// keep the clock ticking and show the progress from here.
+void sdUploadPump(uint32_t received, int total = -1) {
+  static uint32_t last = 0;
+  if (millis() - last < 900UL) return;
+  last = millis();
+  lastUserActivity = millis();
+  if (screenNow != Screen::Clock || screenSleeping || alarmActive >= 0) return;
+  drawClock(false);
+  if (total < 0) total = settingsServer.clientContentLength();
+  int pct = total > 0 ? (int)min<uint64_t>(99, (uint64_t)received * 100ULL / (uint64_t)total) : 0;
+  M5.Display.fillRoundRect(100, 36, 120, 20, 8, TFT_BLACK);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.drawString("SD 上傳 " + String(pct) + "%", 160, 46);
+}
 
 void sendSdBrowser(String dir, const String& message, bool zh) {
   dir = sdCleanPath(dir);
@@ -9075,10 +9142,10 @@ void sendSdBrowser(String dir, const String& message, bool zh) {
   page += "</table></div>";
   page += "<script>var dir=" + String("'") + sdUrlEncode(dir) + "';"
           "document.getElementById('upf').onsubmit=function(ev){ev.preventDefault();var fs=Array.from(this.f.files);if(!fs.length)return;var i=0,pb=document.getElementById('pb'),pt=document.getElementById('pt');"
-          "function next(){if(i>=fs.length){pt.textContent='" + tr("Done", "完成") + "';location.reload();return;}var f=fs[i],x=new XMLHttpRequest(),fd=new FormData();fd.append('f',f,f.name);"
-          "x.open('POST','/sd/upload?dir='+dir);x.upload.onprogress=function(e){if(e.lengthComputable){pb.style.width=(100*e.loaded/e.total)+'%';pt.textContent=(i+1)+'/'+fs.length+' '+f.name+' '+Math.round(100*e.loaded/e.total)+'%';}};"
+          "function next(){if(i>=fs.length){pt.textContent='" + tr("Done", "完成") + "';location.reload();return;}var f=fs[i],x=new XMLHttpRequest();"
+          "x.open('POST','http://'+location.hostname+':8081/put?dir='+dir+'&name='+encodeURIComponent(f.name));x.setRequestHeader('Content-Type','text/plain');x.upload.onprogress=function(e){if(e.lengthComputable){pb.style.width=(100*e.loaded/e.total)+'%';pt.textContent=(i+1)+'/'+fs.length+' '+f.name+' '+Math.round(100*e.loaded/e.total)+'%';}};"
           "x.onload=function(){if(x.status!=200||x.responseText.indexOf('ok')!=0){pt.textContent='" + tr("Upload failed: ", "上傳失敗：") + "'+f.name+' '+x.responseText;return;}i++;next();};"
-          "x.onerror=function(){pt.textContent='" + tr("Connection lost", "連線中斷") + "';};x.send(fd);}next();};</script></body></html>";
+          "x.onerror=function(){pt.textContent='" + tr("Connection lost", "連線中斷") + "';};x.send(f);}next();};</script></body></html>";
   settingsServer.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -9087,14 +9154,107 @@ void sdRedirect(const String& dir, const String& message, const String& lang) {
   settingsServer.send(303, "text/plain", "");
 }
 
+// Fast upload path: the library's multipart parser reads byte by byte (~190 KB/s).
+// The page sends the file as a plain body to this small server instead.
+
+String sdUrlDecode(const String& in) {
+  String out;
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in[i];
+    if (c == '%' && i + 2 < in.length() + 0 && isxdigit(in[i + 1]) && isxdigit(in[i + 2])) { out += (char)strtol(in.substring(i + 1, i + 3).c_str(), nullptr, 16); i += 2; }
+    else if (c == '+') out += ' ';
+    else out += c;
+  }
+  return out;
+}
+
+static const char* SD_RAW_CORS = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n";
+
+void sdRawReply(WiFiClient& c, int code, const char* text) {
+  c.printf("HTTP/1.1 %d %s\r\n%sContent-Type: text/plain\r\nContent-Length: %u\r\nConnection: close\r\n\r\n%s", code, code == 200 ? "OK" : (code == 204 ? "No Content" : "Error"), SD_RAW_CORS, (unsigned)strlen(text), text);
+  c.flush();
+}
+
+void sdRawHandle() {
+  WiFiClient c = sdRawServer.accept();
+  if (!c) return;
+  c.setTimeout(8);
+  String request = c.readStringUntil('\n');
+  uint32_t contentLength = 0;
+  for (int i = 0; i < 40; ++i) {                      // headers
+    String h = c.readStringUntil('\n');
+    if (h.length() <= 1) break;
+    h.toLowerCase();
+    if (h.startsWith("content-length:")) contentLength = (uint32_t)h.substring(15).toInt();
+  }
+  if (request.startsWith("OPTIONS")) { sdRawReply(c, 204, ""); c.stop(); return; }
+  int q = request.indexOf('?'), sp = request.indexOf(" HTTP");
+  String query = (q >= 0 && sp > q) ? request.substring(q + 1, sp) : String("");
+  String dir = "/", name;
+  for (int start = 0; start < (int)query.length();) {
+    int amp = query.indexOf('&', start); if (amp < 0) amp = query.length();
+    String kv = query.substring(start, amp);
+    int eq = kv.indexOf('=');
+    if (eq > 0) { String k = kv.substring(0, eq), v = sdUrlDecode(kv.substring(eq + 1)); if (k == "dir") dir = sdCleanPath(v); else if (k == "name") name = v; }
+    start = amp + 1;
+  }
+  int slash = max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+  if (slash >= 0) name = name.substring(slash + 1);
+  if (!request.startsWith("POST") || !name.length() || name.startsWith(".") || name.indexOf(':') >= 0 || !contentLength || !listen::begin()) {
+    sdRawReply(c, 400, "bad request"); c.stop(); return;
+  }
+  if (!sdUploadBuf) sdUploadBuf = (uint8_t*)heap_caps_malloc(SD_UPLOAD_BUF, MALLOC_CAP_SPIRAM);
+  if (!sdUploadBuf) { sdRawReply(c, 500, "no memory"); c.stop(); return; }
+  String target = dir == "/" ? "/" + name : dir + "/" + name;
+  lastUserActivity = millis();
+  WiFi.setSleep(false);
+  bool failed = false;
+  {
+    listen::SdLock lock;
+    if (SD.exists(SD_UPLOAD_TMP)) SD.remove(SD_UPLOAD_TMP);
+    sdUploadFile = SD.open(SD_UPLOAD_TMP, FILE_WRITE);
+    failed = !sdUploadFile;
+  }
+  uint32_t received = 0, lastData = millis();
+  sdUploadFill = 0; sdUploadMessage = "";
+  while (!failed && received < contentLength && c.connected() && millis() - lastData < 20000UL) {
+    int avail = c.available();
+    if (avail <= 0) { taskYIELD(); continue; }        // no 1 ms sleep: that alone capped the speed
+    size_t room = SD_UPLOAD_BUF - sdUploadFill;
+    size_t want = min<size_t>(min<size_t>(avail, room), contentLength - received);
+    int n = c.read(sdUploadBuf + sdUploadFill, want);
+    if (n <= 0) { taskYIELD(); continue; }
+    lastData = millis();
+    sdUploadFill += n; received += n;
+    if (sdUploadFill == SD_UPLOAD_BUF) { sdUploadFlush(); if (!sdUploadFile) failed = true; }
+    sdUploadPump(received, (int)contentLength);
+  }
+  sdUploadFlush();
+  if (!sdUploadFile) failed = true;
+  bool ok = !failed && received == contentLength;
+  {
+    listen::SdLock lock;
+    if (sdUploadFile) sdUploadFile.close();
+    if (ok) {
+      if (SD.exists(target)) SD.remove(target);
+      ok = SD.rename(SD_UPLOAD_TMP, target);
+    } else SD.remove(SD_UPLOAD_TMP);
+  }
+  Serial.printf("[sd] fast upload %s %u/%u bytes %s\n", name.c_str(), (unsigned)received, (unsigned)contentLength, ok ? "ok" : "FAILED");
+  sdRawReply(c, ok ? 200 : 500, ok ? "ok" : "upload failed");
+  c.stop();
+  if (screenNow == Screen::Clock && !screenSleeping) { drawClock(true); drawAstronaut(); }
+}
+
 void setupSdWebRoutes() {
   settingsServer.on("/sd", HTTP_GET, []() {
+    sdWifiAwakeUntil = millis() + 600000UL;      // Wi-Fi power saving off while this page is in use (uploads are much faster)
+    WiFi.setSleep(false);
     bool zh = settingsServer.arg("lang") != "en";
     sendSdBrowser(settingsServer.arg("dir").length() ? settingsServer.arg("dir") : String("/"), settingsServer.arg("msg"), zh);
   });
   settingsServer.on("/sd/upload", HTTP_POST,
     []() {
-      WiFi.setSleep(true);
       settingsServer.send(sdUploadOk ? 200 : 500, "text/plain", sdUploadOk ? "ok" : (sdUploadMessage.length() ? sdUploadMessage : String("error")));
     },
     []() {
@@ -9102,7 +9262,8 @@ void setupSdWebRoutes() {
       if (up.status == UPLOAD_FILE_START) {
         lastUserActivity = millis();
         WiFi.setSleep(false);                       // full radio speed for the transfer
-        sdUploadOk = false; sdUploadMessage = "";
+        sdUploadOk = false; sdUploadMessage = ""; sdUploadFill = 0;
+        if (!sdUploadBuf) sdUploadBuf = (uint8_t*)heap_caps_malloc(SD_UPLOAD_BUF, MALLOC_CAP_SPIRAM);
         String name = up.filename;
         int slash = max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
         if (slash >= 0) name = name.substring(slash + 1);
@@ -9110,21 +9271,43 @@ void setupSdWebRoutes() {
         if (!listen::begin() || name.startsWith(".") || name.indexOf(':') >= 0) { sdUploadMessage = "bad name or no SD card"; return; }
         String path = dir == "/" ? "/" + name : dir + "/" + name;
         listen::SdLock lock;
-        if (SD.exists(path)) SD.remove(path);
-        sdUploadFile = SD.open(path, FILE_WRITE);
+        sdUploadTarget = path;
+        if (SD.exists(SD_UPLOAD_TMP)) SD.remove(SD_UPLOAD_TMP);
+        sdUploadFile = SD.open(SD_UPLOAD_TMP, FILE_WRITE);
         if (!sdUploadFile) sdUploadMessage = "cannot create file";
       } else if (up.status == UPLOAD_FILE_WRITE) {
         lastUserActivity = millis();
         if (sdUploadFile) {
-          listen::SdLock lock;
-          if (sdUploadFile.write(up.buf, up.currentSize) != up.currentSize) { sdUploadMessage = "SD write failed (card full?)"; sdUploadFile.close(); }
+          if (!sdUploadBuf) {
+            listen::SdLock lock;
+            if (sdUploadFile.write(up.buf, up.currentSize) != up.currentSize) { sdUploadMessage = "SD write failed (card full?)"; sdUploadFile.close(); }
+          } else {
+            size_t off = 0;
+            while (off < up.currentSize && sdUploadFile) {
+              size_t n = min(up.currentSize - off, SD_UPLOAD_BUF - sdUploadFill);
+              memcpy(sdUploadBuf + sdUploadFill, up.buf + off, n);
+              sdUploadFill += n; off += n;
+              if (sdUploadFill == SD_UPLOAD_BUF) sdUploadFlush();
+            }
+          }
         }
+        sdUploadPump(up.totalSize);
       } else if (up.status == UPLOAD_FILE_END) {
-        if (sdUploadFile) { listen::SdLock lock; sdUploadFile.close(); sdUploadOk = sdUploadMessage.length() == 0; }
+        sdUploadFlush();
+        if (sdUploadFile) {
+          listen::SdLock lock;
+          sdUploadFile.close();
+          sdUploadOk = sdUploadMessage.length() == 0;
+          if (sdUploadOk) {
+            if (SD.exists(sdUploadTarget)) SD.remove(sdUploadTarget);
+            sdUploadOk = SD.rename(SD_UPLOAD_TMP, sdUploadTarget);
+            if (!sdUploadOk) sdUploadMessage = "rename failed";
+          } else SD.remove(SD_UPLOAD_TMP);
+        }
+        if (screenNow == Screen::Clock && !screenSleeping) { drawClock(true); drawAstronaut(); }
         Serial.printf("[sd] upload %s %u bytes %s\n", up.filename.c_str(), (unsigned)up.totalSize, sdUploadOk ? "ok" : "FAILED");
       } else if (up.status == UPLOAD_FILE_ABORTED) {
-        if (sdUploadFile) { listen::SdLock lock; sdUploadFile.close(); }
-        WiFi.setSleep(true);
+        if (sdUploadFile) { listen::SdLock lock; sdUploadFile.close(); SD.remove(SD_UPLOAD_TMP); }
       }
     });
   settingsServer.on("/sd/delete", HTTP_POST, []() {
@@ -9668,6 +9851,7 @@ void pauseNetwork() {
   if (hassAssistSocketStarted) { hassAssistWebSocket.disconnect(); hassAssistSocketStarted = false; hassAssistSocketConnected = false; hassAssistAuthenticated = false; }
   if (mqttClient.connected()) mqttClient.disconnect();
   if (settingsServerReady) { settingsServer.stop(); settingsServerStopped = true; }
+  if (sdRawStarted) { sdRawServer.end(); sdRawStarted = false; }
   wifiPaused = true;
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
@@ -9723,7 +9907,7 @@ void leaveListenMode() {
 
 void loop() {
   M5.update();
-  if (WiFi.status() == WL_CONNECTED) settingsServer.handleClient();
+  if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); if (sdRawStarted) sdRawHandle(); }
   if (companionWebSocketMode) { companionWebSocket.loop(); probeAndPreferLocalCompanion(millis()); }
   if (!companionWebSocketMode && companionClient.connected()) {
     while (companionClient.available()) processCompanionLine(companionClient.readStringUntil('\n'));
@@ -9811,6 +9995,7 @@ void loop() {
     playMeditationSound(meditationEndSound, meditationEndVolume);
     drawMeditation();
   }
+  if (sdWifiAwakeUntil && (int32_t)(nowMs - sdWifiAwakeUntil) >= 0) { sdWifiAwakeUntil = 0; WiFi.setSleep(true); }
   updatePowerSaveMode(nowMs);
   if (listenModeActive && (screenNow != Screen::Listen || alarmActive >= 0)) leaveListenMode();   // e.g. an alarm took the screen
   listenMaintain(nowMs);
