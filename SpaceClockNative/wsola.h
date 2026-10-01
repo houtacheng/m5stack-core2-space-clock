@@ -17,7 +17,11 @@
 #include <esp_heap_caps.h>
 static inline void* wsolaAlloc(size_t n) { void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM); return p ? p : malloc(n); }
 // The input ring is read heavily by the matcher: keep it in fast internal RAM when possible.
-static inline void* wsolaAllocFast(size_t n) { void* p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); return p ? p : wsolaAlloc(n); }
+static inline void* wsolaAllocFast(size_t n) {
+  // Only use scarce internal RAM when plenty is left (Bluetooth needs ~80 KB).
+  void* p = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 90000 ? heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : nullptr;
+  return p ? p : wsolaAlloc(n);
+}
 #else
 static inline void* wsolaAlloc(size_t n) { return malloc(n); }
 static inline void* wsolaAllocFast(size_t n) { return malloc(n); }

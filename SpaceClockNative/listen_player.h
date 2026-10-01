@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <mp3dec.h>
 #include "wsola.h"
+#include "listen_bt.h"
 
 namespace listen {
 
@@ -358,8 +359,9 @@ static void decodeTask(void* arg) {
   HMP3Decoder dec = f ? MP3InitDecoder() : nullptr;
   const size_t INBUF = 6 * 1024, SLOT = 2816;   // 64 ms per slot at 44.1 kHz: cushion against SD / Wi-Fi hiccups
   uint8_t* in = (uint8_t*)heap_caps_malloc(INBUF, MALLOC_CAP_SPIRAM);
-  int16_t* pcm = (int16_t*)heap_caps_malloc(1152 * 2 * sizeof(int16_t), MALLOC_CAP_8BIT);
-  int16_t* mono = (int16_t*)heap_caps_malloc(1152 * sizeof(int16_t), MALLOC_CAP_8BIT);
+  // Internal RAM is scarce while Bluetooth runs: keep the buffers in PSRAM.
+  int16_t* pcm = (int16_t*)heap_caps_malloc(1152 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  int16_t* mono = (int16_t*)heap_caps_malloc(1152 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
   int16_t* out = (int16_t*)heap_caps_malloc(4 * SLOT * sizeof(int16_t), MALLOC_CAP_SPIRAM);
   Wsola* ws = new Wsola();
   bool ok = f && dec && in && pcm && mono && out && ws;
@@ -376,8 +378,43 @@ static void decodeTask(void* arg) {
     Serial.printf("[listen] playing %s (%u bytes, speed %s)\n", t.path.c_str(), (unsigned)totalBytes, SPEED_LABELS[speedCode]);
   }
 
+  // Bluetooth path: mono samples at `rate` become 44.1 kHz stereo frames.
+  bool onBt = false;
+  double btPos = 0; int16_t btPrev = 0;
+  auto emitBt = [&](const int16_t* mono, int n) {
+    static int16_t stereo[512];
+    const double step = rate / 44100.0;
+    int i = 0;
+    while (i < n && !stopReq && !paused && !seekReq) {
+      int outFrames = 0;
+      if (rate == 44100) {
+        while (outFrames < 256 && i < n) { stereo[outFrames * 2] = stereo[outFrames * 2 + 1] = mono[i++]; ++outFrames; }
+      } else {
+        while (outFrames < 256) {
+          int idx = (int)floor(btPos);
+          if (idx + 1 >= n) break;
+          double frac = btPos - idx;
+          int16_t a = idx < 0 ? btPrev : mono[idx], b = mono[idx + 1];
+          int16_t v = (int16_t)(a + (b - a) * frac);
+          stereo[outFrames * 2] = stereo[outFrames * 2 + 1] = v;
+          ++outFrames; btPos += step;
+        }
+        if (outFrames == 0 || btPos + 1 >= n) { i = n; }
+      }
+      size_t sent = 0;
+      while (sent < (size_t)outFrames && !stopReq && !paused && !seekReq) sent += lbt::write(stereo + sent * 2, outFrames - sent, 50);
+    }
+    if (rate != 44100) { btPos -= n; if (n) btPrev = mono[n - 1]; }
+  };
   // Send accumulated samples to the speaker (blocks while its queue is full).
   auto emit = [&](int count) {
+    if (count > 0 && lbt::connected()) {
+      if (!onBt) { M5.Speaker.stop(CH); onBt = true; btPos = 0; btPrev = 0; }
+      emitBt(out + slot * SLOT, count);
+      acc = 0;
+      return;
+    }
+    if (onBt) { lbt::flushAudio(); onBt = false; }
     int64_t w0 = esp_timer_get_time();
     while (!stopReq && !paused && !seekReq && M5.Speaker.isPlaying(CH) >= 2) vTaskDelay(pdMS_TO_TICKS(3));
     waitUs += esp_timer_get_time() - w0;
@@ -404,7 +441,7 @@ static void decodeTask(void* arg) {
   while (ok && !stopReq) {
     int64_t iterStart = esp_timer_get_time(), waitBefore = waitUs;
     if (paused) {
-      if (!flushed) { M5.Speaker.stop(CH); acc = 0; flushed = true; }
+      if (!flushed) { M5.Speaker.stop(CH); lbt::flushAudio(); acc = 0; flushed = true; }
       vTaskDelay(pdMS_TO_TICKS(60));
       continue;
     }
@@ -415,7 +452,7 @@ static void decodeTask(void* arg) {
       have = 0; eof = false; acc = 0; wsFinished = false;
       if (wsActive) ws->reset();
       seekReq = false;
-      M5.Speaker.stop(CH);
+      M5.Speaker.stop(CH); lbt::flushAudio();
     }
     uint8_t want = speedCode;
     if (want != usedSpeed) {          // speed button pressed while playing
@@ -484,8 +521,9 @@ static void decodeTask(void* arg) {
   }
   bool natural = ok && !stopReq;
   if (natural) {  // let the last frames play out
-    for (int i = 0; i < 150 && !stopReq && M5.Speaker.isPlaying(CH); ++i) vTaskDelay(pdMS_TO_TICKS(10));
+    for (int i = 0; i < 150 && !stopReq && (M5.Speaker.isPlaying(CH) || (onBt && lbt::sb && xStreamBufferBytesAvailable(lbt::sb) > 4000)); ++i) vTaskDelay(pdMS_TO_TICKS(10));
   }
+  Serial.printf("[listen] decode task stack: %u bytes never used\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
   delete ws;
   if (in) free(in);
   if (pcm) free(pcm);
@@ -503,6 +541,7 @@ void stop() {
   stopReq = true;
   for (int i = 0; i < 150 && playing; ++i) delay(10);
   M5.Speaker.stop(CH);
+  lbt::flushAudio();
   playing = false; paused = false; finished = false;
 }
 
@@ -516,8 +555,9 @@ bool startIndex(int index) {
   posBytes = 0; dataStart = 0; totalBytes = queue[index].size; decodeErrors = 0; underruns = 0;
   if (!M5.Speaker.isRunning()) M5.Speaker.begin();
   M5.Speaker.setVolume((uint8_t)(volume * 255 / 100));
+  lbt::setVolumePercent(volume);
   playing = true;
-  if (xTaskCreatePinnedToCore(decodeTask, "listen", 12288, (void*)(intptr_t)index, 2, nullptr, 1) != pdPASS) {
+  if (xTaskCreatePinnedToCore(decodeTask, "listen", 9216, (void*)(intptr_t)index, 2, nullptr, 1) != pdPASS) {
     playing = false;
     return false;
   }
@@ -538,6 +578,7 @@ bool startQueue(const std::vector<Track>& tracks, const String& key, int index) 
 void setVolume(int percent) {
   volume = (uint8_t)constrain(percent, 0, 100);
   M5.Speaker.setVolume((uint8_t)(volume * 255 / 100));
+  lbt::setVolumePercent(volume);
 }
 
 }  // namespace listen

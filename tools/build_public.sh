@@ -6,8 +6,11 @@ cd "$project_dir"
 arduino_cli="${SPACE_CLOCK_ARDUINO_CLI:-arduino-cli}"
 python_cli="${SPACE_CLOCK_PYTHON:-python3}"
 "$python_cli" tools/validate_ui_fonts.py
+# Bluetooth Classic (listening mode) needs the SDK copy with extra IRAM.
+sdk_path="$("$python_cli" tools/make_bt_sdk.py)"
 version="$(sed -n 's/^#define SPACE_CLOCK_VERSION "\([^"]*\)"/\1/p' SpaceClockNative/config.h)"
 "$arduino_cli" compile --fqbn m5stack:esp32:m5stack_core2:PSRAM=enabled,PartitionScheme=default \
   --build-property compiler.cpp.extra_flags=-DSPACE_CLOCK_PUBLIC_BUILD \
+  --build-property "compiler.sdk.path=$sdk_path" \
   --build-path "$project_dir/.arduino-build/release-$version" "$@" SpaceClockNative
 "$python_cli" tools/validate_public_build.py "$project_dir/.arduino-build/release-$version"
