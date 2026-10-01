@@ -15,6 +15,13 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <mp3dec.h>
+#include "listen_player.h"
+void showListen();
+void showMessageHub();
+volatile bool wifiPaused = false;  // Wi-Fi deliberately off (listening mode frees RAM for Bluetooth)
+#ifdef BT_MP3_EXPERIMENT
+#include "bt_mp3_experiment.h"
+#endif
 #include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
 #include <esp_task_wdt.h>
@@ -43,7 +50,7 @@
 #endif
 #include "mqtt_guide.h"
 
-enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight, Calendar, Messages, MessageDetail, MessageReply, MessageFull, MessageHub, WifiSwitch };
+enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight, Calendar, Messages, MessageDetail, MessageReply, MessageFull, MessageHub, WifiSwitch, Listen };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
 struct WifiChoice { int8_t slot; int16_t rssi; };  // slot -1 = network stored by the setup hotspot
@@ -660,6 +667,7 @@ void saveSettings() {
   prefs.putBool("flatBtns", flatVirtualButtonsEnabled);
   prefs.putUShort("screenOff", screenOffSeconds);
   prefs.putBool("wakeTouch", wakeByTouch);
+  prefs.putUChar("listenVol", listen::volume);
   prefs.putBool("fwAuto", automaticFirmwareUpdate);
   prefs.putUChar("fwHour", firmwareCheckHour);
   prefs.putBool("medSound", meditationSoundEnabled);
@@ -759,6 +767,7 @@ void loadSettings() {
   flatVirtualButtonsEnabled = prefs.getBool("flatBtns", false);
   screenOffSeconds = prefs.getUShort("screenOff", 300);
   wakeByTouch = prefs.getBool("wakeTouch", true);
+  listen::volume = constrain((int)prefs.getUChar("listenVol", 60), 0, 100);
   automaticFirmwareUpdate = prefs.getBool("fwAuto", false);
   firmwareCheckHour = constrain((int)prefs.getUChar("fwHour", 3), 0, 23);
   meditationSoundEnabled = prefs.getBool("medSound", true);
@@ -964,6 +973,7 @@ void startWifiProfileScan(uint32_t nowMs) {
 }
 
 void maintainSavedWifi(uint32_t nowMs) {
+  if (wifiPaused) return;
   static wl_status_t lastLoggedStatus = (wl_status_t)255;
   static uint8_t lastLoggedPhase = 255;
   if (WiFi.status() != lastLoggedStatus || (uint8_t)wifiRecoveryPhase != lastLoggedPhase) {
@@ -1174,7 +1184,7 @@ void updatePowerSaveMode(uint32_t nowMs) {
     }
   }
   // 80 MHz while the screen is off on battery; back to 160 MHz otherwise.
-  uint32_t wantMhz = powerSaveMode && screenSleeping ? 80 : 160;
+  uint32_t wantMhz = powerSaveMode && screenSleeping && !listen::playing ? 80 : 160;
   if (getCpuFrequencyMhz() != wantMhz) setCpuFrequencyMhz(wantMhz);
 }
 
@@ -3982,6 +3992,7 @@ void updateAlarmBaseLights(uint32_t nowMs) {
 
 void startAlarm(int index) {
   if (index < 0 || index >= ALARM_COUNT) return;
+  listen::stop();  // the alarm takes the speaker
   wakeDisplay();
   lastUserActivity = millis();
   alarmActive = index;
@@ -5411,6 +5422,20 @@ void handleClockTouch(const m5::touch_detail_t& t) {
     }
     return;
   }
+  // Swipe left: listening mode. Swipe right: messages.
+  static int16_t swipeX = 0, swipeY = 0;
+  static bool swipeValid = false;
+  if (t.wasPressed()) { swipeX = t.x; swipeY = t.y; swipeValid = t.y < 205; }
+  if (t.wasReleased() && swipeValid) {
+    swipeValid = false;
+    int dx = (int)t.x - swipeX, dy = (int)t.y - swipeY;
+    if (abs(dx) >= 80 && abs(dy) < 60 && abs(dx) > 2 * abs(dy)) {
+      haptic(15);
+      clockSettingsPressValid = false; clockMiddlePressValid = false; companionNavPressValid = false;
+      if (dx < 0) showListen(); else showMessageHub();
+      return;
+    }
+  }
   const bool inNavigation = t.y >= 210;
   const bool inSettings = inNavigation && t.x >= 214;
   const bool inMiddle = inNavigation && t.x >= 107 && t.x < 214;
@@ -6643,6 +6668,257 @@ void handleSignalTap(int x, int y) {
 
 
 // ---------------------------------------------------------------------------
+// Listening mode: MP3 files from the SD card
+// ---------------------------------------------------------------------------
+static const int LISTEN_ROWS = 5;
+uint8_t listenPage = 0;
+bool listenNowView = false;
+uint32_t listenLastDraw = 0;
+bool listenSdMissing = false;
+
+String listenFit(const String& text, int maxW) {
+  String s = text;
+  if (M5.Display.textWidth(s) <= maxW) return s;
+  while (s.length() > 1) {
+    int cut = s.length() - 1;
+    while (cut > 0 && ((uint8_t)s[cut] & 0xC0) == 0x80) --cut;  // UTF-8 boundary
+    s = s.substring(0, cut);
+    if (M5.Display.textWidth(s + "…") <= maxW) return s + "…";
+  }
+  return s;
+}
+
+String listenTime(uint32_t seconds) {
+  char b[12]; snprintf(b, sizeof(b), "%u:%02u", (unsigned)(seconds / 60), (unsigned)(seconds % 60));
+  return String(b);
+}
+
+void drawListenHeader(const String& right) {
+  M5.Display.fillRect(0, 0, 320, 32, calTheme.bg);
+  useUIMediumFont();
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  M5.Display.drawString("聽法", 10, 3);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_right);
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  M5.Display.drawString(right, 310, 15);
+  M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+}
+
+void drawListenList() {
+  M5.Display.fillScreen(calTheme.bg);
+  int total = (int)listen::tracks.size();
+  int pages = max(1, (total + LISTEN_ROWS - 1) / LISTEN_ROWS);
+  if (listenPage >= pages) listenPage = pages - 1;
+  drawListenHeader(total ? String(total) + " 首" : String(""));
+  if (!total) {
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+    M5.Display.drawString(listenSdMissing ? "找不到 SD 卡" : "SD 卡裡沒有 MP3 檔案", 160, 110);
+    M5.Display.drawString("請把 .mp3 放在 SD 卡根目錄或資料夾", 160, 138);
+  }
+  for (int i = 0; i < LISTEN_ROWS; ++i) {
+    int idx = listenPage * LISTEN_ROWS + i;
+    if (idx >= total) break;
+    int y = 35 + i * 35;
+    bool cur = idx == listen::current && (listen::playing || listen::paused);
+    M5.Display.fillRoundRect(8, y, 304, 32, 7, calTheme.panel);
+    M5.Display.drawRoundRect(8, y, 304, 32, 7, cur ? calTheme.accent : calTheme.border);
+    useUIMediumFont();
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.setTextColor(cur ? calTheme.accent : calTheme.text, calTheme.panel);
+    int left = 16;
+    if (cur) { M5.Display.fillTriangle(16, y + 10, 16, y + 22, 26, y + 16, calTheme.accent); left = 34; }
+    M5.Display.drawString(listenFit(listen::tracks[idx].name, 304 - left - 8), left, y + 16);
+  }
+  char mid[16]; snprintf(mid, sizeof(mid), "%d/%d", listenPage + 1, pages);
+  drawCalendarBottomBar("上一頁", total ? "下一頁" : "", "關閉");
+  (void)mid;
+}
+
+void drawListenButton(int i, bool pressedLook = false) {
+  int x = 10 + i * 61, y = 166, w = 56, h = 40;
+  M5.Display.fillRoundRect(x, y, w, h, 8, calTheme.panel);
+  M5.Display.drawRoundRect(x, y, w, h, 8, calTheme.border);
+  uint16_t c = calTheme.accent;
+  int cx = x + w / 2, cy = y + h / 2;
+  if (i == 0) {          // previous
+    M5.Display.fillRect(cx - 11, cy - 9, 3, 18, c);
+    M5.Display.fillTriangle(cx + 10, cy - 9, cx + 10, cy + 9, cx - 6, cy, c);
+  } else if (i == 1) {   // play / pause
+    if (listen::playing && !listen::paused) {
+      M5.Display.fillRect(cx - 8, cy - 10, 6, 20, c);
+      M5.Display.fillRect(cx + 3, cy - 10, 6, 20, c);
+    } else {
+      M5.Display.fillTriangle(cx - 7, cy - 11, cx - 7, cy + 11, cx + 11, cy, c);
+    }
+  } else if (i == 2) {   // next
+    M5.Display.fillRect(cx + 8, cy - 9, 3, 18, c);
+    M5.Display.fillTriangle(cx - 10, cy - 9, cx - 10, cy + 9, cx + 6, cy, c);
+  } else if (i == 3) {   // volume down
+    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
+  } else {               // volume up
+    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
+    M5.Display.fillRect(cx - 2, cy - 9, 4, 18, c);
+  }
+}
+
+void drawListenProgress() {
+  uint32_t span = listen::totalBytes > listen::dataStart ? listen::totalBytes - listen::dataStart : 0;
+  uint32_t pos = listen::posBytes > listen::dataStart ? listen::posBytes - listen::dataStart : 0;
+  float frac = span ? min(1.0f, (float)pos / (float)span) : 0.0f;
+  M5.Display.fillRect(0, 118, 320, 44, calTheme.bg);
+  M5.Display.fillRoundRect(20, 124, 280, 10, 5, calTheme.panelAlt);
+  if (frac > 0) M5.Display.fillRoundRect(20, 124, max(8, (int)(280 * frac)), 10, 5, calTheme.accent);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  if (listen::bitrate > 0 && span) {
+    uint32_t total = (uint32_t)((uint64_t)span * 8 / listen::bitrate);
+    uint32_t elapsed = (uint32_t)((uint64_t)pos * 8 / listen::bitrate);
+    M5.Display.drawString(listenTime(elapsed) + " / " + listenTime(total), 160, 148);
+  } else {
+    M5.Display.drawString(String((int)(frac * 100)) + "%", 160, 148);
+  }
+}
+
+void drawListenNow(bool full) {
+  if (listen::current < 0 || listen::current >= (int)listen::tracks.size()) { listenNowView = false; drawListenList(); return; }
+  const listen::Track& t = listen::tracks[listen::current];
+  if (full) {
+    M5.Display.fillScreen(calTheme.bg);
+    drawListenHeader("音量 " + String(listen::volume) + "%");
+    // Track name: up to two lines.
+    useUIMediumFont();
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(calTheme.text, calTheme.bg);
+    String rest = t.name;
+    for (int line = 0; line < 2 && rest.length(); ++line) {
+      String part = rest;
+      if (line == 0 && M5.Display.textWidth(part) > 296) {
+        int cut = part.length();
+        while (cut > 1 && M5.Display.textWidth(part.substring(0, cut)) > 296) {
+          --cut; while (cut > 0 && ((uint8_t)part[cut] & 0xC0) == 0x80) --cut;
+        }
+        part = part.substring(0, cut);
+        rest = rest.substring(cut);
+      } else {
+        part = listenFit(part, 296);
+        rest = "";
+      }
+      M5.Display.drawString(part, 12, 40 + line * 26);
+    }
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+    String info = t.dir.length() ? t.dir : String("SD");
+    if (listen::bitrate > 0) info += " · " + String(listen::bitrate / 1000) + " kbps";
+    info += " · " + String(listen::current + 1) + "/" + String((int)listen::tracks.size());
+    M5.Display.drawString(info, 160, 102);
+    for (int i = 0; i < 5; ++i) drawListenButton(i);
+    drawCalendarBottomBar("清單", "", "關閉");
+  } else {
+    drawListenButton(1);
+  }
+  drawListenProgress();
+}
+
+void showListen() {
+  applyCalendarTheme();
+  screenNow = Screen::Listen;
+  if (!listen::playing && !listen::paused) {
+    listen::scan();
+    listenSdMissing = !listen::sdMounted;
+    listen::current = -1;
+    listenNowView = false;
+    listenPage = 0;
+  } else {
+    listenNowView = true;
+  }
+  listenLastDraw = millis();
+  if (listenNowView) drawListenNow(true); else drawListenList();
+}
+
+void listenExit() {
+  listen::stop();
+  screenNow = Screen::Clock;
+  lastUserActivity = millis();
+  drawClock(true); drawAstronaut();
+}
+
+void listenPlayIndex(int idx) {
+  if (!listen::start(idx)) return;
+  listenNowView = true;
+  drawListenNow(true);
+}
+
+void handleListenTap(int x, int y) {
+  lastUserActivity = millis();
+  if (y >= 212) {
+    haptic(12);
+    if (x >= 214) { listenExit(); return; }
+    if (listenNowView) {
+      if (x < 107) { listenNowView = false; listenPage = max(0, listen::current) / LISTEN_ROWS; drawListenList(); }
+      return;
+    }
+    int pages = max(1, ((int)listen::tracks.size() + LISTEN_ROWS - 1) / LISTEN_ROWS);
+    if (x < 107) { if (listenPage > 0) --listenPage; drawListenList(); }
+    else if (x < 214) { if (listenPage + 1 < pages) ++listenPage; drawListenList(); }
+    return;
+  }
+  if (!listenNowView) {
+    if (y < 35) return;
+    int row = (y - 35) / 35;
+    int idx = listenPage * LISTEN_ROWS + row;
+    if (row < LISTEN_ROWS && idx < (int)listen::tracks.size()) { haptic(15); listenPlayIndex(idx); }
+    return;
+  }
+  if (y >= 112 && y < 156 && x >= 12 && x <= 308) {  // tap the bar to seek
+    listen::seekFrac = constrain((x - 20) / 280.0f, 0.0f, 1.0f);
+    listen::seekReq = true;
+    listen::posBytes = listen::dataStart + (uint32_t)((listen::totalBytes - listen::dataStart) * (float)listen::seekFrac);
+    haptic(10);
+    drawListenProgress();
+    return;
+  }
+  if (y >= 164 && y < 208) {
+    int i = constrain((x - 10) / 61, 0, 4);
+    haptic(15);
+    if (i == 0) { if (listen::current > 0) listenPlayIndex(listen::current - 1); }
+    else if (i == 1) {
+      if (listen::playing) { listen::paused = !listen::paused; drawListenButton(1); }
+      else if (listen::current >= 0) listenPlayIndex(listen::current);
+    }
+    else if (i == 2) { if (listen::current + 1 < (int)listen::tracks.size()) listenPlayIndex(listen::current + 1); }
+    else {
+      listen::setVolume(listen::volume + (i == 3 ? -10 : 10));
+      saveSettings();
+      drawListenHeader("音量 " + String(listen::volume) + "%");
+    }
+  }
+}
+
+void listenMaintain(uint32_t nowMs) {
+  if (listen::finished) {
+    listen::finished = false;
+    if (listen::current + 1 < (int)listen::tracks.size()) {
+      listen::start(listen::current + 1);
+    } else {
+      listen::stop();
+    }
+    if (screenNow == Screen::Listen && !screenSleeping) {
+      if (listenNowView && listen::playing) drawListenNow(true); else { listenNowView = false; drawListenList(); }
+    }
+  }
+  if (screenNow == Screen::Listen && listenNowView && !screenSleeping && nowMs - listenLastDraw >= 1000UL) {
+    listenLastDraw = nowMs;
+    drawListenProgress();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Wi-Fi switcher: saved networks that are currently in range
 // ---------------------------------------------------------------------------
 String wifiLegacySsid;  // the ESP32's own stored network (set via the setup hotspot)
@@ -6858,6 +7134,11 @@ void handleTouch() {
   if (screenNow == Screen::WifiSwitch) {
     if (!screenSleeping && !wakeTouchConsumed && t.wasReleased() && !pressHandled && !sliding && abs((int)t.y - pressY) < 20)
       handleWifiSwitchTap(t.x, t.y);
+    if (screenSleeping || wakeTouchConsumed) { /* fall through to wake handling */ } else return;
+  }
+  if (screenNow == Screen::Listen) {
+    if (!screenSleeping && !wakeTouchConsumed && t.wasReleased() && !pressHandled && abs((int)t.y - pressY) < 25 && abs((int)t.x - pressX) < 25)
+      handleListenTap(t.x, t.y);
     if (screenSleeping || wakeTouchConsumed) { /* fall through to wake handling */ } else return;
   }
   if (screenNow == Screen::Messages || screenNow == Screen::MessageDetail || screenNow == Screen::MessageReply
@@ -7221,9 +7502,19 @@ void handleSerialConfig() {
   static String line;
   while (Serial.available()) {
     char c = Serial.read();
-    if (c != '\n' && c != '\r') { if (line.length() < 32) line += c; continue; }
+    if (c != '\n' && c != '\r') { if (line.length() < 160) line += c; continue; }
     String cmd = line; line = "";
     uint32_t t0 = millis();
+#ifdef BT_MP3_EXPERIMENT
+    if (cmd.startsWith("bt:")) {
+      // bt:sd | bt:scan | bt:connect NAME | bt:play FILE | bt:stop | bt:vol N | bt:off | bt:status
+      int sp = cmd.indexOf(' ');
+      String name = cmd.substring(3, sp < 0 ? cmd.length() : sp);
+      String arg = sp < 0 ? "" : cmd.substring(sp + 1);
+      Serial.print(btmp3::runCommand(name, arg));
+      continue;
+    }
+#endif
     if (cmd == "t:cal") {
       bool ok = fetchCalendar(calLocalMidnight(time(nullptr)));
       Serial.printf("[test] calendar %s: %d events, %s, %lu ms\n", ok ? "ok" : "FAILED", calEventCount, calError.c_str(), (unsigned long)(millis() - t0));
@@ -7234,6 +7525,24 @@ void handleSerialConfig() {
       String response;
       int code = signalRequest("/api/messages?since=999999", "", response);
       Serial.printf("[test] signal bridge HTTP %d via %s, %lu ms\n", code, signalUsePublic ? "public" : "LAN", (unsigned long)(millis() - t0));
+    } else if (cmd == "t:listen") {
+      int n = listen::scan();
+      Serial.printf("[test] sd=%d tracks=%d\n", listen::sdMounted, n);
+      for (int i = 0; i < n; ++i) Serial.printf("[test]  %d: %s (%u)\n", i, listen::tracks[i].path.c_str(), (unsigned)listen::tracks[i].size);
+    } else if (cmd.startsWith("t:play ")) {
+      if (listen::tracks.empty()) listen::scan();
+      bool ok = listen::start(cmd.substring(7).toInt());
+      Serial.printf("[test] play -> %d\n", ok);
+    } else if (cmd == "t:lstat") {
+      Serial.printf("[test] listen playing=%d paused=%d cur=%d pos=%u/%u kbps=%d err=%u heap=%u\n", listen::playing, listen::paused,
+                    listen::current, (unsigned)listen::posBytes, (unsigned)listen::totalBytes, listen::bitrate / 1000,
+                    (unsigned)listen::decodeErrors, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    } else if (cmd == "t:lstop") {
+      listen::stop();
+      Serial.println("[test] stopped");
+    } else if (cmd == "t:lui") {
+      showListen();
+      Serial.println("[test] listen screen shown");
     } else if (cmd == "t:pwr") {
       Serial.printf("[test] saver=%d vbus=%d mV charging=%d battery=%d%% %d mV cpu=%u MHz\n", powerSaveMode,
                     (int)M5.Power.getVBUSVoltage(), (int)M5.Power.isCharging(), (int)M5.Power.getBatteryLevel(),
@@ -7958,6 +8267,9 @@ void sendHassAssistStatus() {
 
 void setupSettingsServer() {
   settingsServer.on("/", HTTP_GET, []() { sendSettingsPage(); });
+#ifdef BT_MP3_EXPERIMENT
+  settingsServer.on("/bt", HTTP_GET, []() { btmp3::handleHttp(settingsServer); });
+#endif
   settingsServer.on("/hass-status", HTTP_GET, []() { sendHassAssistStatus(); });
   settingsServer.on("/mqtt-guide", HTTP_GET, []() {
     settingsServer.send_P(200, "text/html; charset=utf-8", MQTT_GUIDE_HTML);
@@ -8328,13 +8640,13 @@ void setup() {
   bottomLeds.clear();
   bottomLeds.show();
   Serial.printf("[display] PSRAM: %u bytes, free: %u bytes\n", ESP.getPsramSize(), ESP.getFreePsram());
-  astronautCanvas.setColorDepth(16);
+  astronautCanvas.setPsram(true); astronautCanvas.setColorDepth(16);  // keep internal RAM free for TLS / Bluetooth
   astronautCanvas.createSprite(105, 130);
-  companionButtonCanvas.setColorDepth(16);
+  companionButtonCanvas.setPsram(true); companionButtonCanvas.setColorDepth(16);  // keep internal RAM free for TLS / Bluetooth
   companionButtonCanvas.createSprite(96, 96);
-  meditationCardCanvas.setColorDepth(16);
+  meditationCardCanvas.setPsram(true); meditationCardCanvas.setColorDepth(16);  // keep internal RAM free for TLS / Bluetooth
   meditationCardCanvas.createSprite(98, 96);
-  firmwareProgressCanvas.setColorDepth(16);
+  firmwareProgressCanvas.setPsram(true); firmwareProgressCanvas.setColorDepth(16);  // keep internal RAM free for TLS / Bluetooth
   firmwareProgressCanvasReady = firmwareProgressCanvas.createSprite(292, 44) != nullptr;
   spaceTimeCanvas.setPsram(true); spaceTimeCanvas.setColorDepth(16);
   spaceTimeCanvasReady = spaceTimeCanvas.createSprite(204, 92) != nullptr;
@@ -8531,6 +8843,7 @@ void loop() {
     drawMeditation();
   }
   updatePowerSaveMode(nowMs);
+  listenMaintain(nowMs);
   updateAlarmBaseLights(nowMs);
   if (!screenSleeping && alarmActive < 0 && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
     sleepDisplay(nowMs);
