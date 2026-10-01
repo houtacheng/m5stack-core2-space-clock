@@ -18,6 +18,7 @@ bool hasSaved = false;
 volatile bool running = false;      // stack started (or starting)
 volatile bool starting = false;
 volatile bool linkUp = false;       // A2DP connected
+volatile bool connecting = false;   // a connection attempt is in flight (never tear the stack down meanwhile)
 volatile uint32_t version = 0;      // bumps when the UI should redraw
 String status;                      // short text for the pairing page
 String connectName;                 // name we are trying to reach
@@ -30,6 +31,8 @@ StaticStreamBuffer_t sbStruct;
 uint8_t* sbStorage = nullptr;
 static const size_t SB_SIZE = 24 * 1024;   // ~140 ms of 44.1 kHz stereo
 uint8_t volume127 = 76;
+volatile int8_t playRequest = 0;    // from the headphone buttons / in-ear sensor: 1 play, -1 pause
+volatile int8_t navRequest = 0;     // +1 next track, -1 previous track
 
 static String addrText(const uint8_t* a) {
   char b[20]; snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -80,12 +83,28 @@ static bool onDiscovered(const char* name, esp_bd_addr_t addr, int rssi) {
 
 static void onConnection(esp_a2d_connection_state_t state, void*) {
   linkUp = state == ESP_A2D_CONNECTION_STATE_CONNECTED;
+  connecting = state == ESP_A2D_CONNECTION_STATE_CONNECTING || state == ESP_A2D_CONNECTION_STATE_DISCONNECTING;
   status = linkUp ? "已連線" : (state == ESP_A2D_CONNECTION_STATE_CONNECTING ? "連線中…" : "未連線");
   Serial.printf("[bt] connection state %d\n", (int)state);
   ++version;
 }
 
+// Buttons and the in-ear sensor of the headphones arrive as AVRCP key presses.
+static void onKey(uint8_t key, bool released) {
+  Serial.printf("[bt] key 0x%02X %s\n", key, released ? "up" : "down");
+  if (released) return;
+  switch (key) {
+    case ESP_AVRC_PT_CMD_PLAY: playRequest = 1; break;
+    case ESP_AVRC_PT_CMD_PAUSE: case ESP_AVRC_PT_CMD_STOP: playRequest = -1; break;
+    case ESP_AVRC_PT_CMD_FORWARD: navRequest = 1; break;
+    case ESP_AVRC_PT_CMD_BACKWARD: navRequest = -1; break;
+    default: break;
+  }
+  ++version;
+}
+
 static int32_t dataCb(Frame* frames, int32_t count) {
+  if (!frames || count <= 0) return 0;   // the stack calls with no buffer when the stream stops
   size_t got = sb ? xStreamBufferReceive(sb, frames, (size_t)count * 4, 0) : 0;
   size_t gotFrames = got / 4;
   if ((int32_t)gotFrames < count) memset(frames + gotFrames, 0, (count - gotFrames) * 4);
@@ -104,6 +123,7 @@ static void startTask(void*) {
   a2dp.set_ssid_callback(onDiscovered);
   a2dp.set_on_connection_state_changed(onConnection);
   a2dp.set_data_callback_in_frames(dataCb);
+  a2dp.set_avrc_passthru_command_callback(onKey);
   if (connectByAddr) a2dp.set_auto_reconnect(connectAddr, 3);   // page the device directly
   else a2dp.set_auto_reconnect(false);
   a2dp.start();
@@ -136,6 +156,9 @@ bool begin(const uint8_t* addr, const String& name) {
 void end() {
   if (!running) return;
   for (int i = 0; i < 100 && starting; ++i) delay(50);
+  // Events of a half-finished connection would hit a stack that is gone.
+  for (int i = 0; i < 100 && connecting; ++i) delay(50);
+  delay(300);
   a2dp.end(false);
   // The library keeps the host stack and controller up unless it is told to
   // release memory (which would forbid a restart). Take them down ourselves,
@@ -145,7 +168,8 @@ void end() {
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) esp_bt_controller_disable();
   for (int i = 0; i < 40 && esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED; ++i) delay(50);
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) esp_bt_controller_deinit();
-  running = false; linkUp = false;
+  running = false; linkUp = false; connecting = false;
+  delay(300);                                    // let the stack settle before a restart
   if (sb) xStreamBufferReset(sb);
   status = "";
   Serial.printf("[bt] stopped (free internal %u)\n", (unsigned)freeInternal());
@@ -153,6 +177,8 @@ void end() {
 }
 
 inline bool connected() { return running && !starting && linkUp; }
+// A remembered headphone is being (re)connected: playback waits for it a few seconds.
+inline bool linking() { return hasSaved && running && !scanOnly && !linkUp; }
 
 void setVolumePercent(int percent) {
   volume127 = (uint8_t)constrain(percent * 127 / 100, 0, 127);

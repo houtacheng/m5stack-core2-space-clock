@@ -8,6 +8,7 @@
 #include <map>
 #include <algorithm>
 #include <mp3dec.h>
+#include <esp_heap_caps_init.h>
 #include "wsola.h"
 #include "listen_bt.h"
 
@@ -345,6 +346,16 @@ void setSpeedCode(uint8_t code) {
 }
 
 // ---- decode task ------------------------------------------------------------
+// The MP3 decoder keeps ~20 KB of state. When internal RAM is scarce (Bluetooth
+// is running) it is placed in PSRAM instead, at the price of some speed.
+size_t mallocThreshold = 16384;   // size from which malloc() prefers PSRAM (lowered while listening)
+static HMP3Decoder newDecoder() {
+  bool scarce = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 70000;
+  if (scarce) heap_caps_malloc_extmem_enable(1);
+  HMP3Decoder d = MP3InitDecoder();
+  if (scarce) heap_caps_malloc_extmem_enable(mallocThreshold);
+  return d;
+}
 static size_t id3Size(File& f) {
   uint8_t h[10];
   f.seek(0);
@@ -356,7 +367,7 @@ static void decodeTask(void* arg) {
   Track t = queue[(int)(intptr_t)arg];
   File f;
   { SdLock lock; f = SD.open(t.path); }
-  HMP3Decoder dec = f ? MP3InitDecoder() : nullptr;
+  HMP3Decoder dec = f ? newDecoder() : nullptr;
   const size_t INBUF = 6 * 1024, SLOT = 2816;   // 64 ms per slot at 44.1 kHz: cushion against SD / Wi-Fi hiccups
   uint8_t* in = (uint8_t*)heap_caps_malloc(INBUF, MALLOC_CAP_SPIRAM);
   // Internal RAM is scarce while Bluetooth runs: keep the buffers in PSRAM.
@@ -371,6 +382,8 @@ static void decodeTask(void* arg) {
   int slot = 0, acc = 0, rate = 44100;
   int64_t startUs = esp_timer_get_time(), busyUs = 0, waitUs = 0;
   uint8_t usedSpeed = 2;
+  // Bluetooth first: if the remembered headphones are still connecting, wait for them.
+  for (int i = 0; ok && i < 160 && !stopReq && lbt::linking(); ++i) vTaskDelay(pdMS_TO_TICKS(50));
   if (ok) {
     size_t skip;
     { SdLock lock; skip = id3Size(f); f.seek(skip); }
@@ -409,12 +422,13 @@ static void decodeTask(void* arg) {
   // Send accumulated samples to the speaker (blocks while its queue is full).
   auto emit = [&](int count) {
     if (count > 0 && lbt::connected()) {
-      if (!onBt) { M5.Speaker.stop(CH); onBt = true; btPos = 0; btPrev = 0; }
+      if (!onBt) { M5.Speaker.stop(CH); M5.Speaker.end(); onBt = true; btPos = 0; btPrev = 0; }   // frees its RAM for the stack
       emitBt(out + slot * SLOT, count);
       acc = 0;
       return;
     }
     if (onBt) { lbt::flushAudio(); onBt = false; }
+    if (!M5.Speaker.isRunning()) { M5.Speaker.begin(); M5.Speaker.setVolume((uint8_t)(volume * 255 / 100)); }
     int64_t w0 = esp_timer_get_time();
     while (!stopReq && !paused && !seekReq && M5.Speaker.isPlaying(CH) >= 2) vTaskDelay(pdMS_TO_TICKS(3));
     waitUs += esp_timer_get_time() - w0;
@@ -553,11 +567,14 @@ bool startIndex(int index) {
   speedCode = speedFor(queue[index].path);
   stopReq = false; paused = false; finished = false; seekReq = false;
   posBytes = 0; dataStart = 0; totalBytes = queue[index].size; decodeErrors = 0; underruns = 0;
-  if (!M5.Speaker.isRunning()) M5.Speaker.begin();
-  M5.Speaker.setVolume((uint8_t)(volume * 255 / 100));
+  if (lbt::connected()) M5.Speaker.end();            // sound goes to the headphones: give the RAM back
+  else {
+    if (!M5.Speaker.isRunning()) M5.Speaker.begin();
+    M5.Speaker.setVolume((uint8_t)(volume * 255 / 100));
+  }
   lbt::setVolumePercent(volume);
   playing = true;
-  if (xTaskCreatePinnedToCore(decodeTask, "listen", 9216, (void*)(intptr_t)index, 2, nullptr, 1) != pdPASS) {
+  if (xTaskCreatePinnedToCore(decodeTask, "listen", 5120, (void*)(intptr_t)index, 2, nullptr, 1) != pdPASS) {
     playing = false;
     return false;
   }

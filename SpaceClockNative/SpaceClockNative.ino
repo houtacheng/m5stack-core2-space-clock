@@ -1193,7 +1193,7 @@ void updatePowerSaveMode(uint32_t nowMs) {
   // 80 MHz while the screen is off on battery; back to 160 MHz otherwise.
   // Speed-changed playback needs the extra decode headroom; otherwise 160 MHz.
   uint32_t wantMhz = 160;
-  if (listen::playing && listen::SPEEDS[listen::speedCode] != 1.0f) wantMhz = 240;
+  if (listen::playing && (listen::SPEEDS[listen::speedCode] != 1.0f || lbt::connected())) wantMhz = 240;
   else if (powerSaveMode && screenSleeping && !listen::playing) wantMhz = 80;
   if (getCpuFrequencyMhz() != wantMhz) setCpuFrequencyMhz(wantMhz);
 }
@@ -6731,6 +6731,7 @@ void handleSignalTap(int x, int y) {
 static const int LISTEN_ROWS = 4;
 ListenView listenView = ListenView::Browse;
 ListenView listenPickReturn = ListenView::Browse;
+ListenView listenBtBack = ListenView::Browse;      // page to return to from the Bluetooth page
 String listenLoc = "/";                 // "/", "/folder", "@playlists", "@pl:NAME"
 std::vector<listen::Entry> listenEntries;
 std::vector<String> listenPickNames;
@@ -6784,7 +6785,6 @@ void listenLoad() {
   } else {
     listen::listDir(listenLoc, listenEntries);
     if (listenLoc == "/") {
-      listenEntries.insert(listenEntries.begin(), {"藍牙耳機", "@bt", true, 0});
       listenEntries.insert(listenEntries.begin(), {"播放清單", "@playlists", true, 0});
     }
   }
@@ -6830,6 +6830,28 @@ int listenWrap(const String& text, int maxW, int maxLines, String* lines, bool* 
 String listenTime(uint32_t seconds) {
   char b[12]; snprintf(b, sizeof(b), "%u:%02u", (unsigned)(seconds / 60), (unsigned)(seconds % 60));
   return String(b);
+}
+
+// Bluetooth symbol, top right of every listening page: solid when the
+// headphones are connected, outlined when not. Tap it to open the settings.
+static constexpr int LISTEN_BT_X = 290, LISTEN_BT_Y = 3, LISTEN_BT_W = 24, LISTEN_BT_H = 24;
+bool listenBtIconShown = false;
+
+void drawListenBtIcon() {
+  bool on = lbt::connected();
+  listenBtIconShown = on;
+  int x = LISTEN_BT_X, y = LISTEN_BT_Y, w = LISTEN_BT_W, h = LISTEN_BT_H;
+  uint16_t ink = on ? calTheme.bg : calTheme.accent;
+  if (on) M5.Display.fillRoundRect(x, y, w, h, 6, calTheme.accent);
+  else { M5.Display.fillRoundRect(x, y, w, h, 6, calTheme.bg); M5.Display.drawRoundRect(x, y, w, h, 6, calTheme.accent); }
+  int cx = x + w / 2, cy = y + h / 2;
+  for (int d = 0; d < 2; ++d) {                  // 2 px strokes
+    M5.Display.drawLine(cx + d, cy - 8, cx + d, cy + 8, ink);
+    M5.Display.drawLine(cx - 4, cy - 4 + d, cx + 4, cy + 4 + d, ink);
+    M5.Display.drawLine(cx - 4, cy + 4 + d, cx + 4, cy - 4 + d, ink);
+    M5.Display.drawLine(cx + d, cy - 8, cx + 4, cy - 4 + d, ink);
+    M5.Display.drawLine(cx + d, cy + 8, cx + 4, cy + 4 + d, ink);
+  }
 }
 
 void drawListenFolderIcon(int x, int y, uint16_t c) {
@@ -6883,14 +6905,15 @@ void drawListenBrowse() {
   M5.Display.setTextColor(calTheme.title, calTheme.bg);
   bool pill = listenHasMp3();
   String title = listenLocTitle(listenLoc);
-  int maxW = (pill ? 208 : 308) - titleLeft;
+  int maxW = (pill ? 180 : 284) - titleLeft;
   while (title.length() > 1 && M5.Display.textWidth(title) > maxW) {
     int cut = title.length() - 1;
     while (cut > 0 && ((uint8_t)title[cut] & 0xC0) == 0x80) --cut;
     title = title.substring(0, cut);
   }
   M5.Display.drawString(title, titleLeft, 15);
-  if (pill) drawListenPill(212, 3, 100, listen::MODE_LABELS[listen::modeFor(listenKeyForLoc(listenLoc))]);
+  if (pill) drawListenPill(184, 3, 100, listen::MODE_LABELS[listen::modeFor(listenKeyForLoc(listenLoc))]);
+  drawListenBtIcon();
   M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
 
   int total = (int)listenEntries.size();
@@ -6957,8 +6980,9 @@ void drawListenButtons() {
 void drawListenNowHeader() {
   M5.Display.fillRect(0, 0, 320, 31, calTheme.bg);
   drawListenPill(6, 3, 54, listen::SPEED_LABELS[listen::speedCode]);
-  drawListenPill(122, 3, 76, "加入清單");
-  drawListenPill(212, 3, 100, listen::MODE_LABELS[listen::mode]);
+  drawListenPill(80, 3, 76, "加入清單");
+  drawListenPill(184, 3, 100, listen::MODE_LABELS[listen::mode]);
+  drawListenBtIcon();
   M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
 }
 
@@ -7072,6 +7096,7 @@ void drawListenPick() {
   M5.Display.setTextColor(calTheme.title, calTheme.bg);
   M5.Display.drawString("加入播放清單", 10, 15);
   M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+  drawListenBtIcon();
   int total = (int)listenPickNames.size() + 1;
   int pages = max(1, (total + LISTEN_ROWS - 1) / LISTEN_ROWS);
   if (listenPage >= pages) listenPage = pages - 1;
@@ -7100,6 +7125,7 @@ void drawListenConfirm() {
   M5.Display.setTextColor(calTheme.text, calTheme.bg);
   String lines[3];
   String msg = listenConfirmKind == 1 ? "要從播放清單移除這首嗎？" : "要移除這個播放清單嗎？";
+  drawListenBtIcon();
   M5.Display.drawString(msg, 160, 50);
   int n = listenWrap(listenConfirmName, 280, 2, lines);
   M5.Display.setTextColor(calTheme.accent, calTheme.bg);
@@ -7136,7 +7162,8 @@ void drawListenBt() {
   String status = lbt::connected() ? String("已連線") : lbt::status;
   M5.Display.setTextDatum(middle_right);
   M5.Display.setTextColor(lbt::connected() ? calTheme.accent : calTheme.muted, calTheme.bg);
-  M5.Display.drawString(status, 310, 15);
+  M5.Display.drawString(status, 282, 15);
+  drawListenBtIcon();
   M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
   int total = (int)listenBtRows.size();
   int pages = max(1, (total + LISTEN_ROWS - 1) / LISTEN_ROWS);
@@ -7186,8 +7213,9 @@ void handleListenBtTap(int x, int y) {
   int pages = max(1, ((int)listenBtRows.size() + LISTEN_ROWS - 1) / LISTEN_ROWS);
   if (y >= 212) {
     if (x < 107) {                                   // back
-      if (!lbt::connected()) lbt::end();
-      listenView = ListenView::Browse; listenLoad(); drawListenBrowse();
+      if (!lbt::connected() && !lbt::hasSaved) lbt::end();
+      if (listenBtBack == ListenView::Now && listen::current >= 0 && listen::current < (int)listen::queue.size()) { listenView = ListenView::Now; drawListenNow(true); }
+      else { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
     } else if (x < 214) {                            // scan again
       lbt::end(); lbt::begin(nullptr, ""); drawListenBt();
     } else {                                         // back to the built-in speaker
@@ -7282,6 +7310,12 @@ void listenPickChoose(int index) {
 
 void handleListenTap(int x, int y) {
   lastUserActivity = millis();
+  if (y < 30 && x >= 288 && listenView != ListenView::Bluetooth && listenView != ListenView::Confirm) {   // Bluetooth icon
+    haptic(12);
+    listenBtBack = listenView == ListenView::Now ? ListenView::Now : ListenView::Browse;
+    listenOpenBt();
+    return;
+  }
   if (listenView == ListenView::Bluetooth) { handleListenBtTap(x, y); return; }
   if (listenView == ListenView::Confirm) {
     if (y >= 150 && y < 174) {
@@ -7314,7 +7348,7 @@ void handleListenTap(int x, int y) {
   if (listenView == ListenView::Browse) {
     if (y < 30) {
       if (x < 62 && listenLoc != "/") { haptic(12); listenGoTo(listenParentLoc(listenLoc)); }
-      else if (x >= 212 && listenHasMp3()) {
+      else if (x >= 182 && x < 288 && listenHasMp3()) {
         haptic(12);
         String key = listenKeyForLoc(listenLoc);
         listen::setMode(key, (listen::modeFor(key) + 1) % 4);
@@ -7339,8 +7373,6 @@ void handleListenTap(int x, int y) {
       String name = listen::playlistCreate();
       listenLoad(); drawListenBrowse();
       (void)name;
-    } else if (e.path == "@bt") {
-      listenOpenBt();
     } else if (e.isDir) {
       listenGoTo(e.path.startsWith("@") ? e.path : e.path);
     } else {
@@ -7354,11 +7386,11 @@ void handleListenTap(int x, int y) {
       haptic(12);
       listen::setSpeedCode((listen::speedCode + 1) % 5);
       drawListenNowHeader(); drawListenDynamic(true);
-    } else if (x >= 212) {              // loop mode
+    } else if (x >= 182 && x < 288) {   // loop mode
       haptic(12);
       listen::setMode(listen::ctxKey, (listen::mode + 1) % 4);
       drawListenNowHeader();
-    } else if (x >= 118 && x < 202) {   // add to a playlist
+    } else if (x >= 64 && x < 170) {    // add to a playlist
       haptic(12);
       if (listen::current >= 0 && listen::current < (int)listen::queue.size()) listenOpenPick(listen::queue[listen::current].path, ListenView::Now);
     }
@@ -7428,6 +7460,19 @@ void listenMaintain(uint32_t nowMs) {
       else if (listenView == ListenView::Now) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
     }
   }
+  if (listenModeActive) {                                   // headphone buttons / in-ear sensor
+    int8_t pr = lbt::playRequest, nv = lbt::navRequest;
+    lbt::playRequest = 0; lbt::navRequest = 0;
+    bool changed = false;
+    if (pr < 0 && listen::playing && !listen::paused) { listen::paused = true; changed = true; }
+    else if (pr > 0) {
+      if (listen::playing && listen::paused) { listen::paused = false; changed = true; }
+      else if (!listen::playing && listen::current >= 0 && listen::current < (int)listen::queue.size()) { listen::startIndex(listen::current); changed = true; }
+    }
+    if (nv) { int n = nv > 0 ? listen::indexForNext() : listen::indexForPrev(); if (n >= 0) { listen::startIndex(n); changed = true; } }
+    if (changed && screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) drawListenNow(true);
+  }
+  if (screenNow == Screen::Listen && !screenSleeping && listenView != ListenView::Bluetooth && lbt::connected() != listenBtIconShown) drawListenBtIcon();
   if (listenBtPendingSave && lbt::connected()) {          // the headphones accepted: remember them
     lbt::saveDevice(listenBtPending);
     listenBtPendingSave = false;
@@ -8072,6 +8117,7 @@ void handleSerialConfig() {
       Serial.printf("[test] bt running=%d starting=%d linkUp=%d found=%u saved=%s free=%u largest=%u netPaused=%d\n", lbt::running, lbt::starting, lbt::linkUp,
                     (unsigned)lbt::found.size(), lbt::hasSaved ? lbt::saved.name.c_str() : "-", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), netPaused);
+      Serial.printf("[test] loop stack never used: %u bytes\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     } else if (cmd == "t:btscan") {
       lbt::end(); lbt::begin(nullptr, "");
     } else if (cmd.startsWith("t:btconnect ")) {
@@ -9405,6 +9451,10 @@ void enterListenMode() {
   M5.Display.setTextColor(calTheme.muted, calTheme.bg);
   M5.Display.drawString("進入聽法模式…", 160, 120);
   pauseNetwork();
+  // The Bluetooth stack wants ~80 KB of heap and internal RAM is scarce: while
+  // listening, every malloc of 256 bytes or more is served from PSRAM.
+  listen::mallocThreshold = 256;
+  heap_caps_malloc_extmem_enable(256);
   listenModeActive = true;
   lbt::loadSaved();
   if (lbt::hasSaved) lbt::begin(lbt::saved.addr, lbt::saved.name);   // reconnect the remembered headphones
@@ -9414,6 +9464,9 @@ void leaveListenMode() {
   if (!listenModeActive) return;
   listen::stop();
   lbt::end();
+  if (!M5.Speaker.isRunning()) M5.Speaker.begin();     // other features expect the speaker
+  listen::mallocThreshold = 16384;
+  heap_caps_malloc_extmem_enable(16384);               // back to the normal threshold
   listenModeActive = false;
   resumeNetwork();
 }
