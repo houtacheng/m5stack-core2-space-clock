@@ -51,6 +51,8 @@ LinkSource a2dp;
 std::vector<Device> found;          // discovered while scanning
 Device saved;                       // remembered headphone
 bool hasSaved = false;
+bool speakerMode = false;     // the user chose the built-in speaker; the remembered headphones are kept
+inline bool preferred() { return hasSaved && !speakerMode; }   // sound goes to the headphones (waits for them)
 volatile bool running = false;      // stack started (or starting)
 volatile bool starting = false;
 volatile bool linkUp = false;       // A2DP connected
@@ -95,8 +97,10 @@ void loadSaved() {
   String name = p.getString("name", "");
   uint8_t addr[6] = {0};
   size_t n = p.getBytes("addr", addr, 6);
+  bool spk = p.getBool("spk", false);
   p.end();
   hasSaved = name.length() && n == 6;
+  speakerMode = hasSaved && spk;
   if (hasSaved) { saved.name = name; memcpy(saved.addr, addr, 6); saved.rssi = 0; }
 }
 
@@ -105,8 +109,15 @@ void saveDevice(const Device& d) {
   if (!p.begin("listenbt", false)) return;
   p.putString("name", d.name);
   p.putBytes("addr", d.addr, 6);
+  p.putBool("spk", false);
   p.end();
-  saved = d; hasSaved = true;
+  saved = d; hasSaved = true; speakerMode = false;
+}
+
+void setSpeakerMode(bool on) {
+  speakerMode = on;
+  Preferences p;
+  if (p.begin("listenbt", false)) { p.putBool("spk", on); p.end(); }
 }
 
 void forgetSaved() {
@@ -268,7 +279,7 @@ inline bool connected() { return running && !starting && linkUp; }
 void retryConnect(uint32_t nowMs) {
   static uint32_t last = 0;
   if (last < startedAtMs) last = 0;
-  if (!hasSaved || !running || starting || linkUp || connecting || scanOnly) return;
+  if (!preferred() || !running || starting || linkUp || connecting || scanOnly) return;
   // Right after start the profile is not ready yet: try every 2 s for the first
   // 20 s (a connect that is refused costs nothing), then every 12 s.
   if (nowMs - last < 20000UL) return;   // the library keeps paging itself; this is only a safety net
@@ -278,7 +289,7 @@ void retryConnect(uint32_t nowMs) {
   Serial.printf("[bt] paging the remembered headphones (%s)\n", ok ? "request accepted" : "refused");
 }
 // A remembered headphone is being (re)connected: playback waits for it a few seconds.
-inline bool linking() { return hasSaved && running && !scanOnly && !linkUp; }
+inline bool linking() { return preferred() && running && !scanOnly && !linkUp; }
 
 void setVolumePercent(int percent) {
   volume127 = (uint8_t)constrain((int)lroundf(127.0f * sqrtf(percent / 100.0f)), 0, 127);   // perceptual curve: the stream gain is linear

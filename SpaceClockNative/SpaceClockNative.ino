@@ -6920,16 +6920,31 @@ String listenTime(uint32_t seconds) {
 // Bluetooth symbol, top right of every listening page: solid when the
 // headphones are connected, outlined when not. Tap it to open the settings.
 static constexpr int LISTEN_BT_X = 290, LISTEN_BT_Y = 3, LISTEN_BT_W = 24, LISTEN_BT_H = 24;
-bool listenBtIconShown = false;
+int listenBtIconShown = -1;   // 0 speaker, 1 Bluetooth not connected, 2 Bluetooth connected
+int listenBtIconState() { return lbt::connected() ? 2 : (lbt::preferred() ? 1 : 0); }
 
 void drawListenBtIcon() {
-  bool on = lbt::connected();
-  listenBtIconShown = on;
+  int state = listenBtIconState();
+  bool on = state == 2;
+  listenBtIconShown = state;
   int x = LISTEN_BT_X, y = LISTEN_BT_Y, w = LISTEN_BT_W, h = LISTEN_BT_H;
   uint16_t ink = on ? calTheme.bg : calTheme.accent;
   if (on) M5.Display.fillRoundRect(x, y, w, h, 6, calTheme.accent);
   else { M5.Display.fillRoundRect(x, y, w, h, 6, calTheme.bg); M5.Display.drawRoundRect(x, y, w, h, 6, calTheme.accent); }
   int cx = x + w / 2, cy = y + h / 2;
+  if (state == 0) {                              // no headphones set up: the built-in speaker (tap to pair headphones)
+    M5.Display.fillRect(cx - 9, cy - 3, 5, 7, ink);
+    M5.Display.fillTriangle(cx - 4, cy - 3, cx - 4, cy + 3, cx + 2, cy - 8, ink);
+    M5.Display.fillTriangle(cx - 4, cy + 3, cx + 2, cy + 8, cx + 2, cy - 8, ink);
+    for (int radius = 5; radius <= 8; radius += 3) {   // two sound waves
+      for (int deg = -45; deg <= 45; deg += 5) {
+        float rad = deg * 0.0174533f;
+        int px = cx + 2 + (int)lroundf(cosf(rad) * radius), py = cy + (int)lroundf(sinf(rad) * radius);
+        M5.Display.fillRect(px, py, 2, 2, ink);
+      }
+    }
+    return;
+  }
   for (int d = 0; d < 2; ++d) {                  // 2 px strokes
     M5.Display.drawLine(cx + d, cy - 8, cx + d, cy + 8, ink);
     M5.Display.drawLine(cx - 4, cy - 4 + d, cx + 4, cy + 4 + d, ink);
@@ -7264,7 +7279,7 @@ void drawListenBt() {
   M5.Display.setTextDatum(middle_left);
   M5.Display.setTextColor(calTheme.title, calTheme.bg);
   M5.Display.drawString("藍牙耳機", 10, 15);
-  String status = lbt::connected() ? String("已連線") : lbt::status;
+  String status = lbt::connected() ? String("已連線") : ((lbt::speakerMode || !lbt::hasSaved) && !lbt::running ? String("使用喇叭") : lbt::status);
   M5.Display.setTextDatum(middle_right);
   M5.Display.setTextColor(lbt::connected() ? calTheme.accent : calTheme.muted, calTheme.bg);
   M5.Display.drawString(status, 282, 15);
@@ -7291,13 +7306,16 @@ void drawListenBt() {
     M5.Display.setTextColor(calTheme.muted, calTheme.panel);
     if (r.rssi) M5.Display.drawString(String(r.rssi) + " dBm", 306, y + 20);
   });
-  drawCalendarBottomBar("返回", "重新掃描", "改用喇叭");
+  drawCalendarBottomBar("返回", "重新掃描", lbt::preferred() ? "改用喇叭" : "改用藍牙");
 }
 
 void listenOpenBt() {
   listenView = ListenView::Bluetooth;
   listenPage = 0;
-  if (!lbt::running) lbt::begin(nullptr, "");     // scan for headphones in pairing mode
+  if (!lbt::running) {
+    if (lbt::preferred()) lbt::begin(lbt::saved.addr, lbt::saved.name);   // the remembered headphones: connect, no scan
+    else if (!lbt::hasSaved) lbt::begin(nullptr, "");                      // nothing remembered: scan for headphones in pairing mode
+  }
   drawListenBt();
 }
 
@@ -7307,6 +7325,7 @@ void listenBtConnect(int index) {
   lbt::Device d; d.name = r.name; memcpy(d.addr, r.addr, 6); d.rssi = r.rssi;
   lbt::end();
   lbt::found.clear();
+  lbt::setSpeakerMode(false);
   lbt::begin(d.addr, d.name);
   listenBtPending = d; listenBtPendingSave = true;
   lbt::status = "連線中…";
@@ -7318,13 +7337,17 @@ void handleListenBtTap(int x, int y) {
   int pages = max(1, ((int)listenBtRows.size() + LISTEN_ROWS - 1) / LISTEN_ROWS);
   if (y >= 212) {
     if (x < 107) {                                   // back
-      if (!lbt::connected() && !lbt::hasSaved) lbt::end();
+      if (!lbt::connected() && !lbt::preferred()) lbt::end();
       if (listenBtBack == ListenView::Now && listen::current >= 0 && listen::current < (int)listen::queue.size()) { listenView = ListenView::Now; drawListenNow(true); }
       else { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
     } else if (x < 214) {                            // scan again
       lbt::end(); lbt::begin(nullptr, ""); drawListenBt();
-    } else {                                         // back to the built-in speaker
-      lbt::end(); lbt::forgetSaved(); listenBtPendingSave = false; drawListenBt();
+    } else if (lbt::preferred()) {                   // use the built-in speaker (the headphones stay remembered)
+      lbt::end(); lbt::setSpeakerMode(true); listenBtPendingSave = false; drawListenBt();
+    } else if (lbt::hasSaved) {                      // back to the remembered headphones: connect, no scan
+      lbt::end(); lbt::setSpeakerMode(false); lbt::begin(lbt::saved.addr, lbt::saved.name); drawListenBt();
+    } else {                                         // nothing remembered yet: scan for headphones
+      lbt::end(); lbt::begin(nullptr, ""); drawListenBt();
     }
     return;
   }
@@ -7706,7 +7729,7 @@ void listenMaintain(uint32_t nowMs) {
     lastWaiting = listen::pausedByLink;
     if (screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) { drawListenButton(2); drawListenDynamic(true); }
   }
-  if (screenNow == Screen::Listen && !screenSleeping && listenView != ListenView::Bluetooth && lbt::connected() != listenBtIconShown) drawListenBtIcon();
+  if (screenNow == Screen::Listen && !screenSleeping && listenView != ListenView::Bluetooth && listenBtIconState() != listenBtIconShown) drawListenBtIcon();
   static bool lastSleeping = false;
   if (lastSleeping && !screenSleeping && screenNow == Screen::Listen) listenRedraw();   // tracks may have changed while the screen was off
   lastSleeping = screenSleeping;
@@ -10169,7 +10192,7 @@ void enterListenMode() {
   listenModeActive = true;
   esp_log_level_set("BT_AV", ESP_LOG_VERBOSE); esp_log_level_set("BT_APP", ESP_LOG_VERBOSE);   // connection diagnostics (shown only in debug builds)
   lbt::loadSaved();
-  if (lbt::hasSaved) lbt::begin(lbt::saved.addr, lbt::saved.name);   // reconnect the remembered headphones
+  if (lbt::preferred()) lbt::begin(lbt::saved.addr, lbt::saved.name);   // reconnect the remembered headphones
 }
 
 void leaveListenMode() {

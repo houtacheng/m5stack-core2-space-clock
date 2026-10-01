@@ -33,6 +33,7 @@ volatile bool finished = false;     // track ended by itself
 volatile bool seekReq = false;
 volatile float seekFrac = 0;
 volatile uint32_t posBytes = 0, totalBytes = 0, dataStart = 0;
+uint32_t startRequestedMs = 0;     // for the start-up timing log
 volatile uint32_t durationSec = 0;   // from the Xing/Info/VBRI header when the file has one (0 = unknown)
 volatile int bitrate = 0;
 volatile uint32_t decodeErrors = 0, underruns = 0;
@@ -454,6 +455,8 @@ static void decodeTask(void* arg) {
   Track t = queue[(int)(intptr_t)arg];
   File f;
   { SdLock lock; f = SD.open(t.path); }
+  Serial.printf("[listen] file opened %u ms after the request\n", (unsigned)(millis() - startRequestedMs));
+  bool firstSound = false;
   HMP3Decoder dec = f ? newDecoder() : nullptr;
   const size_t INBUF = 6 * 1024, SLOT = 2816;   // 64 ms per slot at 44.1 kHz: cushion against SD / Wi-Fi hiccups
   uint8_t* in = (uint8_t*)heap_caps_malloc(INBUF, MALLOC_CAP_SPIRAM);
@@ -473,7 +476,7 @@ static void decodeTask(void* arg) {
     size_t skip;
     { SdLock lock; skip = id3Size(f); durationSec = headerDuration(f, skip); f.seek(skip); }
     dataStart = skip; totalBytes = f.size(); posBytes = skip;
-    Serial.printf("[listen] playing %s (%u bytes, speed %s)\n", t.path.c_str(), (unsigned)totalBytes, SPEED_LABELS[speedCode]);
+    Serial.printf("[listen] playing %s (%u bytes, speed %s), header read after %u ms (id3 %u bytes, duration %u s)\n", t.path.c_str(), (unsigned)totalBytes, SPEED_LABELS[speedCode], (unsigned)(millis() - startRequestedMs), (unsigned)skip, (unsigned)durationSec);
   }
 
   // Bluetooth path: mono samples at `rate` become 44.1 kHz stereo frames.
@@ -506,13 +509,14 @@ static void decodeTask(void* arg) {
   };
   // Send accumulated samples to the speaker (blocks while its queue is full).
   auto emit = [&](int count) {
+    if (!firstSound && count > 0) { firstSound = true; Serial.printf("[listen] first audio %u ms after the request\n", (unsigned)(millis() - startRequestedMs)); }
     if (count > 0 && lbt::connected()) {
       if (!onBt) { M5.Speaker.stop(CH); M5.Speaker.end(); onBt = true; btPos = 0; btPrev = 0; }   // frees its RAM for the stack
       emitBt(out + slot * SLOT, count);
       acc = 0;
       return;
     }
-    if (lbt::hasSaved) {                 // headphones are set up: no speaker; wait for them
+    if (lbt::preferred()) {              // headphones are set up: no speaker; wait for them
       lbt::flushAudio(); onBt = false; acc = 0;
       paused = true; pausedByLink = true;
       return;
@@ -712,6 +716,7 @@ void stop() {
 // Play queue[index] (the queue must already be set).
 bool startIndex(int index) {
   if (index < 0 || index >= (int)queue.size()) return false;
+  startRequestedMs = millis();
   stop();
   current = index;
   speedCode = speedFor(queue[index].path);
@@ -719,8 +724,8 @@ bool startIndex(int index) {
   lbt::fadeTarget = 1.0f;
   posBytes = 0; dataStart = 0; totalBytes = queue[index].size; decodeErrors = 0; underruns = 0; durationSec = 0;
   pausedByLink = false;
-  if (lbt::hasSaved && !lbt::connected()) { paused = true; pausedByLink = true; }   // wait for the headphones, silently
-  if (lbt::hasSaved || lbt::connected()) M5.Speaker.end();   // sound goes to the headphones: give the RAM back
+  if (lbt::preferred() && !lbt::connected()) { paused = true; pausedByLink = true; }   // wait for the headphones, silently
+  if (lbt::preferred() || lbt::connected()) M5.Speaker.end();   // sound goes to the headphones: give the RAM back
   else {
     if (!M5.Speaker.isRunning()) M5.Speaker.begin();
     M5.Speaker.setVolume((uint8_t)(volume * 255 / 100));
