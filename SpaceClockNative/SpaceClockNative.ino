@@ -7494,6 +7494,13 @@ void handleListenTap(int x, int y) {
 
 // Long press: add a file to a playlist, or remove it / the playlist.
 void handleListenLong(int x, int y) {
+  if (y >= 212 && x >= 107 && x < 214) {             // long-press the middle button: back to the player
+    if (listenView != ListenView::Now && listen::current >= 0 && listen::current < (int)listen::queue.size() && (listen::playing || listen::paused)) {
+      listenView = ListenView::Now;
+      drawListenNow(true);
+    }
+    return;
+  }
   if (listenView != ListenView::Browse || y < 34 || y >= 210) return;
   int idx = listenPage * LISTEN_ROWS + (y - 34) / 43;
   if (idx >= (int)listenEntries.size()) return;
@@ -8194,6 +8201,7 @@ void handleSerialConfig() {
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), netPaused);
       Serial.printf("[test] loop stack never used: %u bytes\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
       Serial.printf("[test] bt audio frames sent %u, silence %u, audioState %d\n", (unsigned)lbt::framesAudio, (unsigned)lbt::framesSilence, (int)lbt::audioState);
+      Serial.printf("[test] bt underruns while playing: %u events, %u frames missing\n", (unsigned)lbt::starveEvents, (unsigned)lbt::starveFrames);
     } else if (cmd == "t:btscan") {
       lbt::end(); lbt::begin(nullptr, "");
     } else if (cmd.startsWith("t:btconnect ")) {
@@ -8258,6 +8266,13 @@ void handleSerialConfig() {
         Serial.printf("[test] SD write %.0f KB/s, read %.0f KB/s\n", mb * 1024.0 * 1000.0 / (t2 - t1), mb * 1024.0 * 1000.0 / (t3 - t2));
         free(b);
       }
+    } else if (cmd.startsWith("t:bench ")) {
+      // t:bench /path.mp3 speedCode secondsOfOutput : decoder + time stretch speed without any pacing
+      int sp1 = cmd.indexOf(' ', 8), sp2 = cmd.indexOf(' ', sp1 + 1);
+      String path = cmd.substring(8, sp1);
+      int code = constrain((int)cmd.substring(sp1 + 1, sp2).toInt(), 0, 4), seconds = max(5, (int)cmd.substring(sp2 + 1).toInt());
+      listen::begin();
+      listen::bench(path, code, seconds);
     } else if (cmd.startsWith("t:seek ")) {
       listen::seekFrac = cmd.substring(7).toFloat(); listen::seekReq = true;
       Serial.printf("[test] seek to %.2f\n", (float)listen::seekFrac);

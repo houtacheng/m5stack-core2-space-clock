@@ -544,12 +544,18 @@ static void decodeTask(void* arg) {
 
   while (ok && !stopReq) {
     int64_t iterStart = esp_timer_get_time(), waitBefore = waitUs;
+    lbt::wantAudio = !paused && !seekReq;
     if (paused && pausedByLink && lbt::connected()) { paused = false; pausedByLink = false; }   // the headphones are back
     if (paused) {
-      if (!flushed) { M5.Speaker.stop(CH); lbt::flushAudio(); acc = 0; flushed = true; }
+      if (!flushed) {
+        lbt::fadeTarget = 0.0f;                       // let the headphone output fade out first
+        if (lbt::connected()) vTaskDelay(pdMS_TO_TICKS(60));
+        M5.Speaker.stop(CH); lbt::flushAudio(); acc = 0; flushed = true;
+      }
       vTaskDelay(pdMS_TO_TICKS(60));
       continue;
     }
+    if (flushed) lbt::fadeTarget = 1.0f;               // resumed: the output fades in with the first audio
     flushed = false;
     if (seekReq) {
       float frac = constrain((float)seekFrac, 0.0f, 0.995f);
@@ -557,7 +563,9 @@ static void decodeTask(void* arg) {
       have = 0; eof = false; acc = 0; wsFinished = false;
       if (wsActive) ws->reset();
       seekReq = false;
+      lbt::fadeTarget = 0.0f; if (lbt::connected()) vTaskDelay(pdMS_TO_TICKS(50));
       M5.Speaker.stop(CH); lbt::flushAudio();
+      lbt::fadeTarget = 1.0f;
     }
     uint8_t want = speedCode;
     if (want != usedSpeed) {          // speed button pressed while playing
@@ -611,11 +619,16 @@ static void decodeTask(void* arg) {
       acc += n;
       if (acc + 1152 > (int)SLOT) emit(acc);
     } else {
-      if (!wsActive || newRate != rate) {
-        rate = newRate;
+      // The time stretcher's cost grows with the cube of the sample rate: run it at
+      // 24 kHz or less (average pairs of samples above 32 kHz).
+      int ds = newRate > 32000 ? 2 : 1;
+      int wsRate = newRate / ds;
+      if (!wsActive || wsRate != rate) {
+        rate = wsRate;
         if (!ws->begin(rate, SPEEDS[usedSpeed])) { Serial.println("[listen] stretcher out of memory"); break; }
         wsActive = true; wsFinished = false; acc = 0;
       }
+      if (ds == 2) { n /= 2; for (size_t i = 0; i < n; ++i) mono[i] = (int16_t)(((int32_t)mono[2 * i] + mono[2 * i + 1]) / 2); }
       ws->push(mono, n);
     }
     // Never hog the core: the main loop, touch and networking share it.
@@ -642,7 +655,53 @@ static void decodeTask(void* arg) {
   vTaskDelete(nullptr);
 }
 
+// Decoder + time-stretch speed on the CPU without pacing (diagnostics).
+void bench(const String& path, int code, int seconds) {
+  File f; { SdLock lock; f = SD.open(path); }
+  if (!f) { Serial.println("[bench] cannot open file"); return; }
+  bool scarce = lbt::running;   // Helix lives in PSRAM while Bluetooth runs
+  if (scarce) heap_caps_malloc_extmem_enable(1);
+  HMP3Decoder dec = MP3InitDecoder();
+  if (scarce) heap_caps_malloc_extmem_enable(mallocThreshold);
+  uint8_t* in = (uint8_t*)heap_caps_malloc(6144, MALLOC_CAP_SPIRAM);
+  int16_t* pcm = (int16_t*)heap_caps_malloc(1152 * 2 * 2, MALLOC_CAP_SPIRAM);
+  int16_t* mono = (int16_t*)heap_caps_malloc(1152 * 2, MALLOC_CAP_SPIRAM);
+  int16_t hop[1024];
+  Wsola* ws = new Wsola();
+  size_t have = 0; bool eof = false, wsOn = false;
+  uint32_t t0 = millis(), outSamples = 0, rate = 0;
+  size_t skip; { SdLock lock; skip = id3Size(f); f.seek(skip); }
+  while (dec && in && pcm && mono && ws && (millis() - t0 < 30000UL) && (!rate || outSamples < rate * (uint32_t)seconds)) {
+    if (have < 2048 && !eof) { size_t n; { SdLock lock; n = f.read(in + have, 6144 - have); } if (!n) eof = true; else have += n; }
+    if (!have) break;
+    int sync = MP3FindSyncWord(in, (int)have);
+    if (sync < 0) { have = 0; continue; }
+    if (sync > 0) { memmove(in, in + sync, have - sync); have -= sync; }
+    unsigned char* ptr = in; int left = (int)have;
+    int r = MP3Decode(dec, &ptr, &left, pcm, 0);
+    size_t used = have - left; if (!used) used = 1;
+    memmove(in, in + used, have - used); have -= used;
+    if (r != ERR_MP3_NONE) continue;
+    MP3FrameInfo info; MP3GetLastFrameInfo(dec, &info);
+    int ch = max(1, info.nChans); size_t n = min<size_t>(1152, info.outputSamps / ch);
+    for (size_t i = 0; i < n; ++i) mono[i] = ch > 1 ? (int16_t)(((int32_t)pcm[i * ch] + pcm[i * ch + 1]) / 2) : pcm[i];
+    if (!rate) rate = info.samprate;
+    if (SPEEDS[code] == 1.0f) { outSamples += n; continue; }
+    int ds = info.samprate > 32000 ? 2 : 1;
+    if (!wsOn) { rate = info.samprate / ds; ws->begin(rate, SPEEDS[code]); wsOn = true; }
+    if (ds == 2) { n /= 2; for (size_t i = 0; i < n; ++i) mono[i] = (int16_t)(((int32_t)mono[2 * i] + mono[2 * i + 1]) / 2); }
+    ws->push(mono, n);
+    while (ws->pull(hop)) outSamples += ws->hop();
+  }
+  uint32_t ms = max<uint32_t>(1, millis() - t0);
+  Serial.printf("[bench] %s speed %s: %u output samples at %u Hz in %u ms -> %.2fx real time (Helix %s, %u MHz)\n", path.c_str(), SPEED_LABELS[code],
+                (unsigned)outSamples, (unsigned)rate, (unsigned)ms, outSamples * 1000.0 / ms / (rate ? rate : 1), scarce ? "in PSRAM" : "in internal RAM", (unsigned)getCpuFrequencyMhz());
+  delete ws; if (in) free(in); if (pcm) free(pcm); if (mono) free(mono); if (dec) MP3FreeDecoder(dec);
+  f.close();
+}
+
 void stop() {
+  if (playing && lbt::connected()) { lbt::fadeTarget = 0.0f; delay(60); }   // fade out instead of a click
   stopReq = true;
   for (int i = 0; i < 150 && playing; ++i) delay(10);
   M5.Speaker.stop(CH);
@@ -657,6 +716,7 @@ bool startIndex(int index) {
   current = index;
   speedCode = speedFor(queue[index].path);
   stopReq = false; paused = false; finished = false; seekReq = false;
+  lbt::fadeTarget = 1.0f;
   posBytes = 0; dataStart = 0; totalBytes = queue[index].size; decodeErrors = 0; underruns = 0; durationSec = 0;
   pausedByLink = false;
   if (lbt::hasSaved && !lbt::connected()) { paused = true; pausedByLink = true; }   // wait for the headphones, silently

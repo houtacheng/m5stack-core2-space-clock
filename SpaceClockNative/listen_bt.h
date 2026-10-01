@@ -65,10 +65,13 @@ bool scanOnly = false;
 // Frame-aligned single-producer / single-consumer ring (decoder -> Bluetooth
 // callback). A byte-oriented stream buffer can split a stereo frame between two
 // transfers, which shifts every later sample and sounds like heavy static.
-static const uint32_t RING_FRAMES = 8192;      // ~186 ms of 44.1 kHz stereo
+static const uint32_t RING_FRAMES = 16384;     // ~370 ms of 44.1 kHz stereo (absorbs decoder stalls)
 uint32_t* ring = nullptr;                      // PSRAM; one frame = left | right << 16
 volatile uint32_t rHead = 0, rTail = 0;        // monotonic counters
 volatile bool flushReq = false;
+volatile float fadeTarget = 1.0f;            // 0 = fade the output out, 1 = full level (set by the player)
+static float cbGain = 0.0f;                  // gain currently applied by the callback
+static bool cbWasSilent = true;              // the previous callback delivered silence
 inline uint32_t buffered() { return rHead - rTail; }
 uint8_t volume127 = 76;
 volatile int8_t playRequest = 0;    // from the headphone buttons / in-ear sensor: 1 play, -1 pause
@@ -76,6 +79,8 @@ volatile int8_t navRequest = 0;     // +1 next track, -1 previous track
 volatile int audioState = -1;       // esp_a2d_audio_state_t of the stream (0 remote suspend, 1 stopped, 2 started)
 volatile bool remoteSuspend = false;   // the headphone suspended the stream itself (taken off)
 volatile uint32_t framesAudio = 0, framesSilence = 0;   // diagnostics: what the headphone pulled
+volatile bool wantAudio = false;              // the player is playing (set by the player): silence then is an underrun
+volatile uint32_t starveEvents = 0, starveFrames = 0;   // underruns while playing
 uint32_t startedAtMs = 0;
 uint32_t lastMediaCmdMs = 0;
 
@@ -163,6 +168,22 @@ static int32_t dataCb(Frame* frames, int32_t count) {
   for (size_t i = 0; i < gotFrames; ++i) memcpy(&frames[i], &ring[(rTail + i) % RING_FRAMES], 4);
   __sync_synchronize();
   rTail += gotFrames;
+  // Audio that starts, stops or jumps abruptly makes the headphone DAC pop.
+  // Ramp the level (about 30 ms) after every silence and towards fadeTarget.
+  if (gotFrames) {
+    if (cbWasSilent) cbGain = 0.0f;
+    cbWasSilent = false;
+    const float step = 1.0f / 1300.0f, target = fadeTarget;
+    for (size_t i = 0; i < gotFrames; ++i) {
+      if (cbGain < target) { cbGain += step; if (cbGain > target) cbGain = target; }
+      else if (cbGain > target) { cbGain -= step; if (cbGain < target) cbGain = target; }
+      if (cbGain < 0.999f) { frames[i].channel1 = (int16_t)(frames[i].channel1 * cbGain); frames[i].channel2 = (int16_t)(frames[i].channel2 * cbGain); }
+    }
+  }
+  if (gotFrames < (size_t)count) {
+    if (wantAudio) { ++starveEvents; starveFrames += count - gotFrames; }
+    cbWasSilent = true;
+  }
   framesAudio += gotFrames; framesSilence += count - gotFrames;
   if ((int32_t)gotFrames < count) memset(frames + gotFrames, 0, (count - gotFrames) * 4);
   return count;
