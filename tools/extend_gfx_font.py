@@ -52,6 +52,7 @@ def main():
     p.add_argument("--font", required=True)
     p.add_argument("--pixels", type=int, required=True)
     p.add_argument("--kana-only", action="store_true", help="only add katakana (keeps large fonts small)")
+    p.add_argument("--index", type=int, default=0, help="face index inside a .ttc font")
     p.add_argument("--from-source", type=Path, nargs="*", help="only add characters used in these source files")
     a = p.parse_args()
     text = a.header.read_text(encoding="utf-8")
@@ -61,7 +62,7 @@ def main():
     gstart = text.index(f"const GFXglyph {name}Glyphs[]")
     glyphs = {int(m.group(7), 16): tuple(int(m.group(i)) for i in range(1, 7)) for m in GLYPH.finditer(text[gstart:])}
     y_advance = int(re.search(r"0x[0-9A-Fa-f]+,\s*0x[0-9A-Fa-f]+,\s*(\d+)", text[text.index(f"const GFXfont {name}"):]).group(1))
-    font = ImageFont.truetype(a.font, a.pixels)
+    font = ImageFont.truetype(a.font, a.pixels, index=a.index)
     added = 0
     if a.from_source:
         text = "".join(f.read_text(encoding="utf-8") for f in a.from_source)

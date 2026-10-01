@@ -15,9 +15,11 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <mp3dec.h>
+#include <functional>
 #include "listen_player.h"
 void showListen();
 void showMessageHub();
+int signalChatUnread(const char* chat);
 volatile bool wifiPaused = false;  // Wi-Fi deliberately off (listening mode frees RAM for Bluetooth)
 #ifdef BT_MP3_EXPERIMENT
 #include "bt_mp3_experiment.h"
@@ -50,6 +52,7 @@ volatile bool wifiPaused = false;  // Wi-Fi deliberately off (listening mode fre
 #endif
 #include "mqtt_guide.h"
 
+enum class ListenView : uint8_t { Browse, Now, Pick, Confirm };
 enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight, Calendar, Messages, MessageDetail, MessageReply, MessageFull, MessageHub, WifiSwitch, Listen };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
@@ -1184,7 +1187,10 @@ void updatePowerSaveMode(uint32_t nowMs) {
     }
   }
   // 80 MHz while the screen is off on battery; back to 160 MHz otherwise.
-  uint32_t wantMhz = powerSaveMode && screenSleeping && !listen::playing ? 80 : 160;
+  // Speed-changed playback needs the extra decode headroom; otherwise 160 MHz.
+  uint32_t wantMhz = 160;
+  if (listen::playing && listen::SPEEDS[listen::speedCode] != 1.0f) wantMhz = 240;
+  else if (powerSaveMode && screenSleeping && !listen::playing) wantMhz = 80;
   if (getCpuFrequencyMhz() != wantMhz) setCpuFrequencyMhz(wantMhz);
 }
 
@@ -6253,14 +6259,44 @@ int messageUnreadFor(bool teams) {
 }
 
 // Conversations of the selected source, ordered by their newest message.
+int signalChatUnread(const char* chat);
+static constexpr int SIGNAL_MAX_CHATS = 100;
 int signalConversations(int* newestIndex, int maxCount) {
   int n = 0;
-  for (int i = signalMessageCount - 1; i >= 0 && n < maxCount; --i) {
-    if (messageIsTeams(signalMessages[i]) != messageSourceTeams) continue;
-    bool seen = false;
-    for (int k = 0; k < n; ++k) if (!strcmp(signalMessages[newestIndex[k]].chat, signalMessages[i].chat)) { seen = true; break; }
-    if (!seen) newestIndex[n++] = i;
+  // Conversations with unread messages first, so none can hide below the fold.
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int i = signalMessageCount - 1; i >= 0 && n < maxCount; --i) {
+      if (messageIsTeams(signalMessages[i]) != messageSourceTeams) continue;
+      bool seen = false;
+      for (int k = 0; k < n; ++k) if (!strcmp(signalMessages[newestIndex[k]].chat, signalMessages[i].chat)) { seen = true; break; }
+      if (seen) continue;
+      bool hasUnread = signalChatUnread(signalMessages[i].chat) > 0;
+      if ((pass == 0) == hasUnread) newestIndex[n++] = i;
+    }
   }
+  return n;
+}
+
+// Mark every unread conversation of the selected source as read (shared with the NAS).
+int signalMarkAllRead(bool teams) {
+  static char keys[24][128];
+  int n = 0;
+  for (int i = 0; i < signalMessageCount && n < 24; ++i) {
+    if (!signalMessages[i].unread || messageIsTeams(signalMessages[i]) != teams) continue;
+    bool seen = false;
+    for (int k = 0; k < n; ++k) if (!strcmp(keys[k], signalMessages[i].chat)) { seen = true; break; }
+    if (!seen) strlcpy(keys[n++], signalMessages[i].chat, sizeof(keys[0]));
+  }
+  for (int k = 0; k < n; ++k) {
+    JsonDocument req; req["chat"] = keys[k];
+    String body, response; serializeJson(req, body);
+    int code = signalRequest("/api/read", body, response);
+    Serial.printf("[signal] mark read %.12s -> HTTP %d\n", keys[k], code);
+  }
+  for (int i = 0; i < signalMessageCount; ++i)
+    if (signalMessages[i].unread && messageIsTeams(signalMessages[i]) == teams) signalMessages[i].unread = false;
+  signalUnread = 0;
+  for (int i = 0; i < signalMessageCount; ++i) if (signalMessages[i].unread) ++signalUnread;
   return n;
 }
 
@@ -6282,8 +6318,8 @@ void drawSignalSyncButton(const char* label = "同步") {
 void drawSignalList() {
   if (screenNow != Screen::Messages) return;
   applyCalendarTheme();
-  int chats[20];
-  int chatCount = signalMessages ? signalConversations(chats, 20) : 0;
+  int chats[SIGNAL_MAX_CHATS];
+  int chatCount = signalMessages ? signalConversations(chats, SIGNAL_MAX_CHATS) : 0;
   int pages = max(1, (chatCount + 3) / 4);
   if (signalListPage >= pages) signalListPage = pages - 1;
   M5.Display.fillScreen(calTheme.bg);
@@ -6293,8 +6329,16 @@ void drawSignalList() {
   M5.Display.drawString(messageSourceTeams ? "Teams" : "Signal", 10, 4);
   useUIFont(1);
   M5.Display.setTextColor(calTheme.muted, calTheme.bg);
-  M5.Display.drawString((signalStatus.length() ? signalStatus : String("連線中…")) + "  " + String(signalListPage + 1) + "/" + String(pages), 96, 10);
+  int sourceUnread = messageUnreadFor(messageSourceTeams);
+  M5.Display.drawString((sourceUnread ? String("") : (signalStatus.length() ? signalStatus : String("連線中…")) + "  ") + String(signalListPage + 1) + "/" + String(pages), 96, 10);
   drawSignalSyncButton();
+  if (sourceUnread) {
+    M5.Display.fillRoundRect(168, 3, 88, 26, 6, calTheme.panel);
+    M5.Display.drawRoundRect(168, 3, 88, 26, 6, 0xFD20);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(0xFD20, calTheme.panel);
+    M5.Display.drawString("全部已讀", 212, 16);
+  }
   M5.Display.drawFastHLine(8, 34, 304, calTheme.border);
   if (!signalConfigured() || !chatCount) {
     M5.Display.setTextDatum(middle_center);
@@ -6613,9 +6657,14 @@ void handleSignalTap(int x, int y) {
     }
     return;
   }
+  if (screenNow == Screen::Messages && y < 34 && x >= 168 && x < 256 && messageUnreadFor(messageSourceTeams)) {
+    signalMarkAllRead(messageSourceTeams);
+    drawSignalList();
+    return;
+  }
   if (screenNow == Screen::Messages) {
-    int chats[20];
-    int chatCount = signalMessages ? signalConversations(chats, 20) : 0;
+    int chats[SIGNAL_MAX_CHATS];
+    int chatCount = signalMessages ? signalConversations(chats, SIGNAL_MAX_CHATS) : 0;
     int pages = max(1, (chatCount + 3) / 4);
     if (y >= 210) {
       if (x < 107 && signalListPage) { --signalListPage; drawSignalList(); }
@@ -6670,22 +6719,99 @@ void handleSignalTap(int x, int y) {
 // ---------------------------------------------------------------------------
 // Listening mode: MP3 files from the SD card
 // ---------------------------------------------------------------------------
-static const int LISTEN_ROWS = 5;
-uint8_t listenPage = 0;
-bool listenNowView = false;
+// Folders and playlists are browsed four rows at a time. File and folder names
+// are drawn with the 8pt font, which covers the whole CJK block, so no
+// character is missing.
+static const int LISTEN_ROWS = 4;
+ListenView listenView = ListenView::Browse;
+ListenView listenPickReturn = ListenView::Browse;
+String listenLoc = "/";                 // "/", "/folder", "@playlists", "@pl:NAME"
+std::vector<listen::Entry> listenEntries;
+std::vector<String> listenPickNames;
+int listenPage = 0;
 uint32_t listenLastDraw = 0;
 bool listenSdMissing = false;
+String listenPickPath;                  // file waiting to be added to a playlist
+String listenToast;
+uint8_t listenConfirmKind = 0;          // 1 remove a track from a playlist, 2 remove a playlist
+String listenConfirmName;
+int listenConfirmIndex = 0;
 
-String listenFit(const String& text, int maxW) {
-  String s = text;
-  if (M5.Display.textWidth(s) <= maxW) return s;
-  while (s.length() > 1) {
-    int cut = s.length() - 1;
-    while (cut > 0 && ((uint8_t)s[cut] & 0xC0) == 0x80) --cut;  // UTF-8 boundary
-    s = s.substring(0, cut);
-    if (M5.Display.textWidth(s + "…") <= maxW) return s + "…";
+String listenKeyForLoc(const String& loc) {
+  if (loc.startsWith("@pl:")) return "P:" + loc.substring(4);
+  return "D:" + loc;
+}
+
+String listenBaseName(const String& path) {
+  String n = path.substring(path.lastIndexOf('/') + 1);
+  if (n.length() > 4 && n.substring(n.length() - 4).equalsIgnoreCase(".mp3")) n = n.substring(0, n.length() - 4);
+  return n;
+}
+
+String listenLocTitle(const String& loc) {
+  if (loc == "/") return "聽法";
+  if (loc == "@playlists") return "播放清單";
+  if (loc.startsWith("@pl:")) return loc.substring(4);
+  return loc.substring(loc.lastIndexOf('/') + 1);
+}
+
+String listenParentLoc(const String& loc) {
+  if (loc == "/") return "/";
+  if (loc == "@playlists") return "/";
+  if (loc.startsWith("@pl:")) return "@playlists";
+  return listen::parentOf(loc);
+}
+
+bool listenIsPlaylistLoc() { return listenLoc.startsWith("@pl:"); }
+
+void listenLoad() {
+  listenEntries.clear();
+  if (listenLoc == "@playlists") {
+    std::vector<String> names; listen::playlistNames(names);
+    for (auto& n : names) listenEntries.push_back({n, "@pl:" + n, true, 0});
+    listenEntries.push_back({"＋ 新增播放清單", "@new", true, 0});
+  } else if (listenIsPlaylistLoc()) {
+    std::vector<String> paths; listen::playlistPaths(listenLoc.substring(4), paths);
+    for (auto& p : paths) if (SD.exists(p)) listenEntries.push_back({listenBaseName(p), p, false, 0});
+  } else {
+    listen::listDir(listenLoc, listenEntries);
+    if (listenLoc == "/") listenEntries.insert(listenEntries.begin(), {"播放清單", "@playlists", true, 0});
   }
-  return s;
+  int pages = max(1, ((int)listenEntries.size() + LISTEN_ROWS - 1) / LISTEN_ROWS);
+  if (listenPage >= pages) listenPage = pages - 1;
+}
+
+bool listenHasMp3() {
+  for (auto& e : listenEntries) if (!e.isDir) return true;
+  return false;
+}
+
+// Wrap `text` (8pt font must be set) into at most maxLines lines of maxW pixels.
+int listenWrap(const String& text, int maxW, int maxLines, String* lines) {
+  int count = 0;
+  String cur;
+  int i = 0, len = text.length();
+  while (i < len && count < maxLines) {
+    int n = 1;
+    uint8_t c = text[i];
+    if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+    String ch = text.substring(i, i + n);
+    if (M5.Display.textWidth(cur + ch) > maxW && cur.length()) {
+      if (count == maxLines - 1) {          // last line: end with an ellipsis
+        while (cur.length() > 1 && M5.Display.textWidth(cur + "…") > maxW) {
+          int cut = cur.length() - 1;
+          while (cut > 0 && ((uint8_t)cur[cut] & 0xC0) == 0x80) --cut;
+          cur = cur.substring(0, cut);
+        }
+        lines[count++] = cur + "…";
+        return count;
+      }
+      lines[count++] = cur; cur = "";
+    }
+    cur += ch; i += n;
+  }
+  if (cur.length() && count < maxLines) lines[count++] = cur;
+  return count;
 }
 
 String listenTime(uint32_t seconds) {
@@ -6693,152 +6819,265 @@ String listenTime(uint32_t seconds) {
   return String(b);
 }
 
-void drawListenHeader(const String& right) {
-  M5.Display.fillRect(0, 0, 320, 32, calTheme.bg);
-  useUIMediumFont();
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(calTheme.title, calTheme.bg);
-  M5.Display.drawString("聽法", 10, 3);
-  useUIFont(1);
-  M5.Display.setTextDatum(middle_right);
-  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
-  M5.Display.drawString(right, 310, 15);
-  M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+void drawListenFolderIcon(int x, int y, uint16_t c) {
+  M5.Display.fillRect(x, y, 10, 5, c);
+  M5.Display.fillRoundRect(x, y + 3, 24, 16, 2, c);
 }
 
-void drawListenList() {
+void drawListenNoteIcon(int x, int y, uint16_t c) {
+  M5.Display.fillCircle(x + 6, y + 15, 4, c);
+  M5.Display.fillRect(x + 9, y + 2, 2, 14, c);
+  M5.Display.fillTriangle(x + 11, y + 2, x + 17, y + 7, x + 11, y + 8, c);
+}
+
+void drawListenPill(int x, int y, int w, const String& label) {
+  M5.Display.fillRoundRect(x, y, w, 24, 6, calTheme.panel);
+  M5.Display.drawRoundRect(x, y, w, 24, 6, calTheme.accent);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.accent, calTheme.panel);
+  M5.Display.drawString(label, x + w / 2, y + 12);
+}
+
+void drawListenRows(int count, const std::function<void(int, int)>& drawRow) {
+  for (int i = 0; i < LISTEN_ROWS; ++i) {
+    int idx = listenPage * LISTEN_ROWS + i;
+    if (idx >= count) break;
+    drawRow(idx, 34 + i * 43);
+  }
+}
+
+void drawListenRowText(const String& text, int y, int left, uint16_t color, uint16_t bg) {
+  useUIFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(color, bg);
+  String lines[2];
+  int n = listenWrap(text, 304 - left - 8, 2, lines);
+  int top = y + (40 - (n * 16 + (n - 1) * 3)) / 2;
+  for (int i = 0; i < n; ++i) M5.Display.drawString(lines[i], left, top + i * 19);
+}
+
+void drawListenBrowse() {
   M5.Display.fillScreen(calTheme.bg);
-  int total = (int)listen::tracks.size();
-  int pages = max(1, (total + LISTEN_ROWS - 1) / LISTEN_ROWS);
-  if (listenPage >= pages) listenPage = pages - 1;
-  drawListenHeader(total ? String(total) + " 首" : String(""));
-  if (!total) {
+  useUIFont(1);
+  bool atRoot = listenLoc == "/";
+  int titleLeft = 10;
+  if (!atRoot) {
+    drawListenPill(6, 3, 54, "◀ 返回");
+    titleLeft = 66;
+  }
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  bool pill = listenHasMp3();
+  String title = listenLocTitle(listenLoc);
+  int maxW = (pill ? 208 : 308) - titleLeft;
+  while (title.length() > 1 && M5.Display.textWidth(title) > maxW) {
+    int cut = title.length() - 1;
+    while (cut > 0 && ((uint8_t)title[cut] & 0xC0) == 0x80) --cut;
+    title = title.substring(0, cut);
+  }
+  M5.Display.drawString(title, titleLeft, 15);
+  if (pill) drawListenPill(212, 3, 100, listen::MODE_LABELS[listen::modeFor(listenKeyForLoc(listenLoc))]);
+  M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+
+  int total = (int)listenEntries.size();
+  if (listenSdMissing) {
     useUIFont(1);
     M5.Display.setTextDatum(middle_center);
     M5.Display.setTextColor(calTheme.muted, calTheme.bg);
-    M5.Display.drawString(listenSdMissing ? "找不到 SD 卡" : "SD 卡裡沒有 MP3 檔案", 160, 110);
-    M5.Display.drawString("請把 .mp3 放在 SD 卡根目錄或資料夾", 160, 138);
+    M5.Display.drawString("找不到 SD 卡", 160, 120);
+  } else if (!total) {
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+    M5.Display.drawString(listenIsPlaylistLoc() ? "這個播放清單是空的" : "這裡沒有 MP3 檔案或資料夾", 160, 110);
+    if (listenIsPlaylistLoc()) M5.Display.drawString("長按 MP3 可以加入播放清單", 160, 138);
   }
-  for (int i = 0; i < LISTEN_ROWS; ++i) {
-    int idx = listenPage * LISTEN_ROWS + i;
-    if (idx >= total) break;
-    int y = 35 + i * 35;
-    bool cur = idx == listen::current && (listen::playing || listen::paused);
-    M5.Display.fillRoundRect(8, y, 304, 32, 7, calTheme.panel);
-    M5.Display.drawRoundRect(8, y, 304, 32, 7, cur ? calTheme.accent : calTheme.border);
-    useUIMediumFont();
-    M5.Display.setTextDatum(middle_left);
-    M5.Display.setTextColor(cur ? calTheme.accent : calTheme.text, calTheme.panel);
-    int left = 16;
-    if (cur) { M5.Display.fillTriangle(16, y + 10, 16, y + 22, 26, y + 16, calTheme.accent); left = 34; }
-    M5.Display.drawString(listenFit(listen::tracks[idx].name, 304 - left - 8), left, y + 16);
-  }
-  char mid[16]; snprintf(mid, sizeof(mid), "%d/%d", listenPage + 1, pages);
-  drawCalendarBottomBar("上一頁", total ? "下一頁" : "", "關閉");
-  (void)mid;
+  String playingKey = listen::ctxKey;
+  String thisKey = listenKeyForLoc(listenLoc);
+  drawListenRows(total, [&](int idx, int y) {
+    const listen::Entry& e = listenEntries[idx];
+    bool cur = !e.isDir && (listen::playing || listen::paused) && listen::current >= 0
+               && listen::current < (int)listen::queue.size() && listen::queue[listen::current].path == e.path
+               && playingKey == thisKey;
+    M5.Display.fillRoundRect(8, y, 304, 40, 7, calTheme.panel);
+    M5.Display.drawRoundRect(8, y, 304, 40, 7, cur ? calTheme.accent : calTheme.border);
+    uint16_t color = cur ? calTheme.accent : calTheme.text;
+    if (e.isDir) drawListenFolderIcon(14, y + 11, calTheme.accent);
+    else drawListenNoteIcon(18, y + 10, cur ? calTheme.accent : calTheme.muted);
+    drawListenRowText(e.name, y, 46, color, calTheme.panel);
+  });
+  drawCalendarBottomBar("上一頁", "下一頁", "關閉");
 }
 
-void drawListenButton(int i, bool pressedLook = false) {
-  int x = 10 + i * 61, y = 166, w = 56, h = 40;
+void drawListenButton(int x, int w, int kind) {
+  int y = 164, h = 42;
   M5.Display.fillRoundRect(x, y, w, h, 8, calTheme.panel);
   M5.Display.drawRoundRect(x, y, w, h, 8, calTheme.border);
   uint16_t c = calTheme.accent;
   int cx = x + w / 2, cy = y + h / 2;
-  if (i == 0) {          // previous
+  if (kind == 0) {          // previous
     M5.Display.fillRect(cx - 11, cy - 9, 3, 18, c);
     M5.Display.fillTriangle(cx + 10, cy - 9, cx + 10, cy + 9, cx - 6, cy, c);
-  } else if (i == 1) {   // play / pause
+  } else if (kind == 1) {   // play / pause
     if (listen::playing && !listen::paused) {
       M5.Display.fillRect(cx - 8, cy - 10, 6, 20, c);
       M5.Display.fillRect(cx + 3, cy - 10, 6, 20, c);
     } else {
       M5.Display.fillTriangle(cx - 7, cy - 11, cx - 7, cy + 11, cx + 11, cy, c);
     }
-  } else if (i == 2) {   // next
+  } else if (kind == 2) {   // next
     M5.Display.fillRect(cx + 8, cy - 9, 3, 18, c);
     M5.Display.fillTriangle(cx - 10, cy - 9, cx - 10, cy + 9, cx + 6, cy, c);
-  } else if (i == 3) {   // volume down
-    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
-  } else {               // volume up
-    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
-    M5.Display.fillRect(cx - 2, cy - 9, 4, 18, c);
+  } else {                  // mode (3) and speed (4): text labels
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(c, calTheme.panel);
+    String label = kind == 3 ? String(listen::MODE_LABELS[listen::mode]) : String(listen::SPEED_LABELS[listen::speedCode]);
+    M5.Display.drawString(label, cx, cy);
   }
+}
+
+void listenButtonRect(int i, int& x, int& w) {
+  static const int xs[5] = {6, 56, 114, 164, 258}, ws[5] = {44, 52, 44, 88, 56};
+  x = xs[i]; w = ws[i];
+}
+
+void drawListenButtons() {
+  for (int i = 0; i < 5; ++i) { int x, w; listenButtonRect(i, x, w); drawListenButton(x, w, i); }
+}
+
+void drawListenVolume() {
+  M5.Display.fillRect(150, 0, 170, 30, calTheme.bg);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.text, calTheme.bg);
+  drawListenPill(196, 3, 30, "－");
+  drawListenPill(268, 3, 40, "＋");
+  M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(String(listen::volume) + "%", 247, 15);
 }
 
 void drawListenProgress() {
   uint32_t span = listen::totalBytes > listen::dataStart ? listen::totalBytes - listen::dataStart : 0;
   uint32_t pos = listen::posBytes > listen::dataStart ? listen::posBytes - listen::dataStart : 0;
   float frac = span ? min(1.0f, (float)pos / (float)span) : 0.0f;
-  M5.Display.fillRect(0, 118, 320, 44, calTheme.bg);
-  M5.Display.fillRoundRect(20, 124, 280, 10, 5, calTheme.panelAlt);
-  if (frac > 0) M5.Display.fillRoundRect(20, 124, max(8, (int)(280 * frac)), 10, 5, calTheme.accent);
+  M5.Display.fillRect(0, 116, 320, 44, calTheme.bg);
+  M5.Display.fillRoundRect(20, 122, 280, 10, 5, calTheme.panelAlt);
+  if (frac > 0) M5.Display.fillRoundRect(20, 122, max(8, (int)(280 * frac)), 10, 5, calTheme.accent);
   useUIFont(1);
   M5.Display.setTextDatum(middle_center);
   M5.Display.setTextColor(calTheme.muted, calTheme.bg);
   if (listen::bitrate > 0 && span) {
     uint32_t total = (uint32_t)((uint64_t)span * 8 / listen::bitrate);
     uint32_t elapsed = (uint32_t)((uint64_t)pos * 8 / listen::bitrate);
-    M5.Display.drawString(listenTime(elapsed) + " / " + listenTime(total), 160, 148);
+    M5.Display.drawString(listenTime(elapsed) + " / " + listenTime(total), 160, 146);
   } else {
-    M5.Display.drawString(String((int)(frac * 100)) + "%", 160, 148);
+    M5.Display.drawString(String((int)(frac * 100)) + "%", 160, 146);
   }
 }
 
 void drawListenNow(bool full) {
-  if (listen::current < 0 || listen::current >= (int)listen::tracks.size()) { listenNowView = false; drawListenList(); return; }
-  const listen::Track& t = listen::tracks[listen::current];
+  if (listen::current < 0 || listen::current >= (int)listen::queue.size()) { listenView = ListenView::Browse; drawListenBrowse(); return; }
+  const listen::Track& t = listen::queue[listen::current];
   if (full) {
     M5.Display.fillScreen(calTheme.bg);
-    drawListenHeader("音量 " + String(listen::volume) + "%");
-    // Track name: up to two lines.
-    useUIMediumFont();
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.setTextColor(calTheme.title, calTheme.bg);
+    M5.Display.drawString("聽法", 10, 15);
+    drawListenVolume();
+    M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+    useUIFont(1);
     M5.Display.setTextDatum(top_left);
     M5.Display.setTextColor(calTheme.text, calTheme.bg);
-    String rest = t.name;
-    for (int line = 0; line < 2 && rest.length(); ++line) {
-      String part = rest;
-      if (line == 0 && M5.Display.textWidth(part) > 296) {
-        int cut = part.length();
-        while (cut > 1 && M5.Display.textWidth(part.substring(0, cut)) > 296) {
-          --cut; while (cut > 0 && ((uint8_t)part[cut] & 0xC0) == 0x80) --cut;
-        }
-        part = part.substring(0, cut);
-        rest = rest.substring(cut);
-      } else {
-        part = listenFit(part, 296);
-        rest = "";
-      }
-      M5.Display.drawString(part, 12, 40 + line * 26);
-    }
-    useUIFont(1);
-    M5.Display.setTextDatum(middle_center);
+    String lines[3];
+    int n = listenWrap(t.name, 296, 3, lines);
+    for (int i = 0; i < n; ++i) M5.Display.drawString(lines[i], 12, 38 + i * 21);
+    M5.Display.setTextDatum(middle_left);
     M5.Display.setTextColor(calTheme.muted, calTheme.bg);
-    String info = t.dir.length() ? t.dir : String("SD");
+    String where = listen::ctxKey.startsWith("P:") ? listen::ctxKey.substring(2) : listenLocTitle(listen::ctxKey.substring(2));
+    if (listen::ctxKey == "D:/") where = "SD";
+    String info = where + " · " + String(listen::current + 1) + "/" + String((int)listen::queue.size());
     if (listen::bitrate > 0) info += " · " + String(listen::bitrate / 1000) + " kbps";
-    info += " · " + String(listen::current + 1) + "/" + String((int)listen::tracks.size());
-    M5.Display.drawString(info, 160, 102);
-    for (int i = 0; i < 5; ++i) drawListenButton(i);
-    drawCalendarBottomBar("清單", "", "關閉");
+    while (info.length() > 1 && M5.Display.textWidth(info) > 296) info = info.substring(info.length() / 2 >= 1 ? 0 : 0, info.length() - 1);
+    M5.Display.drawString(info, 12, 104);
+    drawListenButtons();
+    drawCalendarBottomBar("清單", "加入清單", "關閉");
   } else {
-    drawListenButton(1);
+    int x, w; listenButtonRect(1, x, w); drawListenButton(x, w, 1);
+    listenButtonRect(3, x, w); drawListenButton(x, w, 3);
+    listenButtonRect(4, x, w); drawListenButton(x, w, 4);
   }
   drawListenProgress();
+}
+
+void drawListenPick() {
+  M5.Display.fillScreen(calTheme.bg);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.setTextColor(calTheme.title, calTheme.bg);
+  M5.Display.drawString("加入播放清單", 10, 15);
+  M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+  int total = (int)listenPickNames.size() + 1;
+  int pages = max(1, (total + LISTEN_ROWS - 1) / LISTEN_ROWS);
+  if (listenPage >= pages) listenPage = pages - 1;
+  if (listenToast.length()) {
+    M5.Display.fillRoundRect(30, 90, 260, 50, 10, calTheme.panel);
+    M5.Display.drawRoundRect(30, 90, 260, 50, 10, calTheme.accent);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(calTheme.text, calTheme.panel);
+    M5.Display.drawString(listenToast, 160, 115);
+    return;
+  }
+  drawListenRows(total, [&](int idx, int y) {
+    bool isNew = idx >= (int)listenPickNames.size();
+    M5.Display.fillRoundRect(8, y, 304, 40, 7, calTheme.panel);
+    M5.Display.drawRoundRect(8, y, 304, 40, 7, calTheme.border);
+    if (!isNew) drawListenFolderIcon(14, y + 11, calTheme.accent);
+    drawListenRowText(isNew ? String("＋ 新增播放清單並加入") : listenPickNames[idx], y, isNew ? 16 : 46, calTheme.text, calTheme.panel);
+  });
+  drawCalendarBottomBar("上一頁", "下一頁", "取消");
+}
+
+void drawListenConfirm() {
+  M5.Display.fillScreen(calTheme.bg);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.text, calTheme.bg);
+  String lines[3];
+  String msg = listenConfirmKind == 1 ? "要從播放清單移除這首嗎？" : "要移除這個播放清單嗎？";
+  M5.Display.drawString(msg, 160, 50);
+  int n = listenWrap(listenConfirmName, 280, 2, lines);
+  M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+  for (int i = 0; i < n; ++i) M5.Display.drawString(lines[i], 160, 84 + i * 22);
+  drawListenPill(40, 150, 100, "確定");
+  drawListenPill(180, 150, 100, "取消");
+}
+
+void listenRedraw() {
+  switch (listenView) {
+    case ListenView::Browse: drawListenBrowse(); break;
+    case ListenView::Now: drawListenNow(true); break;
+    case ListenView::Pick: drawListenPick(); break;
+    case ListenView::Confirm: drawListenConfirm(); break;
+  }
 }
 
 void showListen() {
   applyCalendarTheme();
   screenNow = Screen::Listen;
-  if (!listen::playing && !listen::paused) {
-    listen::scan();
-    listenSdMissing = !listen::sdMounted;
-    listen::current = -1;
-    listenNowView = false;
-    listenPage = 0;
+  listenSdMissing = !listen::begin();
+  listenToast = "";
+  if (listen::playing || listen::paused) {
+    listenView = ListenView::Now;
   } else {
-    listenNowView = true;
+    listenView = ListenView::Browse;
+    listenLoad();
   }
   listenLastDraw = millis();
-  if (listenNowView) drawListenNow(true); else drawListenList();
+  listenRedraw();
 }
 
 void listenExit() {
@@ -6848,31 +7087,128 @@ void listenExit() {
   drawClock(true); drawAstronaut();
 }
 
-void listenPlayIndex(int idx) {
-  if (!listen::start(idx)) return;
-  listenNowView = true;
+void listenGoTo(const String& loc) {
+  listenLoc = loc; listenPage = 0;
+  listenLoad();
+  drawListenBrowse();
+}
+
+void listenPlayEntry(int entryIndex) {
+  std::vector<listen::Track> tracks;
+  int start = 0;
+  for (int i = 0; i < (int)listenEntries.size(); ++i) {
+    if (listenEntries[i].isDir) continue;
+    if (i == entryIndex) start = tracks.size();
+    tracks.push_back({listenEntries[i].path, listenEntries[i].name, listenEntries[i].size});
+  }
+  // File sizes are needed for the progress bar; playlist entries do not carry them.
+  for (auto& t : tracks) if (!t.size) { File f = SD.open(t.path); if (f) { t.size = f.size(); f.close(); } }
+  if (!listen::startQueue(tracks, listenKeyForLoc(listenLoc), start)) return;
+  listenView = ListenView::Now;
   drawListenNow(true);
+}
+
+void listenOpenPick(const String& path, ListenView back) {
+  listenPickPath = path; listenPickReturn = back;
+  listen::playlistNames(listenPickNames);
+  listenView = ListenView::Pick; listenPage = 0; listenToast = "";
+  drawListenPick();
+}
+
+void listenFinishPick() {
+  listenView = listenPickReturn;
+  listenToast = "";
+  if (listenView == ListenView::Browse) { listenPage = 0; listenLoad(); }
+  listenRedraw();
+}
+
+void listenPickChoose(int index) {
+  String name;
+  if (index >= (int)listenPickNames.size()) name = listen::playlistCreate();
+  else name = listenPickNames[index];
+  if (!name.length()) { listenToast = "無法建立播放清單"; drawListenPick(); listenLastDraw = millis(); return; }
+  int r = listen::playlistAdd(name, listenPickPath);
+  listenToast = r == 1 ? "已加入「" + name + "」" : (r == 0 ? "已經在「" + name + "」裡了" : "加入失敗");
+  drawListenPick();
+  listenLastDraw = millis();   // the toast closes after about a second (listenMaintain)
 }
 
 void handleListenTap(int x, int y) {
   lastUserActivity = millis();
+  if (listenView == ListenView::Confirm) {
+    if (y >= 150 && y < 174) {
+      haptic(15);
+      if (x >= 40 && x < 140) {
+        if (listenConfirmKind == 1) listen::playlistRemoveAt(listenLoc.substring(4), listenConfirmIndex);
+        else listen::playlistDelete(listenConfirmName);
+      }
+      if (x >= 40 && x < 140) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
+      else if (x >= 180 && x < 280) { listenView = ListenView::Browse; drawListenBrowse(); }
+    }
+    return;
+  }
+  if (listenView == ListenView::Pick) {
+    if (listenToast.length()) return;
+    if (y >= 212) {
+      haptic(12);
+      int pages = max(1, ((int)listenPickNames.size() + 1 + LISTEN_ROWS - 1) / LISTEN_ROWS);
+      if (x >= 214) listenFinishPick();
+      else if (x < 107) { if (listenPage > 0) --listenPage; drawListenPick(); }
+      else { if (listenPage + 1 < pages) ++listenPage; drawListenPick(); }
+      return;
+    }
+    if (y >= 34) {
+      int idx = listenPage * LISTEN_ROWS + (y - 34) / 43;
+      if (idx <= (int)listenPickNames.size()) { haptic(15); listenPickChoose(idx); }
+    }
+    return;
+  }
+  if (listenView == ListenView::Browse) {
+    if (y < 30) {
+      if (x < 62 && listenLoc != "/") { haptic(12); listenGoTo(listenParentLoc(listenLoc)); }
+      else if (x >= 212 && listenHasMp3()) {
+        haptic(12);
+        String key = listenKeyForLoc(listenLoc);
+        listen::setMode(key, (listen::modeFor(key) + 1) % 4);
+        drawListenBrowse();
+      }
+      return;
+    }
+    if (y >= 212) {
+      haptic(12);
+      int pages = max(1, ((int)listenEntries.size() + LISTEN_ROWS - 1) / LISTEN_ROWS);
+      if (x >= 214) listenExit();
+      else if (x < 107) { if (listenPage > 0) --listenPage; drawListenBrowse(); }
+      else { if (listenPage + 1 < pages) ++listenPage; drawListenBrowse(); }
+      return;
+    }
+    if (y < 34) return;
+    int idx = listenPage * LISTEN_ROWS + (y - 34) / 43;
+    if (idx >= (int)listenEntries.size()) return;
+    const listen::Entry& e = listenEntries[idx];
+    haptic(15);
+    if (e.path == "@new") {
+      String name = listen::playlistCreate();
+      listenLoad(); drawListenBrowse();
+      (void)name;
+    } else if (e.isDir) {
+      listenGoTo(e.path.startsWith("@") ? e.path : e.path);
+    } else {
+      listenPlayEntry(idx);
+    }
+    return;
+  }
+  // Now playing
+  if (y < 30) {
+    if (x >= 190 && x < 232) { listen::setVolume(listen::volume - 10); saveSettings(); drawListenVolume(); haptic(8); }
+    else if (x >= 262) { listen::setVolume(listen::volume + 10); saveSettings(); drawListenVolume(); haptic(8); }
+    return;
+  }
   if (y >= 212) {
     haptic(12);
     if (x >= 214) { listenExit(); return; }
-    if (listenNowView) {
-      if (x < 107) { listenNowView = false; listenPage = max(0, listen::current) / LISTEN_ROWS; drawListenList(); }
-      return;
-    }
-    int pages = max(1, ((int)listen::tracks.size() + LISTEN_ROWS - 1) / LISTEN_ROWS);
-    if (x < 107) { if (listenPage > 0) --listenPage; drawListenList(); }
-    else if (x < 214) { if (listenPage + 1 < pages) ++listenPage; drawListenList(); }
-    return;
-  }
-  if (!listenNowView) {
-    if (y < 35) return;
-    int row = (y - 35) / 35;
-    int idx = listenPage * LISTEN_ROWS + row;
-    if (row < LISTEN_ROWS && idx < (int)listen::tracks.size()) { haptic(15); listenPlayIndex(idx); }
+    if (x < 107) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); return; }
+    if (listen::current >= 0 && listen::current < (int)listen::queue.size()) listenOpenPick(listen::queue[listen::current].path, ListenView::Now);
     return;
   }
   if (y >= 112 && y < 156 && x >= 12 && x <= 308) {  // tap the bar to seek
@@ -6884,35 +7220,53 @@ void handleListenTap(int x, int y) {
     return;
   }
   if (y >= 164 && y < 208) {
-    int i = constrain((x - 10) / 61, 0, 4);
+    int hit = -1;
+    for (int i = 0; i < 5; ++i) { int bx, bw; listenButtonRect(i, bx, bw); if (x >= bx - 3 && x < bx + bw + 3) hit = i; }
+    if (hit < 0) return;
     haptic(15);
-    if (i == 0) { if (listen::current > 0) listenPlayIndex(listen::current - 1); }
-    else if (i == 1) {
-      if (listen::playing) { listen::paused = !listen::paused; drawListenButton(1); }
-      else if (listen::current >= 0) listenPlayIndex(listen::current);
+    if (hit == 0) { int n = listen::indexForPrev(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
+    else if (hit == 1) {
+      if (listen::playing) { listen::paused = !listen::paused; int bx, bw; listenButtonRect(1, bx, bw); drawListenButton(bx, bw, 1); }
+      else if (listen::current >= 0) { listen::startIndex(listen::current); drawListenNow(true); }
     }
-    else if (i == 2) { if (listen::current + 1 < (int)listen::tracks.size()) listenPlayIndex(listen::current + 1); }
-    else {
-      listen::setVolume(listen::volume + (i == 3 ? -10 : 10));
-      saveSettings();
-      drawListenHeader("音量 " + String(listen::volume) + "%");
-    }
+    else if (hit == 2) { int n = listen::indexForNext(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
+    else if (hit == 3) { listen::setMode(listen::ctxKey, (listen::mode + 1) % 4); int bx, bw; listenButtonRect(3, bx, bw); drawListenButton(bx, bw, 3); }
+    else { listen::setSpeedCode((listen::speedCode + 1) % 5); int bx, bw; listenButtonRect(4, bx, bw); drawListenButton(bx, bw, 4); }
   }
+}
+
+// Long press: add a file to a playlist, or remove it / the playlist.
+void handleListenLong(int x, int y) {
+  if (listenView != ListenView::Browse || y < 34 || y >= 210) return;
+  int idx = listenPage * LISTEN_ROWS + (y - 34) / 43;
+  if (idx >= (int)listenEntries.size()) return;
+  const listen::Entry& e = listenEntries[idx];
+  if (e.path == "@new") return;
+  if (listenLoc == "@playlists" && e.isDir) {
+    listenConfirmKind = 2; listenConfirmName = e.name; listenConfirmIndex = 0;
+  } else if (listenIsPlaylistLoc() && !e.isDir) {
+    listenConfirmKind = 1; listenConfirmName = e.name; listenConfirmIndex = idx;
+  } else if (!e.isDir) {
+    listenOpenPick(e.path, ListenView::Browse);
+    return;
+  } else return;
+  listenView = ListenView::Confirm;
+  drawListenConfirm();
 }
 
 void listenMaintain(uint32_t nowMs) {
   if (listen::finished) {
     listen::finished = false;
-    if (listen::current + 1 < (int)listen::tracks.size()) {
-      listen::start(listen::current + 1);
-    } else {
-      listen::stop();
-    }
+    int nx = listen::indexAfterFinish();
+    if (nx >= 0) listen::startIndex(nx); else listen::stop();
     if (screenNow == Screen::Listen && !screenSleeping) {
-      if (listenNowView && listen::playing) drawListenNow(true); else { listenNowView = false; drawListenList(); }
+      if (listenView == ListenView::Now && listen::playing) drawListenNow(true);
+      else if (listenView == ListenView::Now) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
     }
   }
-  if (screenNow == Screen::Listen && listenNowView && !screenSleeping && nowMs - listenLastDraw >= 1000UL) {
+  if (screenNow != Screen::Listen || screenSleeping) return;
+  if (listenView == ListenView::Pick && listenToast.length() && nowMs - listenLastDraw >= 1100UL) listenFinishPick();
+  if (listenView == ListenView::Now && nowMs - listenLastDraw >= 1000UL) {
     listenLastDraw = nowMs;
     drawListenProgress();
   }
@@ -7137,7 +7491,11 @@ void handleTouch() {
     if (screenSleeping || wakeTouchConsumed) { /* fall through to wake handling */ } else return;
   }
   if (screenNow == Screen::Listen) {
-    if (!screenSleeping && !wakeTouchConsumed && t.wasReleased() && !pressHandled && abs((int)t.y - pressY) < 25 && abs((int)t.x - pressX) < 25)
+    if (longHeld && !screenSleeping && !wakeTouchConsumed) {
+      pressHandled = true;
+      haptic(20);
+      handleListenLong(pressX, pressY);
+    } else if (!screenSleeping && !wakeTouchConsumed && t.wasReleased() && !pressHandled && abs((int)t.y - pressY) < 25 && abs((int)t.x - pressX) < 25)
       handleListenTap(t.x, t.y);
     if (screenSleeping || wakeTouchConsumed) { /* fall through to wake handling */ } else return;
   }
@@ -7525,18 +7883,42 @@ void handleSerialConfig() {
       String response;
       int code = signalRequest("/api/messages?since=999999", "", response);
       Serial.printf("[test] signal bridge HTTP %d via %s, %lu ms\n", code, signalUsePublic ? "public" : "LAN", (unsigned long)(millis() - t0));
-    } else if (cmd == "t:listen") {
-      int n = listen::scan();
-      Serial.printf("[test] sd=%d tracks=%d\n", listen::sdMounted, n);
-      for (int i = 0; i < n; ++i) Serial.printf("[test]  %d: %s (%u)\n", i, listen::tracks[i].path.c_str(), (unsigned)listen::tracks[i].size);
+    } else if (cmd.startsWith("t:listen")) {
+      String dir = cmd.length() > 9 ? cmd.substring(9) : String("/");
+      Serial.printf("[test] sd=%d\n", listen::begin());
+      std::vector<listen::Entry> es; listen::listDir(dir, es);
+      for (size_t i = 0; i < es.size(); ++i) Serial.printf("[test]  %u: %s%s\n", (unsigned)i, es[i].isDir ? "[dir] " : "", es[i].path.c_str());
     } else if (cmd.startsWith("t:play ")) {
-      if (listen::tracks.empty()) listen::scan();
-      bool ok = listen::start(cmd.substring(7).toInt());
+      // t:play /folder/file.mp3 [speedcode]
+      listen::begin();
+      String arg = cmd.substring(7);
+      std::vector<listen::Track> one;
+      File f = SD.open(arg);
+      if (f) { one.push_back({arg, listenBaseName(arg), (uint32_t)f.size()}); f.close(); }
+      bool ok = !one.empty() && listen::startQueue(one, "D:" + listen::parentOf(arg), 0);
       Serial.printf("[test] play -> %d\n", ok);
+    } else if (cmd.startsWith("t:speed ")) {
+      listen::setSpeedCode(cmd.substring(8).toInt());
+      Serial.printf("[test] speed -> %s\n", listen::SPEED_LABELS[listen::speedCode]);
+    } else if (cmd == "t:markall") {
+      Serial.printf("[test] marked %d conversation(s) read\n", signalMarkAllRead(false));
+    } else if (cmd == "t:unread") {
+      // Metadata only (no message text): why does a message stay unread?
+      int shown = 0;
+      for (int i = 0; i < signalMessageCount; ++i) {
+        const SignalMessage& m = signalMessages[i];
+        if (!m.unread) continue;
+        Serial.printf("[test] unread id=%u own=%d teams=%d chatLen=%u chatPrefix=%.8s fromLen=%u groupLen=%u age=%lds\n", (unsigned)m.id, m.own,
+                      !strncmp(m.chat, "teams:", 6), (unsigned)strlen(m.chat), m.chat, (unsigned)strlen(m.from), (unsigned)strlen(m.group),
+                      (long)(time(nullptr) - m.when));
+        ++shown;
+      }
+      Serial.printf("[test] %d unread of %d messages (signalUnread=%u)\n", shown, signalMessageCount, (unsigned)signalUnread);
     } else if (cmd == "t:lstat") {
-      Serial.printf("[test] listen playing=%d paused=%d cur=%d pos=%u/%u kbps=%d err=%u heap=%u\n", listen::playing, listen::paused,
+      Serial.printf("[test] listen playing=%d paused=%d cur=%d pos=%u/%u kbps=%d err=%u underruns=%u speed=%s mode=%d busy=%u.%u%% heap=%u\n", listen::playing, listen::paused,
                     listen::current, (unsigned)listen::posBytes, (unsigned)listen::totalBytes, listen::bitrate / 1000,
-                    (unsigned)listen::decodeErrors, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                    (unsigned)listen::decodeErrors, (unsigned)listen::underruns, listen::SPEED_LABELS[listen::speedCode], listen::mode, (unsigned)(listen::busyPermille / 10), (unsigned)(listen::busyPermille % 10),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     } else if (cmd == "t:lstop") {
       listen::stop();
       Serial.println("[test] stopped");
