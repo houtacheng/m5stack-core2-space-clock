@@ -6731,6 +6731,7 @@ std::vector<String> listenPickNames;
 int listenPage = 0;
 uint32_t listenLastDraw = 0;
 bool listenSdMissing = false;
+String listenSaveMessage;               // result of the last rename on the web page
 String listenPickPath;                  // file waiting to be added to a playlist
 String listenToast;
 uint8_t listenConfirmKind = 0;          // 1 remove a track from a playlist, 2 remove a playlist
@@ -6772,6 +6773,7 @@ void listenLoad() {
     listenEntries.push_back({"＋ 新增播放清單", "@new", true, 0});
   } else if (listenIsPlaylistLoc()) {
     std::vector<String> paths; listen::playlistPaths(listenLoc.substring(4), paths);
+    listen::SdLock sdLock;
     for (auto& p : paths) if (SD.exists(p)) listenEntries.push_back({listenBaseName(p), p, false, 0});
   } else {
     listen::listDir(listenLoc, listenEntries);
@@ -6787,8 +6789,9 @@ bool listenHasMp3() {
 }
 
 // Wrap `text` (8pt font must be set) into at most maxLines lines of maxW pixels.
-int listenWrap(const String& text, int maxW, int maxLines, String* lines) {
+int listenWrap(const String& text, int maxW, int maxLines, String* lines, bool* truncated = nullptr) {
   int count = 0;
+  if (truncated) *truncated = false;
   String cur;
   int i = 0, len = text.length();
   while (i < len && count < maxLines) {
@@ -6804,6 +6807,7 @@ int listenWrap(const String& text, int maxW, int maxLines, String* lines) {
           cur = cur.substring(0, cut);
         }
         lines[count++] = cur + "…";
+        if (truncated) *truncated = true;
         return count;
       }
       lines[count++] = cur; cur = "";
@@ -6911,70 +6915,88 @@ void drawListenBrowse() {
 }
 
 void drawListenButton(int x, int w, int kind) {
-  int y = 164, h = 42;
+  // kind: 0 volume down, 1 previous, 2 play/pause, 3 next, 4 volume up
+  int y = 190, h = 44;
   M5.Display.fillRoundRect(x, y, w, h, 8, calTheme.panel);
   M5.Display.drawRoundRect(x, y, w, h, 8, calTheme.border);
   uint16_t c = calTheme.accent;
   int cx = x + w / 2, cy = y + h / 2;
-  if (kind == 0) {          // previous
+  if (kind == 0) {
+    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
+  } else if (kind == 4) {
+    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
+    M5.Display.fillRect(cx - 2, cy - 9, 4, 18, c);
+  } else if (kind == 1) {
     M5.Display.fillRect(cx - 11, cy - 9, 3, 18, c);
     M5.Display.fillTriangle(cx + 10, cy - 9, cx + 10, cy + 9, cx - 6, cy, c);
-  } else if (kind == 1) {   // play / pause
+  } else if (kind == 3) {
+    M5.Display.fillRect(cx + 8, cy - 9, 3, 18, c);
+    M5.Display.fillTriangle(cx - 10, cy - 9, cx - 10, cy + 9, cx + 6, cy, c);
+  } else {
     if (listen::playing && !listen::paused) {
       M5.Display.fillRect(cx - 8, cy - 10, 6, 20, c);
       M5.Display.fillRect(cx + 3, cy - 10, 6, 20, c);
     } else {
       M5.Display.fillTriangle(cx - 7, cy - 11, cx - 7, cy + 11, cx + 11, cy, c);
     }
-  } else if (kind == 2) {   // next
-    M5.Display.fillRect(cx + 8, cy - 9, 3, 18, c);
-    M5.Display.fillTriangle(cx - 10, cy - 9, cx - 10, cy + 9, cx + 6, cy, c);
-  } else {                  // mode (3) and speed (4): text labels
-    useUIFont(1);
-    M5.Display.setTextDatum(middle_center);
-    M5.Display.setTextColor(c, calTheme.panel);
-    String label = kind == 3 ? String(listen::MODE_LABELS[listen::mode]) : String(listen::SPEED_LABELS[listen::speedCode]);
-    M5.Display.drawString(label, cx, cy);
   }
 }
 
 void listenButtonRect(int i, int& x, int& w) {
-  static const int xs[5] = {6, 56, 114, 164, 258}, ws[5] = {44, 52, 44, 88, 56};
-  x = xs[i]; w = ws[i];
+  x = 8 + i * 62; w = 56;
 }
 
 void drawListenButtons() {
   for (int i = 0; i < 5; ++i) { int x, w; listenButtonRect(i, x, w); drawListenButton(x, w, i); }
 }
 
+// Top row: speed (left) and loop mode (right) sit where the folder page puts
+// its back button and mode pill; the small buttons in between lead out.
+void drawListenNowHeader() {
+  M5.Display.fillRect(0, 0, 320, 31, calTheme.bg);
+  drawListenPill(6, 3, 54, listen::SPEED_LABELS[listen::speedCode]);
+  drawListenPill(66, 3, 44, "清單");
+  drawListenPill(112, 3, 44, "加入");
+  drawListenPill(158, 3, 44, "關閉");
+  drawListenPill(212, 3, 100, listen::MODE_LABELS[listen::mode]);
+  M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+}
+
 void drawListenVolume() {
-  M5.Display.fillRect(150, 0, 170, 30, calTheme.bg);
+  M5.Display.fillRect(0, 164, 320, 22, calTheme.bg);
   useUIFont(1);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.setTextColor(calTheme.text, calTheme.bg);
-  drawListenPill(196, 3, 30, "－");
-  drawListenPill(268, 3, 40, "＋");
+  M5.Display.setTextDatum(middle_left);
   M5.Display.setTextColor(calTheme.muted, calTheme.bg);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(String(listen::volume) + "%", 247, 15);
+  M5.Display.drawString("音量", 12, 175);
+  M5.Display.fillRoundRect(56, 171, 200, 8, 4, calTheme.panelAlt);
+  if (listen::volume) M5.Display.fillRoundRect(56, 171, max(8, 200 * listen::volume / 100), 8, 4, calTheme.accent);
+  M5.Display.setTextDatum(middle_right);
+  M5.Display.drawString(String(listen::volume) + "%", 308, 175);
 }
 
 void drawListenProgress() {
   uint32_t span = listen::totalBytes > listen::dataStart ? listen::totalBytes - listen::dataStart : 0;
   uint32_t pos = listen::posBytes > listen::dataStart ? listen::posBytes - listen::dataStart : 0;
   float frac = span ? min(1.0f, (float)pos / (float)span) : 0.0f;
-  M5.Display.fillRect(0, 116, 320, 44, calTheme.bg);
-  M5.Display.fillRoundRect(20, 122, 280, 10, 5, calTheme.panelAlt);
-  if (frac > 0) M5.Display.fillRoundRect(20, 122, max(8, (int)(280 * frac)), 10, 5, calTheme.accent);
+  M5.Display.fillRect(0, 124, 320, 38, calTheme.bg);
+  M5.Display.fillRoundRect(20, 128, 280, 10, 5, calTheme.panelAlt);
+  if (frac > 0) M5.Display.fillRoundRect(20, 128, max(8, (int)(280 * frac)), 10, 5, calTheme.accent);
   useUIFont(1);
-  M5.Display.setTextDatum(middle_center);
   M5.Display.setTextColor(calTheme.muted, calTheme.bg);
   if (listen::bitrate > 0 && span) {
     uint32_t total = (uint32_t)((uint64_t)span * 8 / listen::bitrate);
     uint32_t elapsed = (uint32_t)((uint64_t)pos * 8 / listen::bitrate);
-    M5.Display.drawString(listenTime(elapsed) + " / " + listenTime(total), 160, 146);
+    uint32_t remain = total > elapsed ? total - elapsed : 0;
+    remain = (uint32_t)(remain / listen::SPEEDS[listen::speedCode]);   // real time at the current speed
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.drawString("已播放 " + listenTime(elapsed), 12, 150);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString("總長 " + listenTime(total), 160, 150);
+    M5.Display.setTextDatum(middle_right);
+    M5.Display.drawString("剩餘 " + listenTime(remain), 308, 150);
   } else {
-    M5.Display.drawString(String((int)(frac * 100)) + "%", 160, 146);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString(String((int)(frac * 100)) + "%", 160, 150);
   }
 }
 
@@ -6983,32 +7005,44 @@ void drawListenNow(bool full) {
   const listen::Track& t = listen::queue[listen::current];
   if (full) {
     M5.Display.fillScreen(calTheme.bg);
+    drawListenNowHeader();
+    // Folder / playlist name and position in it.
     useUIFont(1);
-    M5.Display.setTextDatum(middle_left);
-    M5.Display.setTextColor(calTheme.title, calTheme.bg);
-    M5.Display.drawString("聽法", 10, 15);
-    drawListenVolume();
-    M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
-    useUIFont(1);
-    M5.Display.setTextDatum(top_left);
-    M5.Display.setTextColor(calTheme.text, calTheme.bg);
-    String lines[3];
-    int n = listenWrap(t.name, 296, 3, lines);
-    for (int i = 0; i < n; ++i) M5.Display.drawString(lines[i], 12, 38 + i * 21);
-    M5.Display.setTextDatum(middle_left);
-    M5.Display.setTextColor(calTheme.muted, calTheme.bg);
     String where = listen::ctxKey.startsWith("P:") ? listen::ctxKey.substring(2) : listenLocTitle(listen::ctxKey.substring(2));
     if (listen::ctxKey == "D:/") where = "SD";
-    String info = where + " · " + String(listen::current + 1) + "/" + String((int)listen::queue.size());
-    if (listen::bitrate > 0) info += " · " + String(listen::bitrate / 1000) + " kbps";
-    while (info.length() > 1 && M5.Display.textWidth(info) > 296) info = info.substring(info.length() / 2 >= 1 ? 0 : 0, info.length() - 1);
-    M5.Display.drawString(info, 12, 104);
+    String count = String(listen::current + 1) + " / " + String((int)listen::queue.size());
+    M5.Display.setTextDatum(middle_right);
+    M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+    M5.Display.drawString(count, 308, 44);
+    int countW = M5.Display.textWidth(count);
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.setTextColor(calTheme.muted, calTheme.bg);
+    String clipped[1];
+    listenWrap(where, 296 - countW - 12, 1, clipped);
+    M5.Display.drawString(clipped[0], 12, 44);
+    // File name in large type: the biggest size that shows all of it.
+    static const float scales[3] = {2.0f, 1.5f, 1.0f};
+    static const int maxLines[3] = {2, 3, 4};
+    static const int pitch[3] = {33, 23, 17};
+    String lines[4];
+    int n = 0, pick = 2;
+    for (int k = 0; k < 3; ++k) {
+      M5.Display.setTextSize(scales[k]);
+      bool truncated = false;
+      n = listenWrap(t.name, 296, maxLines[k], lines, &truncated);
+      pick = k;
+      if (!truncated) break;
+    }
+    M5.Display.setTextSize(scales[pick]);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(calTheme.text, calTheme.bg);
+    for (int i = 0; i < n; ++i) M5.Display.drawString(lines[i], 12, 56 + i * pitch[pick]);
+    M5.Display.setTextSize(1);
+    drawListenVolume();
     drawListenButtons();
-    drawCalendarBottomBar("清單", "加入清單", "關閉");
   } else {
-    int x, w; listenButtonRect(1, x, w); drawListenButton(x, w, 1);
-    listenButtonRect(3, x, w); drawListenButton(x, w, 3);
-    listenButtonRect(4, x, w); drawListenButton(x, w, 4);
+    int x, w; listenButtonRect(2, x, w); drawListenButton(x, w, 2);
+    drawListenNowHeader();
   }
   drawListenProgress();
 }
@@ -7102,7 +7136,7 @@ void listenPlayEntry(int entryIndex) {
     tracks.push_back({listenEntries[i].path, listenEntries[i].name, listenEntries[i].size});
   }
   // File sizes are needed for the progress bar; playlist entries do not carry them.
-  for (auto& t : tracks) if (!t.size) { File f = SD.open(t.path); if (f) { t.size = f.size(); f.close(); } }
+  { listen::SdLock sdLock; for (auto& t : tracks) if (!t.size) { File f = SD.open(t.path); if (f) { t.size = f.size(); f.close(); } } }
   if (!listen::startQueue(tracks, listenKeyForLoc(listenLoc), start)) return;
   listenView = ListenView::Now;
   drawListenNow(true);
@@ -7200,18 +7234,27 @@ void handleListenTap(int x, int y) {
   }
   // Now playing
   if (y < 30) {
-    if (x >= 190 && x < 232) { listen::setVolume(listen::volume - 10); saveSettings(); drawListenVolume(); haptic(8); }
-    else if (x >= 262) { listen::setVolume(listen::volume + 10); saveSettings(); drawListenVolume(); haptic(8); }
+    if (x < 62) {                       // speed
+      haptic(12);
+      listen::setSpeedCode((listen::speedCode + 1) % 5);
+      drawListenNowHeader(); drawListenProgress();
+    } else if (x >= 212) {              // loop mode
+      haptic(12);
+      listen::setMode(listen::ctxKey, (listen::mode + 1) % 4);
+      drawListenNowHeader();
+    } else if (x >= 66 && x < 110) {    // back to the folder / playlist page
+      haptic(12);
+      listenView = ListenView::Browse; listenLoad(); drawListenBrowse();
+    } else if (x >= 112 && x < 156) {   // add to a playlist
+      haptic(12);
+      if (listen::current >= 0 && listen::current < (int)listen::queue.size()) listenOpenPick(listen::queue[listen::current].path, ListenView::Now);
+    } else if (x >= 158 && x < 202) {   // close
+      haptic(12);
+      listenExit();
+    }
     return;
   }
-  if (y >= 212) {
-    haptic(12);
-    if (x >= 214) { listenExit(); return; }
-    if (x < 107) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); return; }
-    if (listen::current >= 0 && listen::current < (int)listen::queue.size()) listenOpenPick(listen::queue[listen::current].path, ListenView::Now);
-    return;
-  }
-  if (y >= 112 && y < 156 && x >= 12 && x <= 308) {  // tap the bar to seek
+  if (y >= 118 && y < 160 && x >= 12 && x <= 308) {  // tap the bar to seek
     listen::seekFrac = constrain((x - 20) / 280.0f, 0.0f, 1.0f);
     listen::seekReq = true;
     listen::posBytes = listen::dataStart + (uint32_t)((listen::totalBytes - listen::dataStart) * (float)listen::seekFrac);
@@ -7219,19 +7262,24 @@ void handleListenTap(int x, int y) {
     drawListenProgress();
     return;
   }
-  if (y >= 164 && y < 208) {
+  if (y >= 162 && y < 188) {            // tap the volume bar
+    listen::setVolume(constrain((x - 56) * 100 / 200, 0, 100));
+    saveSettings(); drawListenVolume(); haptic(8);
+    return;
+  }
+  if (y >= 188) {
     int hit = -1;
     for (int i = 0; i < 5; ++i) { int bx, bw; listenButtonRect(i, bx, bw); if (x >= bx - 3 && x < bx + bw + 3) hit = i; }
     if (hit < 0) return;
     haptic(15);
-    if (hit == 0) { int n = listen::indexForPrev(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
-    else if (hit == 1) {
-      if (listen::playing) { listen::paused = !listen::paused; int bx, bw; listenButtonRect(1, bx, bw); drawListenButton(bx, bw, 1); }
+    if (hit == 0) { listen::setVolume(listen::volume - 10); saveSettings(); drawListenVolume(); }
+    else if (hit == 4) { listen::setVolume(listen::volume + 10); saveSettings(); drawListenVolume(); }
+    else if (hit == 1) { int n = listen::indexForPrev(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
+    else if (hit == 3) { int n = listen::indexForNext(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
+    else {
+      if (listen::playing) { listen::paused = !listen::paused; int bx, bw; listenButtonRect(2, bx, bw); drawListenButton(bx, bw, 2); }
       else if (listen::current >= 0) { listen::startIndex(listen::current); drawListenNow(true); }
     }
-    else if (hit == 2) { int n = listen::indexForNext(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
-    else if (hit == 3) { listen::setMode(listen::ctxKey, (listen::mode + 1) % 4); int bx, bw; listenButtonRect(3, bx, bw); drawListenButton(bx, bw, 3); }
-    else { listen::setSpeedCode((listen::speedCode + 1) % 5); int bx, bw; listenButtonRect(4, bx, bw); drawListenButton(bx, bw, 4); }
   }
 }
 
@@ -7900,6 +7948,11 @@ void handleSerialConfig() {
     } else if (cmd.startsWith("t:speed ")) {
       listen::setSpeedCode(cmd.substring(8).toInt());
       Serial.printf("[test] speed -> %s\n", listen::SPEED_LABELS[listen::speedCode]);
+    } else if (cmd.startsWith("t:rename ")) {
+      // t:rename /old/path NewName  (or @pl:OldName NewName)
+      String rest = cmd.substring(9); int sp = rest.indexOf(' ');
+      String err = sp > 0 ? listen::renameItem(rest.substring(0, sp), rest.substring(sp + 1)) : String("usage");
+      Serial.printf("[test] rename -> %s\n", err.length() ? err.c_str() : "ok");
     } else if (cmd == "t:markall") {
       Serial.printf("[test] marked %d conversation(s) read\n", signalMarkAllRead(false));
     } else if (cmd == "t:unread") {
@@ -8380,7 +8433,7 @@ void maintainMqtt(uint32_t nowMs) {
 void sendSettingsPage(const String& message = "", const String& requestedPage = "", const String& requestedLanguage = "") {
   String pageId = requestedPage.length() ? requestedPage : settingsServer.arg("page");
   String language = requestedLanguage.length() ? requestedLanguage : settingsServer.arg("lang");
-  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "signal" && pageId != "firmware") pageId = "clock";
+  if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "signal" && pageId != "listen" && pageId != "firmware") pageId = "clock";
   bool zh = language == "zh" || (!language.length());
   auto tr = [zh](const char* en, const char* zhText) -> String { return zh ? String(zhText) : String(en); };
   String page;
@@ -8392,11 +8445,11 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   char webTime[24]; snprintf(webTime, sizeof(webTime), "%04d-%02d-%02d %02d:%02d:%02d", webNow.date.year, webNow.date.month, webNow.date.date, webNow.time.hours, webNow.time.minutes, webNow.time.seconds);
   page += "<header><div><h1>" + tr("Space Clock settings", "太空時鐘設定") + "</h1><div class='muted'>" + tr("Device", "設備") + ": <b>" + htmlEscape(deviceName) + "</b> · " + tr("Network name", "網路名稱") + ": <b>" + networkHostname() + "</b><br>" + tr("IP", "設備 IP") + ": <b>" + WiFi.localIP().toString() + "</b> · " + tr("Device time", "裝置時間") + ": <b>" + webTime + "</b> (" + TIME_ZONES[timeZoneIndex].city + ")</div></div>";
   page += "<a class='lang' href='/?page=" + pageId + "&lang=" + String(zh ? "en" : "zh") + "'>" + tr("中文", "English") + "</a></header>";
-  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "hass", "companion", "calendar", "signal", "firmware"};
-  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "HASS Assist", "Companion", "Calendar", "Signal", "Firmware"};
-  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "日曆", "Signal", "韌體更新"};
+  const char* pageIds[] = {"wifi", "clock", "alarms", "meditation", "emotion", "mqtt", "hass", "companion", "calendar", "signal", "listen", "firmware"};
+  const char* tabEn[] = {"Wi-Fi", "Clock", "Alarms", "Meditation", "Emotion journal", "MQTT", "HASS Assist", "Companion", "Calendar", "Signal", "Listening", "Firmware"};
+  const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "日曆", "Signal", "聽法", "韌體更新"};
   page += "<nav class='tabs'>";
-  for (int i = 0; i < 11; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
+  for (int i = 0; i < 12; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
   page += "</nav>";
   if (message.length()) page += "<p class='ok'>" + htmlEscape(message) + "</p>";
   if (pageId == "emotion") {
@@ -8566,6 +8619,29 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<label class='field'>" + tr("Public URL", "外網網址") + "<input name='sigPub' inputmode='url' placeholder='https://174mqtt.theoakhouse.org' value='" + htmlEscape(signalPublicUrl) + "'></label>";
     page += "<label class='field'>" + tr("Access token", "存取權杖") + "<input type='password' name='sigTok' autocomplete='new-password' placeholder='" + tr(signalToken.length() ? "Saved - leave blank to keep" : "Paste the token from the bridge admin page", signalToken.length() ? "已儲存—留白即保留" : "貼上轉接後台的權杖") + "'></label>";
     page += "<p class='muted'>" + tr("Status: ", "狀態：") + htmlEscape(signalStatus.length() ? signalStatus : String(tr("not connected yet", "尚未連線"))) + " · " + tr("messages: ", "訊息數：") + String(signalMessageCount) + "</p>";
+  } else if (pageId == "listen") {
+    page += "<h2>" + tr("Listening mode", "聽法") + "</h2><p class='muted'>" + tr("Rename the folders on the SD card and your playlists. A new name is saved when you press the save button at the bottom. Playback stops while renaming. Playlists keep working after a folder is renamed.", "在這裡為 SD 卡上的資料夾和播放清單改名。按下方儲存後才會套用，改名時會先停止播放；資料夾改名後，播放清單與記住的播放設定仍然有效。") + "</p>";
+    if (!listen::begin()) {
+      page += "<p class='warn'>" + tr("No SD card found.", "找不到 SD 卡。") + "</p>";
+    } else {
+      std::vector<String> names; listen::playlistNames(names);
+      std::vector<String> folders; listen::allFolders(folders);
+      int idx = 0;
+      page += "<h2>" + tr("Playlists", "播放清單") + "</h2>";
+      if (names.empty()) page += "<p class='muted'>" + tr("No playlists yet. Long-press an MP3 on the device to add it to a playlist.", "還沒有播放清單。在時鐘上長按任一首 MP3 即可加入播放清單。") + "</p>";
+      for (auto& n : names) {
+        page += "<label class='field'>" + htmlEscape(n) + "<input type='hidden' name='old" + String(idx) + "' value='" + htmlEscape("@pl:" + n) + "'><input name='new" + String(idx) + "' maxlength='60' value='" + htmlEscape(n) + "'></label>";
+        ++idx;
+      }
+      page += "<h2>" + tr("Folders", "資料夾") + "</h2>";
+      if (folders.empty()) page += "<p class='muted'>" + tr("No folders on the SD card.", "SD 卡上沒有資料夾。") + "</p>";
+      for (auto& f : folders) {
+        String base = f.substring(f.lastIndexOf('/') + 1);
+        page += "<label class='field'>" + htmlEscape(f) + "<input type='hidden' name='old" + String(idx) + "' value='" + htmlEscape(f) + "'><input name='new" + String(idx) + "' maxlength='60' value='" + htmlEscape(base) + "'></label>";
+        ++idx;
+      }
+      page += "<input type='hidden' name='listenCount' value='" + String(idx) + "'>";
+    }
   } else if (pageId == "calendar") {
     page += "<h2>" + tr("Calendar", "日曆") + "</h2><p class='muted'>" + tr("Paste an iCal (.ics) subscription URL, e.g. Google Calendar's \"Secret address in iCal format\". On the clock, long-press the screen to open the calendar; swipe left for month, right for week; long-press again to return.", "貼上 iCal（.ics）訂閱網址，例如 Google 日曆的「iCal 格式的私人網址」。在時鐘畫面長按進入日曆；往左滑為月模式、往右滑為週模式；再長按回到時鐘。") + "</p>";
     page += "<label class='field'>" + tr("iCal URL", "iCal 網址") + "<input name='icalUrl' inputmode='url' placeholder='https://calendar.google.com/calendar/ical/.../basic.ics' value='" + htmlEscape(calendarIcalUrl) + "'></label>";
@@ -8754,7 +8830,7 @@ void setupSettingsServer() {
   settingsServer.on("/save", HTTP_POST, []() {
     String pageId = settingsServer.arg("page");
     String language = settingsServer.arg("lang");
-    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "signal" && pageId != "firmware") pageId = "clock";
+    if (pageId != "wifi" && pageId != "clock" && pageId != "alarms" && pageId != "meditation" && pageId != "emotion" && pageId != "mqtt" && pageId != "hass" && pageId != "companion" && pageId != "calendar" && pageId != "signal" && pageId != "listen" && pageId != "firmware") pageId = "clock";
     bool wifiChanged = false;
     bool deviceNameChanged = false;
     bool emotionBaseRejected = false;
@@ -8911,6 +8987,20 @@ void setupSettingsServer() {
       String nextToken = settingsServer.arg("sigTok"); nextToken.trim();
       if (nextToken.length()) signalToken = nextToken;
       signalUsePublic = false; signalNextPollAt = 0;
+    } else if (pageId == "listen") {
+      int count = constrain(settingsServer.arg("listenCount").toInt(), 0, 200);
+      String errors;
+      for (int i = 0; i < count; ++i) {
+        String oldPath = settingsServer.arg("old" + String(i)), newName = settingsServer.arg("new" + String(i));
+        newName.trim();
+        String base = oldPath.startsWith("@pl:") ? oldPath.substring(4) : oldPath.substring(oldPath.lastIndexOf('/') + 1);
+        if (!oldPath.length() || newName == base) continue;
+        listen::stop();
+        String err = listen::renameItem(oldPath, newName);
+        if (err.length()) errors += base + "：" + err + "　";
+      }
+      listenLoc = "/"; listenEntries.clear();
+      if (errors.length()) listenSaveMessage = errors;
     } else if (pageId == "calendar") {
       String nextUrl = settingsServer.arg("icalUrl"); nextUrl.trim();
       if (nextUrl != calendarIcalUrl) { calendarIcalUrl = nextUrl; calFetchedAt = 0; calEventCount = 0; }
@@ -8942,6 +9032,7 @@ void setupSettingsServer() {
     if (emotionBaseRejected) savedMessage = language == "zh" ? "API 網址無效；必須以 https:// 開頭，原網址已保留。其餘設定已儲存。" : "Invalid API URL; HTTPS is required. The previous URL was kept, and other settings were saved.";
     if (hassBaseRejected) savedMessage = language == "zh" ? "Home Assistant 網址無效；必須以 http:// 或 https:// 開頭，原網址已保留。其餘設定已儲存。" : "Invalid Home Assistant URL; it must begin with http:// or https://. The previous URL was kept, and other settings were saved.";
     if (deviceNameChanged) savedMessage = language == "zh" ? "設備名稱已儲存，設備即將重新連線以套用新的網路名稱。" : "Device name saved. The device is restarting Wi-Fi to apply its new network name.";
+    if (pageId == "listen" && listenSaveMessage.length()) { savedMessage = listenSaveMessage; listenSaveMessage = ""; }
     sendSettingsPage(savedMessage, pageId, language);
     if (deviceNameChanged) {
       delay(800);

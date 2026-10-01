@@ -47,7 +47,19 @@ std::map<String, uint8_t> modes;    // folder/playlist key -> mode
 static const char* SETTINGS_FILE = "/.listen.txt";
 static const char* PLAYLIST_DIR = "/.playlists";
 
+// The SD card sits on one SPI bus: the decode task, the touch UI and the web
+// page must never talk to it at the same time.
+static SemaphoreHandle_t sdMutex() {
+  static SemaphoreHandle_t m = xSemaphoreCreateRecursiveMutex();
+  return m;
+}
+struct SdLock {
+  SdLock() { xSemaphoreTakeRecursive(sdMutex(), portMAX_DELAY); }
+  ~SdLock() { xSemaphoreGiveRecursive(sdMutex()); }
+};
+
 bool mountSd() {
+  SdLock lock;
   if (sdMounted) return true;
   SPI.begin(18, 38, 23, -1);
   sdMounted = SD.begin(4, SPI, 25000000);
@@ -55,6 +67,7 @@ bool mountSd() {
 }
 
 static void loadSettings() {
+  SdLock lock;
   speeds.clear(); modes.clear();
   File f = SD.open(SETTINGS_FILE);
   if (!f) return;
@@ -71,6 +84,7 @@ static void loadSettings() {
 }
 
 static void saveSettings() {
+  SdLock lock;
   if (!sdMounted) return;
   SD.remove(SETTINGS_FILE);
   File f = SD.open(SETTINGS_FILE, FILE_WRITE);
@@ -99,6 +113,7 @@ static bool isMp3(const String& name) {
 // Sub-folders first, then MP3 files, both sorted by name. Hidden entries
 // (macOS "._" files, our own ".playlists") are skipped.
 void listDir(const String& dir, std::vector<Entry>& out) {
+  SdLock lock;
   out.clear();
   File d = SD.open(dir);
   if (!d) return;
@@ -129,6 +144,7 @@ String parentOf(const String& dir) {
 static String playlistFile(const String& name) { return String(PLAYLIST_DIR) + "/" + name + ".txt"; }
 
 void playlistNames(std::vector<String>& out) {
+  SdLock lock;
   out.clear();
   File d = SD.open(PLAYLIST_DIR);
   if (!d) return;
@@ -142,6 +158,7 @@ void playlistNames(std::vector<String>& out) {
 }
 
 void playlistPaths(const String& name, std::vector<String>& out) {
+  SdLock lock;
   out.clear();
   File f = SD.open(playlistFile(name));
   if (!f) return;
@@ -153,6 +170,7 @@ void playlistPaths(const String& name, std::vector<String>& out) {
 }
 
 static void playlistWrite(const String& name, const std::vector<String>& paths) {
+  SdLock lock;
   SD.remove(playlistFile(name));
   File f = SD.open(playlistFile(name), FILE_WRITE);
   if (!f) return;
@@ -162,6 +180,7 @@ static void playlistWrite(const String& name, const std::vector<String>& paths) 
 
 // Creates "播放清單 N" with the lowest unused number.
 String playlistCreate() {
+  SdLock lock;
   SD.mkdir(PLAYLIST_DIR);
   std::vector<String> names; playlistNames(names);
   for (int n = 1; n < 100; ++n) {
@@ -191,10 +210,79 @@ void playlistRemoveAt(const String& name, int index) {
 }
 
 void playlistDelete(const String& name) {
+  SdLock lock;
   SD.remove(playlistFile(name));
   modes.erase("P:" + name);
   saveSettings();
 }
+
+// ---- renaming (web page) -----------------------------------------------------
+static bool validName(const String& n) {
+  if (!n.length() || n.length() > 80 || n.startsWith(".")) return false;
+  for (size_t i = 0; i < n.length(); ++i) {
+    char c = n[i];
+    if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') return false;
+  }
+  return true;
+}
+
+// Moves settings keys and playlist entries that pointed below oldPath.
+static void retarget(const String& oldPath, const String& newPath) {
+  std::map<String, uint8_t> sp, mo;
+  for (auto& kv : speeds) sp[kv.first == oldPath || kv.first.startsWith(oldPath + "/") ? newPath + kv.first.substring(oldPath.length()) : kv.first] = kv.second;
+  for (auto& kv : modes) {
+    String k = kv.first;
+    if (k.startsWith("D:" + oldPath) && (k.length() == oldPath.length() + 2 || k[oldPath.length() + 2] == '/'))
+      k = "D:" + newPath + k.substring(oldPath.length() + 2);
+    mo[k] = kv.second;
+  }
+  speeds = sp; modes = mo;
+  std::vector<String> names; playlistNames(names);
+  for (auto& n : names) {
+    std::vector<String> paths; playlistPaths(n, paths);
+    bool changed = false;
+    for (auto& p : paths) if (p == oldPath || p.startsWith(oldPath + "/")) { p = newPath + p.substring(oldPath.length()); changed = true; }
+    if (changed) playlistWrite(n, paths);
+  }
+  saveSettings();
+}
+
+// Renames a folder (path "/a/b") or a playlist (path "@pl:NAME"). Returns "" or an error text.
+String renameItem(const String& path, const String& newName) {
+  SdLock lock;
+  if (!validName(newName)) return "名稱不可用";
+  if (path.startsWith("@pl:")) {
+    String old = path.substring(4);
+    if (old == newName) return "";
+    if (SD.exists(playlistFile(newName))) return "已有同名的播放清單";
+    if (!SD.rename(playlistFile(old), playlistFile(newName))) return "重新命名失敗";
+    auto it = modes.find("P:" + old);
+    if (it != modes.end()) { modes["P:" + newName] = it->second; modes.erase(it); saveSettings(); }
+    return "";
+  }
+  String parent = parentOf(path);
+  String target = parent == "/" ? "/" + newName : parent + "/" + newName;
+  if (target == path) return "";
+  if (SD.exists(target)) return "已有同名的資料夾";
+  if (!SD.rename(path, target)) return "重新命名失敗";
+  retarget(path, target);
+  return "";
+}
+
+// All folders (up to three levels) for the web page.
+static void walkFolders(const String& dir, int depth, std::vector<String>& out) {
+  File d = SD.open(dir);
+  if (!d) return;
+  for (File e = d.openNextFile(); e && out.size() < 80; e = d.openNextFile()) {
+    String name = e.name();
+    if (!e.isDirectory() || name.startsWith(".")) continue;
+    String full = dir == "/" ? "/" + name : dir + "/" + name;
+    out.push_back(full);
+    if (depth > 0) walkFolders(full, depth - 1, out);
+  }
+  d.close();
+}
+void allFolders(std::vector<String>& out) { SdLock lock; out.clear(); walkFolders("/", 2, out); std::sort(out.begin(), out.end()); }
 
 // ---- queue / modes ----------------------------------------------------------
 static void shuffleOrder(int keepFirst) {
@@ -265,7 +353,8 @@ static size_t id3Size(File& f) {
 
 static void decodeTask(void* arg) {
   Track t = queue[(int)(intptr_t)arg];
-  File f = SD.open(t.path);
+  File f;
+  { SdLock lock; f = SD.open(t.path); }
   HMP3Decoder dec = f ? MP3InitDecoder() : nullptr;
   const size_t INBUF = 6 * 1024, SLOT = 2816;   // 64 ms per slot at 44.1 kHz: cushion against SD / Wi-Fi hiccups
   uint8_t* in = (uint8_t*)heap_caps_malloc(INBUF, MALLOC_CAP_SPIRAM);
@@ -281,8 +370,8 @@ static void decodeTask(void* arg) {
   int64_t startUs = esp_timer_get_time(), busyUs = 0, waitUs = 0;
   uint8_t usedSpeed = 2;
   if (ok) {
-    size_t skip = id3Size(f);
-    f.seek(skip);
+    size_t skip;
+    { SdLock lock; skip = id3Size(f); f.seek(skip); }
     dataStart = skip; totalBytes = f.size(); posBytes = skip;
     Serial.printf("[listen] playing %s (%u bytes, speed %s)\n", t.path.c_str(), (unsigned)totalBytes, SPEED_LABELS[speedCode]);
   }
@@ -322,7 +411,7 @@ static void decodeTask(void* arg) {
     flushed = false;
     if (seekReq) {
       float frac = constrain((float)seekFrac, 0.0f, 0.995f);
-      f.seek(dataStart + (size_t)((totalBytes - dataStart) * frac));
+      { SdLock lock; f.seek(dataStart + (size_t)((totalBytes - dataStart) * frac)); }
       have = 0; eof = false; acc = 0; wsFinished = false;
       if (wsActive) ws->reset();
       seekReq = false;
@@ -344,7 +433,8 @@ static void decodeTask(void* arg) {
     }
 
     if (have < 2048 && !eof) {
-      size_t n = f.read(in + have, INBUF - have);
+      size_t n;
+      { SdLock lock; n = f.read(in + have, INBUF - have); }
       if (n == 0) eof = true; else have += n;
     }
     posBytes = f.position() - have;
@@ -402,7 +492,7 @@ static void decodeTask(void* arg) {
   if (mono) free(mono);
   if (out) free(out);
   if (dec) MP3FreeDecoder(dec);
-  if (f) f.close();
+  if (f) { SdLock lock; f.close(); }
   Serial.printf("[listen] track ended (%s), decode errors %u\n", natural ? "finished" : "stopped", (unsigned)decodeErrors);
   playing = false;
   if (natural) finished = true;
