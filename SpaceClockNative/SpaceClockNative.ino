@@ -204,7 +204,15 @@ uint8_t alarmSound = 0;
 bool use24HourTime = true;
 bool flatVirtualButtonsEnabled = false;
 uint16_t screenOffSeconds = 300;
-bool wakeByTouch = true;  // false: only the power button wakes a sleeping screen
+// Screen off has two independent behaviours: turned off by the power button
+// ("manual") or by the standby timer ("auto"). For each: whether the Bottom2
+// LEDs light up, and whether touch/movement wakes the screen (the power button
+// always does).
+bool manualOffLed = false, manualOffWakeAuto = true;
+bool autoOffLed = false, autoOffWakeAuto = true;
+bool screenSleepManual = false;   // why the screen is off right now
+uint16_t listenSkipBack = 15, listenSkipFwd = 15;   // seconds for rewind / fast-forward in the player (long-press the button to change)
+float listenDragFrac = -1.0f;                       // playhead while the progress bar is being dragged (-1: not dragging)
 bool meditationSoundEnabled = true;
 uint16_t meditationPresetMinutes[2] = {5, 15};
 uint8_t meditationStartSound = 1;
@@ -675,8 +683,10 @@ void saveSettings() {
   prefs.putBool("time24", use24HourTime);
   prefs.putBool("flatBtns", flatVirtualButtonsEnabled);
   prefs.putUShort("screenOff", screenOffSeconds);
-  prefs.putBool("wakeTouch", wakeByTouch);
+  prefs.putBool("manLed", manualOffLed); prefs.putBool("manWake", manualOffWakeAuto);
+  prefs.putBool("autoLed", autoOffLed); prefs.putBool("autoWake", autoOffWakeAuto);
   prefs.putUChar("listenVol", listen::volume);
+  prefs.putUShort("skipBack", listenSkipBack); prefs.putUShort("skipFwd", listenSkipFwd);
   prefs.putBool("fwAuto", automaticFirmwareUpdate);
   prefs.putUChar("fwHour", firmwareCheckHour);
   prefs.putBool("medSound", meditationSoundEnabled);
@@ -775,8 +785,13 @@ void loadSettings() {
   use24HourTime = prefs.getBool("time24", true);
   flatVirtualButtonsEnabled = prefs.getBool("flatBtns", false);
   screenOffSeconds = prefs.getUShort("screenOff", 300);
-  wakeByTouch = prefs.getBool("wakeTouch", true);
+  // Settings from before the split: one wake option and the night-light switch applied to both.
+  bool oldWake = prefs.getBool("wakeTouch", true);
+  manualOffWakeAuto = prefs.getBool("manWake", oldWake);
+  autoOffWakeAuto = prefs.getBool("autoWake", oldWake);
   listen::volume = constrain((int)prefs.getUChar("listenVol", 60), 0, 100);
+  listenSkipBack = constrain((int)prefs.getUShort("skipBack", 15), 5, 600);
+  listenSkipFwd = constrain((int)prefs.getUShort("skipFwd", 15), 5, 600);
   automaticFirmwareUpdate = prefs.getBool("fwAuto", false);
   firmwareCheckHour = constrain((int)prefs.getUChar("fwHour", 3), 0, 23);
   meditationSoundEnabled = prefs.getBool("medSound", true);
@@ -795,6 +810,8 @@ void loadSettings() {
   alarmLightBrightness = constrain((int)prefs.getUChar("alarmLBri", 35), 1, 100);
   alarmLightMode = constrain((int)prefs.getUChar("alarmLMode", 0), 0, 3);
   nightLightEnabled = prefs.getBool("nightLight", false);
+  manualOffLed = prefs.getBool("manLed", nightLightEnabled);
+  autoOffLed = prefs.getBool("autoLed", nightLightEnabled);
   nightLightColor = prefs.getUInt("nightColor", 0xFFF0C8) & 0xFFFFFF;
   nightLightBrightness = constrain((int)prefs.getUChar("nightBri", 18), 1, 100);
   nightLightMode = constrain((int)prefs.getUChar("nightMode", 0), 0, 2);
@@ -1170,8 +1187,9 @@ void wakeDisplay() {
   applyDisplayBrightness(wakeTime);
 }
 
-void sleepDisplay(uint32_t nowMs) {
+void sleepDisplay(uint32_t nowMs, bool manual) {
   screenSleeping = true;
+  screenSleepManual = manual;
   screenSleepStarted = nowMs;
   motionBaselineReady = false;
   M5.Display.setBrightness(0);
@@ -1204,7 +1222,7 @@ void updatePowerSaveMode(uint32_t nowMs) {
 }
 
 void checkMotionWake(uint32_t nowMs) {
-  if (!wakeByTouch || !screenSleeping || !M5.Imu.isEnabled() || nowMs - lastMotionSample < (powerSaveMode ? 1000UL : 100UL)) return;
+  if (!(screenSleepManual ? manualOffWakeAuto : autoOffWakeAuto) || !screenSleeping || !M5.Imu.isEnabled() || nowMs - lastMotionSample < (powerSaveMode ? 1000UL : 100UL)) return;
   lastMotionSample = nowMs;
   M5.Imu.update();
   float ax, ay, az, gx, gy, gz;
@@ -3514,10 +3532,13 @@ void showSettings() {
     drawSettingsRow(2, "Time format", use24HourTime ? "24 hour" : "12 hour");
     drawSettingsRow(3, "Flat buttons", flatVirtualButtonsEnabled ? "ON" : "OFF");
   } else if (clockSettingsPage == 3) {
-    drawSettingsRow(0, "Wake screen", wakeByTouch ? "Touch" : "Button");
+    drawSettingsRow(0, "Manual off LED", manualOffLed ? "ON" : "OFF");
+    drawSettingsRow(1, "Manual off wake", manualOffWakeAuto ? "Touch" : "Button");
+    drawSettingsRow(2, "Auto off LED", autoOffLed ? "ON" : "OFF");
+    drawSettingsRow(3, "Auto off wake", autoOffWakeAuto ? "Touch" : "Button");
   } else {
     const char* modes[] = {"Stay on", "Timed off", "Timed fade"};
-    drawSettingsRow(0, "Night light", nightLightEnabled ? "ON" : "OFF");
+    drawSettingsRow(0, "On time", nightLightSeconds >= 60 ? String(nightLightSeconds / 60) + " min" : String(nightLightSeconds) + " sec");
     drawSettingsRow(1, "Color", "", (int32_t)nightLightColor);
     drawSettingsRow(2, "LED brightness", String(nightLightBrightness) + "%");
     drawSettingsRow(3, "Mode", modes[nightLightMode]);
@@ -3987,7 +4008,7 @@ void updateAlarmBaseLights(uint32_t nowMs) {
     } else if (meditationState == MeditationState::Done && age < 3000UL) {
       color = 0xFFF1D2; strength = ((age / 300UL) & 1) ? 0 : 50;
     }
-  } else if (screenSleeping && nightLightEnabled) {
+  } else if (screenSleeping && (screenSleepManual ? manualOffLed : autoOffLed)) {
     uint32_t age = nowMs - screenSleepStarted;
     color = nightLightColor;
     if (nightLightMode == 0) strength = nightLightBrightness;
@@ -7003,33 +7024,48 @@ void drawListenBrowse() {
   drawCalendarBottomBar("上一頁", "下一頁", "關閉");
 }
 
-void drawListenButton(int x, int w, int kind) {
-  // kind: 0 volume down, 1 previous, 2 next, 3 volume up
+String listenSkipLabel(int seconds) { return seconds >= 60 && seconds % 60 == 0 ? String(seconds / 60) + "m" : String(seconds) + "s"; }
+
+void listenButtonRect(int i, int& x, int& w) {
+  x = 8 + i * 61; w = 56;
+}
+
+// kind: 0 previous track, 1 rewind, 2 play / pause, 3 fast-forward, 4 next track
+void drawListenButton(int kind) {
+  int x, w; listenButtonRect(kind, x, w);
   int y = 164, h = 42;
   M5.Display.fillRoundRect(x, y, w, h, 8, calTheme.panel);
   M5.Display.drawRoundRect(x, y, w, h, 8, calTheme.border);
   uint16_t c = calTheme.accent;
   int cx = x + w / 2, cy = y + h / 2;
   if (kind == 0) {
-    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
-  } else if (kind == 3) {
-    M5.Display.fillRect(cx - 9, cy - 2, 18, 4, c);
-    M5.Display.fillRect(cx - 2, cy - 9, 4, 18, c);
-  } else if (kind == 1) {
     M5.Display.fillRect(cx - 11, cy - 9, 3, 18, c);
     M5.Display.fillTriangle(cx + 10, cy - 9, cx + 10, cy + 9, cx - 6, cy, c);
-  } else {
+  } else if (kind == 4) {
     M5.Display.fillRect(cx + 8, cy - 9, 3, 18, c);
     M5.Display.fillTriangle(cx - 10, cy - 9, cx - 10, cy + 9, cx + 6, cy, c);
+  } else if (kind == 1 || kind == 3) {
+    int dir = kind == 1 ? -1 : 1, base = cy - 7;
+    for (int k = 0; k < 2; ++k) {                       // two arrows
+      int tip = cx + dir * (k * 9 - 4) + dir * 5;
+      M5.Display.fillTriangle(tip, base, tip - dir * 8, base - 6, tip - dir * 8, base + 6, c);
+    }
+    useUIFont(1);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(c, calTheme.panel);
+    M5.Display.drawString(listenSkipLabel(kind == 1 ? listenSkipBack : listenSkipFwd), cx, cy + 12);
+  } else {
+    if (listen::playing && !listen::paused) {
+      M5.Display.fillRect(cx - 8, cy - 10, 6, 20, c);
+      M5.Display.fillRect(cx + 3, cy - 10, 6, 20, c);
+    } else {
+      M5.Display.fillTriangle(cx - 7, cy - 11, cx - 7, cy + 11, cx + 11, cy, c);
+    }
   }
 }
 
-void listenButtonRect(int i, int& x, int& w) {
-  x = 8 + i * 78; w = 70;
-}
-
 void drawListenButtons() {
-  for (int i = 0; i < 4; ++i) { int x, w; listenButtonRect(i, x, w); drawListenButton(x, w, i); }
+  for (int i = 0; i < 5; ++i) drawListenButton(i);
 }
 
 // Top row: speed (left) and loop mode (right) sit where the folder page puts
@@ -7044,7 +7080,7 @@ void drawListenNowHeader() {
 }
 
 void drawListenNowBottomBar() {
-  drawCalendarBottomBar("上一頁", (listen::playing && !listen::paused) ? "暫停" : "播放", "關閉");
+  drawCalendarBottomBar("主選單", "停止播放", "關閉播放");
 }
 
 // Progress bar, the three times and the volume are drawn into an off-screen
@@ -7056,6 +7092,7 @@ static constexpr int LISTEN_DYN_Y = 108, LISTEN_DYN_H = 54;
 void drawListenDynamic(bool force) {
   uint32_t span = listen::totalBytes > listen::dataStart ? listen::totalBytes - listen::dataStart : 0;
   uint32_t pos = listen::posBytes > listen::dataStart ? listen::posBytes - listen::dataStart : 0;
+  if (listenDragFrac >= 0 && span) pos = (uint32_t)(listenDragFrac * span);   // the finger is moving the playhead
   float frac = span ? min(1.0f, (float)pos / (float)span) : 0.0f;
   uint32_t total = 0, elapsed = 0, remain = 0;
   if (listen::durationSec > 0 && span) {          // header says how long it is (variable bit rate)
@@ -7071,7 +7108,7 @@ void drawListenDynamic(bool force) {
   }
   int barPx = frac > 0 ? max(8, (int)(280 * frac)) : 0;
   static uint32_t lastKey = 0xFFFFFFFF;
-  uint32_t key = elapsed * 31 + remain * 7 + barPx * 131 + listen::volume * 977 + listen::speedCode + (listen::pausedByLink ? 99991 : 0);
+  uint32_t key = elapsed * 31 + remain * 7 + barPx * 131 + listen::volume * 977 + listen::speedCode + (listen::pausedByLink ? 99991 : 0) + (uint32_t)(listenDragFrac * 1000.0f);
   if (!force && key == lastKey) return;
   lastKey = key;
   if (!listenCanvasReady) {
@@ -7369,6 +7406,19 @@ void listenPickChoose(int index) {
   listenLastDraw = millis();   // the toast closes after about a second (listenMaintain)
 }
 
+// Jump `seconds` forward (+) or back (-) inside the current track.
+void listenSkip(int seconds) {
+  uint32_t span = listen::totalBytes > listen::dataStart ? listen::totalBytes - listen::dataStart : 0;
+  if (!span || !(listen::playing || listen::paused)) return;
+  float perSecond = listen::durationSec > 0 ? 1.0f / listen::durationSec : (listen::bitrate > 0 ? (listen::bitrate / 8.0f) / span : 0.0f);
+  if (perSecond <= 0) return;
+  float cur = (float)(listen::posBytes > listen::dataStart ? listen::posBytes - listen::dataStart : 0) / span;
+  float next = constrain(cur + seconds * perSecond, 0.0f, 0.995f);
+  listen::seekFrac = next; listen::seekReq = true;
+  listen::posBytes = listen::dataStart + (uint32_t)(next * span);
+  drawListenDynamic(true);
+}
+
 void handleListenTap(int x, int y) {
   lastUserActivity = millis();
   if (y < 30 && x >= 288 && listenView != ListenView::Bluetooth && listenView != ListenView::Confirm) {   // Bluetooth icon
@@ -7459,36 +7509,25 @@ void handleListenTap(int x, int y) {
   }
   if (y >= 212) {                       // the three virtual buttons
     haptic(12);
-    if (x < 107) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
-    else if (x < 214) {
-      if (listen::playing) { listen::paused = !listen::paused; listen::pausedByLink = false; }
-      else if (listen::current >= 0) { listen::startIndex(listen::current); drawListenNow(true); }
-      drawListenNowBottomBar();
-    } else listenExit();
+    if (x < 107) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }        // main menu
+    else if (x < 214) { listen::stop(); drawListenNow(true); }                                  // stop playing
+    else listenExit();                                                                          // close the player
     return;
   }
-  if (y >= 108 && y < 162 && x >= 12 && x <= 308) {
-    if (y < 130) {                      // tap the bar to seek
-      listen::seekFrac = constrain((x - 20) / 280.0f, 0.0f, 1.0f);
-      listen::seekReq = true;
-      listen::posBytes = listen::dataStart + (uint32_t)((listen::totalBytes - listen::dataStart) * (float)listen::seekFrac);
-      haptic(10);
-      drawListenDynamic(true);
-    } else if (y >= 144 && x >= 50 && x <= 262) {   // tap the volume bar
-      listen::setVolume(constrain((x - 56) * 100 / 200, 0, 100));
-      saveSettings(); drawListenDynamic(true); haptic(8);
-    }
-    return;
-  }
+  if (y >= 108 && y < 164) return;      // progress bar and volume: handled as drags in handleTouch
   if (y >= 164 && y < 208) {
     int hit = -1;
-    for (int i = 0; i < 4; ++i) { int bx, bw; listenButtonRect(i, bx, bw); if (x >= bx - 3 && x < bx + bw + 3) hit = i; }
+    for (int i = 0; i < 5; ++i) { int bx, bw; listenButtonRect(i, bx, bw); if (x >= bx - 2 && x < bx + bw + 3) hit = i; }
     if (hit < 0) return;
     haptic(15);
-    if (hit == 0) { listen::setVolume(listen::volume - 10); saveSettings(); drawListenDynamic(true); }
-    else if (hit == 3) { listen::setVolume(listen::volume + 10); saveSettings(); drawListenDynamic(true); }
-    else if (hit == 1) { int n = listen::indexForPrev(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
-    else { int n = listen::indexForNext(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
+    if (hit == 0) { int n = listen::indexForPrev(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
+    else if (hit == 4) { int n = listen::indexForNext(); if (n >= 0) { listen::startIndex(n); drawListenNow(true); } }
+    else if (hit == 2) {
+      if (listen::playing) { listen::paused = !listen::paused; listen::pausedByLink = false; drawListenButton(2); }
+      else if (listen::current >= 0) { listen::startIndex(listen::current); drawListenNow(true); }
+    } else {
+      listenSkip(hit == 1 ? -(int)listenSkipBack : (int)listenSkipFwd);
+    }
   }
 }
 
@@ -7499,6 +7538,18 @@ void handleListenLong(int x, int y) {
       listenView = ListenView::Now;
       drawListenNow(true);
     }
+    return;
+  }
+  if (listenView == ListenView::Now && y >= 164 && y < 208) {      // long-press rewind / fast-forward: choose the seconds
+    int hit = -1;
+    for (int i = 1; i <= 3; i += 2) { int bx, bw; listenButtonRect(i, bx, bw); if (x >= bx - 2 && x < bx + bw + 3) hit = i; }
+    if (hit < 0) return;
+    static const uint16_t choices[] = {5, 10, 15, 30, 60, 120, 300};
+    uint16_t& value = hit == 1 ? listenSkipBack : listenSkipFwd;
+    int next = 0; for (int i = 0; i < 7; ++i) if (value == choices[i]) next = (i + 1) % 7;
+    value = choices[next];
+    saveSettings();
+    drawListenButton(hit);
     return;
   }
   if (listenView != ListenView::Browse || y < 34 || y >= 210) return;
@@ -7533,7 +7584,7 @@ void listenMaintain(uint32_t nowMs) {
     lbt::maintainMedia(listen::playing && !listen::paused, nowMs);
     if (lbt::remoteSuspend) {                                 // the headphone stopped the stream (taken off)
       lbt::remoteSuspend = false;
-      if (listen::playing && !listen::paused) { listen::paused = true; listen::pausedByLink = false; if (screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) drawListenNowBottomBar(); }
+      if (listen::playing && !listen::paused) { listen::paused = true; listen::pausedByLink = false; if (screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) drawListenButton(2); }
     }
   }
   if (listenModeActive) {                                   // headphone buttons / in-ear sensor
@@ -7552,9 +7603,12 @@ void listenMaintain(uint32_t nowMs) {
   static bool lastWaiting = false;
   if (listen::pausedByLink != lastWaiting) {
     lastWaiting = listen::pausedByLink;
-    if (screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) { drawListenNowBottomBar(); drawListenDynamic(true); }
+    if (screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) { drawListenButton(2); drawListenDynamic(true); }
   }
   if (screenNow == Screen::Listen && !screenSleeping && listenView != ListenView::Bluetooth && lbt::connected() != listenBtIconShown) drawListenBtIcon();
+  static bool lastSleeping = false;
+  if (lastSleeping && !screenSleeping && screenNow == Screen::Listen) listenRedraw();   // tracks may have changed while the screen was off
+  lastSleeping = screenSleeping;
   if (listenBtPendingSave && lbt::connected()) {          // the headphones accepted: remember them
     lbt::saveDevice(listenBtPending);
     listenBtPendingSave = false;
@@ -7790,6 +7844,35 @@ void handleTouch() {
       handleWifiSwitchTap(t.x, t.y);
     if (screenSleeping || wakeTouchConsumed) { /* fall through to wake handling */ } else return;
   }
+  if (screenNow == Screen::Listen && listenView == ListenView::Now && !screenSleeping && !wakeTouchConsumed) {
+    // Slide on the progress bar to move the playhead, on the volume bar to change the volume.
+    static int dragKind = 0;
+    static uint32_t lastDragDraw = 0;
+    if (t.wasPressed()) dragKind = (t.y >= 108 && t.y < 134) ? 1 : ((t.y >= 144 && t.y < 164) ? 2 : 0);
+    if (dragKind && (t.isPressed() || t.wasReleased())) {
+      lastUserActivity = millis();
+      pressHandled = true;                           // not a tap, not a long press
+      if (dragKind == 1) listenDragFrac = constrain((t.x - 20) / 280.0f, 0.0f, 1.0f);
+      else listen::setVolume(constrain(((int)t.x - 56) * 100 / 200, 0, 100));
+      if (t.wasReleased()) {
+        if (dragKind == 1) {
+          uint32_t span = listen::totalBytes > listen::dataStart ? listen::totalBytes - listen::dataStart : 0;
+          if (span && (listen::playing || listen::paused)) {
+            listen::seekFrac = min(0.995f, listenDragFrac); listen::seekReq = true;
+            listen::posBytes = listen::dataStart + (uint32_t)(listen::seekFrac * span);
+          }
+          listenDragFrac = -1.0f;
+        } else saveSettings();
+        dragKind = 0;
+        haptic(8);
+        drawListenDynamic(true);
+      } else if (millis() - lastDragDraw >= 60UL) {
+        lastDragDraw = millis();
+        drawListenDynamic(true);
+      }
+      return;
+    }
+  }
   if (screenNow == Screen::Listen) {
     if (longHeld && !screenSleeping && !wakeTouchConsumed) {
       pressHandled = true;
@@ -7867,7 +7950,7 @@ void handleTouch() {
     return;
   }
   if (screenSleeping) {
-    if (wakeByTouch && (t.wasPressed() || t.isPressed())) {
+    if ((screenSleepManual ? manualOffWakeAuto : autoOffWakeAuto) && (t.wasPressed() || t.isPressed())) {
       wakeDisplay();
       wakeTouchConsumed = true;
     }
@@ -8125,10 +8208,16 @@ void handleTouch() {
       else if (row == 2) use24HourTime = !use24HourTime;
       else flatVirtualButtonsEnabled = !flatVirtualButtonsEnabled;
     } else if (clockSettingsPage == 3) {
-      if (row == 0) wakeByTouch = !wakeByTouch;
+      if (row == 0) manualOffLed = !manualOffLed;
+      else if (row == 1) manualOffWakeAuto = !manualOffWakeAuto;
+      else if (row == 2) autoOffLed = !autoOffLed;
+      else autoOffWakeAuto = !autoOffWakeAuto;
     } else {
-      if (row == 0) nightLightEnabled = !nightLightEnabled;
-      else if (row == 1) {
+      if (row == 0) {   // how long the timed / fading modes keep the LEDs on
+        const uint16_t secs[] = {15, 30, 60, 120, 300, 600, 1800};
+        int next = 0; for (int i = 0; i < 7; ++i) if (nightLightSeconds == secs[i]) next = (i + 1) % 7;
+        nightLightSeconds = secs[next];
+      } else if (row == 1) {
         const uint32_t colors[] = {0xFFF0C8, 0xFFFFFF, 0xFFD080, 0x80B8FF, 0xFF9090};
         int next = 0; for (int i=0;i<5;++i) if (nightLightColor==colors[i]) next=(i+1)%5;
         nightLightColor=colors[next];
@@ -8220,6 +8309,16 @@ void handleSerialConfig() {
     } else if (cmd.startsWith("t:thr ")) {
       listenEnterThreshold = (size_t)max(1L, (long)cmd.substring(6).toInt());
       Serial.printf("[test] threshold %u\n", (unsigned)listenEnterThreshold);
+    } else if (cmd == "t:sleep") {
+      sleepDisplay(millis(), true); Serial.println("[test] screen off (manual)");
+    } else if (cmd == "t:wake") {
+      wakeDisplay(); Serial.println("[test] screen on");
+    } else if (cmd.startsWith("t:key ")) {                // simulate a headphone key: play, pause, next, prev
+      String k = cmd.substring(6);
+      if (k == "play") lbt::playRequest = 1; else if (k == "pause") lbt::playRequest = -1; else if (k == "next") lbt::navRequest = 1; else if (k == "prev") lbt::navRequest = -1;
+      Serial.printf("[test] key %s\n", k.c_str());
+    } else if (cmd == "t:nosaved") {                      // pretend no headphones are remembered (RAM only)
+      lbt::hasSaved = false; Serial.println("[test] saved headphones ignored until reboot");
     } else if (cmd == "t:enter") {
       showListen();
     } else if (cmd.startsWith("t:glyph ")) {
@@ -8494,7 +8593,10 @@ void publishMqttSettings() {
   doc["day_brightness"] = dayBrightness;
   doc["night_brightness"] = nightBrightness;
   doc["screen_off_seconds"] = screenOffSeconds;
-  doc["wake_by_touch"] = wakeByTouch;
+  JsonObject manual = doc["manual_off"].to<JsonObject>();
+  manual["led"] = manualOffLed; manual["wake_auto"] = manualOffWakeAuto;
+  JsonObject autoOff = doc["auto_off"].to<JsonObject>();
+  autoOff["led"] = autoOffLed; autoOff["wake_auto"] = autoOffWakeAuto;
   doc["alarm_volume"] = alarmVolume;
   doc["alarm_sound"] = alarmSound;
   JsonObject night = doc["night_light"].to<JsonObject>();
@@ -8560,7 +8662,9 @@ bool applyMqttSettings(const String& payload, String& error) {
   if (root["adaptive_brightness"].is<bool>()) adaptiveBrightness = root["adaptive_brightness"].as<bool>();
   if (root["day_brightness"].is<int>()) dayBrightness = constrain(root["day_brightness"].as<int>(), 10, 100);
   if (root["night_brightness"].is<int>()) nightBrightness = constrain(root["night_brightness"].as<int>(), 5, 100);
-  if (root["wake_by_touch"].is<bool>()) wakeByTouch = root["wake_by_touch"].as<bool>();
+  if (root["wake_by_touch"].is<bool>()) manualOffWakeAuto = autoOffWakeAuto = root["wake_by_touch"].as<bool>();   // old key
+  { JsonObjectConst m = root["manual_off"]; if (!m.isNull()) { if (m["led"].is<bool>()) manualOffLed = m["led"]; if (m["wake_auto"].is<bool>()) manualOffWakeAuto = m["wake_auto"]; } }
+  { JsonObjectConst a = root["auto_off"]; if (!a.isNull()) { if (a["led"].is<bool>()) autoOffLed = a["led"]; if (a["wake_auto"].is<bool>()) autoOffWakeAuto = a["wake_auto"]; } }
   if (root["screen_off_seconds"].is<int>()) screenOffSeconds = constrain(root["screen_off_seconds"].as<int>(), 0, 1800);
   if (root["alarm_volume"].is<int>()) alarmVolume = constrain(root["alarm_volume"].as<int>(), 10, 100);
   if (root["alarm_sound"].is<int>()) alarmSound = constrain(root["alarm_sound"].as<int>(), 0, 3);
@@ -8679,7 +8783,7 @@ void mqttMessage(char* topicChars, byte* payload, unsigned int length) {
   String command = topic.substring(commandRoot.length());
   if (command == "screen") {
     if (value == "on" || value == "wake") wakeDisplay();
-    else if (value == "off") { screenSleeping=true; screenSleepStarted=millis(); M5.Display.setBrightness(0); }
+    else if (value == "off") { sleepDisplay(millis(), true); }
   } else if (command == "brightness") {
     adaptiveBrightness=false; dayBrightness=constrain(value.toInt(),10,100); M5.Display.setBrightness(dayBrightness*255/100); saveSettings();
   } else if (command == "page") {
@@ -8808,9 +8912,15 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     const uint16_t offValues[] = {0,30,60,300,600,1800}; const char* offEn[] = {"Never","30 seconds","1 minute","5 minutes","10 minutes","30 minutes"}; const char* offZh[] = {"永不","30 秒","1 分鐘","5 分鐘","10 分鐘","30 分鐘"};
     for (int i = 0; i < 6; ++i) page += "<option value='" + String(offValues[i]) + "'" + (screenOffSeconds == offValues[i] ? " selected" : "") + ">" + tr(offEn[i], offZh[i]) + "</option>";
     page += "</select></label>";
-    page += "<label class='field'>" + tr("Wake the screen by", "喚醒螢幕方式") + "<select name='wakeMode'><option value='1'" + String(wakeByTouch ? " selected" : "") + ">" + tr("Touch, movement or power button", "碰觸、移動或電源鍵") + "</option><option value='0'" + String(!wakeByTouch ? " selected" : "") + ">" + tr("Power button only", "只用電源鍵") + "</option></select></label>";
-    page += "<h2>" + tr("Night light", "小夜燈") + "</h2><p class='muted'>" + tr("Long-press the gear icon on the clock to manually toggle the light. This setting controls automatic lighting while the display is off.", "在時鐘首頁長按齒輪可手動開關小夜燈。以下設定控制螢幕關閉時的自動亮燈。") + "</p>";
-    page += "<label class='check'><input type='checkbox' name='nightLight'" + String(nightLightEnabled ? " checked" : "") + ">" + tr("Enable automatic Bottom2 night light while screen is off", "螢幕關閉時自動開啟 Bottom2 小夜燈") + "</label>";
+    for (int k = 0; k < 2; ++k) {
+      bool manual = k == 0;
+      bool led = manual ? manualOffLed : autoOffLed, wake = manual ? manualOffWakeAuto : autoOffWakeAuto;
+      String pre = manual ? "man" : "auto";
+      page += "<fieldset class='field'><legend>" + (manual ? tr("Turned off with the power button", "手動關閉（按一下電源鍵）") : tr("Turned off by the standby timer", "自動關閉（待機時間到）")) + "</legend>";
+      page += "<label class='check'><input type='checkbox' name='" + pre + "Led'" + String(led ? " checked" : "") + ">" + tr("Light the Bottom2 LEDs while the screen is off", "螢幕關閉期間點亮底部 LED") + "</label>";
+      page += "<label class='field'>" + tr("Wake the screen by", "喚醒方式") + "<select name='" + pre + "Wake'><option value='1'" + String(wake ? " selected" : "") + ">" + tr("Automatic: touch, movement or power button", "自動：碰觸、移動或電源鍵") + "</option><option value='0'" + String(!wake ? " selected" : "") + ">" + tr("Manual: power button only", "手動：只用電源鍵") + "</option></select></label></fieldset>";
+    }
+    page += "<h2>" + tr("Night light", "小夜燈") + "</h2><p class='muted'>" + tr("Long-press the gear icon on the clock to manually toggle the light. Whether the LEDs light up while the screen is off is chosen above (separately for the power button and the standby timer); the colour, brightness and timing below apply to both.", "在時鐘首頁長按齒輪可手動開關小夜燈。以下設定控制螢幕關閉時的自動亮燈。") + "</p>";
     page += "<div class='grid'><label class='field'>" + tr("LED color", "LED 顏色") + "<input type='color' name='nightColor' value='" + colorHex(nightLightColor) + "'></label>";
     page += "<label class='field'>" + tr("LED brightness", "LED 亮度") + ": <output id='nightLedOut'>" + String(nightLightBrightness) + "%</output><input type='range' min='1' max='100' name='nightLedBrightness' value='" + String(nightLightBrightness) + "' oninput='nightLedOut.value=this.value+\"%\"'></label></div>";
     page += "<label class='field'>" + tr("Automatic mode", "自動模式") + "<select name='nightLightMode'><option value='0'" + String(nightLightMode == 0 ? " selected" : "") + ">" + tr("Stay on while screen is off", "螢幕關閉期間持續亮起") + "</option><option value='1'" + String(nightLightMode == 1 ? " selected" : "") + ">" + tr("Turn off after set time", "指定時間後關閉") + "</option><option value='2'" + String(nightLightMode == 2 ? " selected" : "") + ">" + tr("Fade out after set time", "指定時間後逐漸熄滅") + "</option></select></label>";
@@ -9489,8 +9599,10 @@ void setupSettingsServer() {
       dayBrightness = constrain(settingsServer.arg("dayBrightness").toInt(), 10, 100);
       nightBrightness = constrain(settingsServer.arg("nightBrightness").toInt(), 5, 100);
       screenOffSeconds = constrain(settingsServer.arg("screenOff").toInt(), 0, 1800);
-      wakeByTouch = settingsServer.arg("wakeMode").toInt() != 0;
-      nightLightEnabled = settingsServer.hasArg("nightLight");
+      manualOffLed = settingsServer.hasArg("manLed");
+      manualOffWakeAuto = settingsServer.arg("manWake").toInt() != 0;
+      autoOffLed = settingsServer.hasArg("autoLed");
+      autoOffWakeAuto = settingsServer.arg("autoWake").toInt() != 0;
       nightLightColor = parseWebColor(settingsServer.arg("nightColor"), nightLightColor);
       nightLightBrightness = constrain(settingsServer.arg("nightLedBrightness").toInt(), 1, 100);
       nightLightMode = constrain(settingsServer.arg("nightLightMode").toInt(), 0, 2);
@@ -9939,7 +10051,7 @@ void loop() {
     else if (alarmActive < 0) {
       if (screenNow == Screen::NightLight) exitNightLightScreen();
       haptic(12);
-      sleepDisplay(nowMs);
+      sleepDisplay(nowMs, true);   // power button
     }
   }
   SLOW_SECTION("hass", maintainHassAssist(nowMs));
@@ -10016,7 +10128,7 @@ void loop() {
   listenMaintain(nowMs);
   updateAlarmBaseLights(nowMs);
   if (!screenSleeping && alarmActive < 0 && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
-    sleepDisplay(nowMs);
+    sleepDisplay(nowMs, false);   // standby timer
   }
   checkMotionWake(nowMs);
   static uint32_t lastAlarmCheck = 0;
