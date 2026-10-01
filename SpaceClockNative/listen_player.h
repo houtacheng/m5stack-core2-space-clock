@@ -28,6 +28,7 @@ volatile uint8_t speedCode = 2;     // index into SPEEDS
 volatile bool playing = false;      // decode task alive
 volatile bool paused = false;
 volatile bool stopReq = false;
+volatile bool pausedByLink = false;  // paused because the Bluetooth link dropped (resumes when it returns)
 volatile bool finished = false;     // track ended by itself
 volatile bool seekReq = false;
 volatile float seekFrac = 0;
@@ -271,6 +272,58 @@ String renameItem(const String& path, const String& newName) {
   return "";
 }
 
+// ---- file operations for the web file browser -----------------------------------
+static bool removeTree(const String& path) {
+  File f = SD.open(path);
+  if (!f) return false;
+  bool isDir = f.isDirectory();
+  if (isDir) {
+    std::vector<String> children;
+    for (File e = f.openNextFile(); e; e = f.openNextFile()) children.push_back(path == "/" ? "/" + String(e.name()) : path + "/" + String(e.name()));
+    f.close();
+    for (auto& c : children) removeTree(c);
+    return SD.rmdir(path);
+  }
+  f.close();
+  return SD.remove(path);
+}
+
+// Deletes a file or a whole folder. Returns "" or an error text.
+String deleteItem(const String& path) {
+  SdLock lock;
+  if (path.length() < 2 || path.indexOf("..") >= 0) return "不可刪除這個路徑";
+  if (!SD.exists(path)) return "找不到這個檔案";
+  if (!removeTree(path)) return "刪除失敗";
+  for (auto it = speeds.begin(); it != speeds.end();) it = (it->first == path || it->first.startsWith(path + "/")) ? speeds.erase(it) : std::next(it);
+  for (auto it = modes.begin(); it != modes.end();) it = (it->first == "D:" + path || it->first.startsWith("D:" + path + "/")) ? modes.erase(it) : std::next(it);
+  saveSettings();
+  return "";
+}
+
+// Moves a file or folder into destDir ("/" = top level). Returns "" or an error text.
+String moveItem(const String& path, const String& destDir) {
+  SdLock lock;
+  if (path.length() < 2 || path.indexOf("..") >= 0 || destDir.indexOf("..") >= 0) return "不可移動這個路徑";
+  if (!SD.exists(path)) return "找不到這個檔案";
+  String base = path.substring(path.lastIndexOf('/') + 1);
+  String target = destDir == "/" ? "/" + base : destDir + "/" + base;
+  if (target == path) return "";
+  if (destDir != "/" && !SD.exists(destDir)) return "目的資料夾不存在";
+  if (destDir == path || destDir.startsWith(path + "/")) return "不能把資料夾移進它自己裡面";
+  if (SD.exists(target)) return "目的地已有同名項目";
+  if (!SD.rename(path, target)) return "移動失敗";
+  retarget(path, target);
+  return "";
+}
+
+String makeDir(const String& dir, const String& name) {
+  SdLock lock;
+  if (!validName(name)) return "資料夾名稱不可用";
+  String target = dir == "/" ? "/" + name : dir + "/" + name;
+  if (SD.exists(target)) return "已有同名項目";
+  return SD.mkdir(target) ? "" : "建立失敗";
+}
+
 // All folders (up to three levels) for the web page.
 static void walkFolders(const String& dir, int depth, std::vector<String>& out) {
   File d = SD.open(dir);
@@ -398,7 +451,7 @@ static void decodeTask(void* arg) {
     static int16_t stereo[512];
     const double step = rate / 44100.0;
     int i = 0;
-    while (i < n && !stopReq && !paused && !seekReq) {
+    while (i < n && !stopReq && !paused && !seekReq && lbt::connected()) {
       int outFrames = 0;
       if (rate == 44100) {
         while (outFrames < 256 && i < n) { stereo[outFrames * 2] = stereo[outFrames * 2 + 1] = mono[i++]; ++outFrames; }
@@ -415,7 +468,7 @@ static void decodeTask(void* arg) {
         if (outFrames == 0 || btPos + 1 >= n) { i = n; }
       }
       size_t sent = 0;
-      while (sent < (size_t)outFrames && !stopReq && !paused && !seekReq) sent += lbt::write(stereo + sent * 2, outFrames - sent, 50);
+      while (sent < (size_t)outFrames && !stopReq && !paused && !seekReq && lbt::connected()) sent += lbt::write(stereo + sent * 2, outFrames - sent, 50);   // a lost link must not block the decoder
     }
     if (rate != 44100) { btPos -= n; if (n) btPrev = mono[n - 1]; }
   };
@@ -425,6 +478,11 @@ static void decodeTask(void* arg) {
       if (!onBt) { M5.Speaker.stop(CH); M5.Speaker.end(); onBt = true; btPos = 0; btPrev = 0; }   // frees its RAM for the stack
       emitBt(out + slot * SLOT, count);
       acc = 0;
+      return;
+    }
+    if (lbt::hasSaved) {                 // headphones are set up: no speaker; wait for them
+      lbt::flushAudio(); onBt = false; acc = 0;
+      paused = true; pausedByLink = true;
       return;
     }
     if (onBt) { lbt::flushAudio(); onBt = false; }
@@ -454,6 +512,7 @@ static void decodeTask(void* arg) {
 
   while (ok && !stopReq) {
     int64_t iterStart = esp_timer_get_time(), waitBefore = waitUs;
+    if (paused && pausedByLink && lbt::connected()) { paused = false; pausedByLink = false; }   // the headphones are back
     if (paused) {
       if (!flushed) { M5.Speaker.stop(CH); lbt::flushAudio(); acc = 0; flushed = true; }
       vTaskDelay(pdMS_TO_TICKS(60));
@@ -535,7 +594,7 @@ static void decodeTask(void* arg) {
   }
   bool natural = ok && !stopReq;
   if (natural) {  // let the last frames play out
-    for (int i = 0; i < 150 && !stopReq && (M5.Speaker.isPlaying(CH) || (onBt && lbt::sb && xStreamBufferBytesAvailable(lbt::sb) > 4000)); ++i) vTaskDelay(pdMS_TO_TICKS(10));
+    for (int i = 0; i < 150 && !stopReq && (M5.Speaker.isPlaying(CH) || (onBt && lbt::buffered() > 1000)); ++i) vTaskDelay(pdMS_TO_TICKS(10));
   }
   Serial.printf("[listen] decode task stack: %u bytes never used\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
   delete ws;
@@ -567,7 +626,8 @@ bool startIndex(int index) {
   speedCode = speedFor(queue[index].path);
   stopReq = false; paused = false; finished = false; seekReq = false;
   posBytes = 0; dataStart = 0; totalBytes = queue[index].size; decodeErrors = 0; underruns = 0;
-  if (lbt::connected()) M5.Speaker.end();            // sound goes to the headphones: give the RAM back
+  pausedByLink = false;
+  if (lbt::hasSaved || lbt::connected()) M5.Speaker.end();   // sound goes to the headphones: give the RAM back
   else {
     if (!M5.Speaker.isRunning()) M5.Speaker.begin();
     M5.Speaker.setVolume((uint8_t)(volume * 255 / 100));

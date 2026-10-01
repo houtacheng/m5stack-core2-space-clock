@@ -1,0 +1,9 @@
+Characters that listening mode shows in large type (file and folder names).
+Add the characters of your own file names here, then run:
+  python3 tools/extend_gfx_font.py --header SpaceClockNative/generated/source_han_sans_14.h \
+    --font ~/Library/Fonts/SourceHanSans.ttc --index 5 --pixels 23 \
+    --from-source SpaceClockNative/SpaceClockNative.ino SpaceClockNative/listen_chars.txt
+Characters that are not in the 23 px font are drawn from the complete 16 px font instead.
+
+定課 拜佛 35佛3輪 01_如密法師念誦三清淨_D2 02_比丘時念法 03_六座X6
+南無阿彌陀佛釋迦牟尼觀世音菩薩地藏王藥師琉璃光如來般若波羅蜜多心經金剛法華楞嚴大悲咒懺悔迴向發願皈依三寶戒定慧禪淨土蓮嚴楞伽維摩詰阿含彌勒文殊普賢盧舍那毘遮極樂世界無量壽清淨念誦早晚課誦禮拜供養功德經文偈頌讚歎開示講座法師居士聽聞修行持戒布施忍辱精進智慧十善業道因果輪迴六道眾生解脫涅槃菩提覺悟慈悲喜捨四無量心八正道四聖諦十二因緣緣起空性中觀唯識如是我聞一時祇樹給孤獨園比丘尼優婆塞夷僧伽

@@ -26,13 +26,22 @@ uint8_t connectAddr[6] = {0};
 bool connectByAddr = false;
 bool scanOnly = false;
 
-StreamBufferHandle_t sb = nullptr;
-StaticStreamBuffer_t sbStruct;
-uint8_t* sbStorage = nullptr;
-static const size_t SB_SIZE = 24 * 1024;   // ~140 ms of 44.1 kHz stereo
+// Frame-aligned single-producer / single-consumer ring (decoder -> Bluetooth
+// callback). A byte-oriented stream buffer can split a stereo frame between two
+// transfers, which shifts every later sample and sounds like heavy static.
+static const uint32_t RING_FRAMES = 8192;      // ~186 ms of 44.1 kHz stereo
+uint32_t* ring = nullptr;                      // PSRAM; one frame = left | right << 16
+volatile uint32_t rHead = 0, rTail = 0;        // monotonic counters
+volatile bool flushReq = false;
+inline uint32_t buffered() { return rHead - rTail; }
 uint8_t volume127 = 76;
 volatile int8_t playRequest = 0;    // from the headphone buttons / in-ear sensor: 1 play, -1 pause
 volatile int8_t navRequest = 0;     // +1 next track, -1 previous track
+volatile int audioState = -1;       // esp_a2d_audio_state_t of the stream (0 remote suspend, 1 stopped, 2 started)
+volatile bool remoteSuspend = false;   // the headphone suspended the stream itself (taken off)
+volatile uint32_t framesAudio = 0, framesSilence = 0;   // diagnostics: what the headphone pulled
+uint32_t startedAtMs = 0;
+uint32_t lastMediaCmdMs = 0;
 
 static String addrText(const uint8_t* a) {
   char b[20]; snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -103,10 +112,22 @@ static void onKey(uint8_t key, bool released) {
   ++version;
 }
 
+static void onAudioState(esp_a2d_audio_state_t state, void*) {
+  audioState = (int)state;
+  if (state == ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND) remoteSuspend = true;
+  Serial.printf("[bt] audio state %d\n", (int)state);
+  ++version;
+}
+
 static int32_t dataCb(Frame* frames, int32_t count) {
   if (!frames || count <= 0) return 0;   // the stack calls with no buffer when the stream stops
-  size_t got = sb ? xStreamBufferReceive(sb, frames, (size_t)count * 4, 0) : 0;
-  size_t gotFrames = got / 4;
+  if (flushReq) { rTail = rHead; flushReq = false; }
+  uint32_t avail = rHead - rTail;
+  size_t gotFrames = avail < (uint32_t)count ? avail : (uint32_t)count;
+  for (size_t i = 0; i < gotFrames; ++i) memcpy(&frames[i], &ring[(rTail + i) % RING_FRAMES], 4);
+  __sync_synchronize();
+  rTail += gotFrames;
+  framesAudio += gotFrames; framesSilence += count - gotFrames;
   if ((int32_t)gotFrames < count) memset(frames + gotFrames, 0, (count - gotFrames) * 4);
   return count;
 }
@@ -114,21 +135,21 @@ static int32_t dataCb(Frame* frames, int32_t count) {
 static void startTask(void*) {
   Serial.printf("[bt] starting (free internal %u, largest %u)\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-  if (!sb) {
-    sbStorage = (uint8_t*)heap_caps_malloc(SB_SIZE + 1, MALLOC_CAP_SPIRAM);
-    if (sbStorage) sb = xStreamBufferCreateStatic(SB_SIZE, 1, sbStorage, &sbStruct);
-  }
+  if (!ring) ring = (uint32_t*)heap_caps_malloc(RING_FRAMES * 4, MALLOC_CAP_SPIRAM);
+  rHead = rTail = 0;
   a2dp.set_ssp_enabled(true);               // AirPods need Secure Simple Pairing
   a2dp.set_local_name("SpaceClock");
   a2dp.set_ssid_callback(onDiscovered);
   a2dp.set_on_connection_state_changed(onConnection);
   a2dp.set_data_callback_in_frames(dataCb);
   a2dp.set_avrc_passthru_command_callback(onKey);
+  a2dp.set_on_audio_state_changed(onAudioState);
   if (connectByAddr) a2dp.set_auto_reconnect(connectAddr, 3);   // page the device directly
   else a2dp.set_auto_reconnect(false);
   a2dp.start();
   a2dp.set_volume(volume127);
   starting = false;
+  startedAtMs = millis();
   status = scanOnly ? "掃描中…" : "連線中…";
   Serial.printf("[bt] started (free internal %u)\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   ++version;
@@ -156,6 +177,13 @@ bool begin(const uint8_t* addr, const String& name) {
 void end() {
   if (!running) return;
   for (int i = 0; i < 100 && starting; ++i) delay(50);
+  // Hang up first and let the stack drain its queue: tearing the profile down while
+  // events are still queued crashes it.
+  if (linkUp) {
+    a2dp.disconnect();
+    for (int i = 0; i < 60 && linkUp; ++i) delay(50);
+    delay(1200);
+  }
   // Events of a half-finished connection would hit a stack that is gone.
   for (int i = 0; i < 100 && connecting; ++i) delay(50);
   delay(300);
@@ -170,28 +198,74 @@ void end() {
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) esp_bt_controller_deinit();
   running = false; linkUp = false; connecting = false;
   delay(300);                                    // let the stack settle before a restart
-  if (sb) xStreamBufferReset(sb);
+  flushReq = true;
   status = "";
   Serial.printf("[bt] stopped (free internal %u)\n", (unsigned)freeInternal());
   ++version;
 }
 
 inline bool connected() { return running && !starting && linkUp; }
+
+// A remembered headphone that dropped (taken off, out of range) is paged again
+// every few seconds; it cannot be found by scanning unless it is in pairing mode.
+void retryConnect(uint32_t nowMs) {
+  static uint32_t last = 0;
+  if (last < startedAtMs) last = 0;
+  if (!hasSaved || !running || starting || linkUp || connecting || scanOnly) return;
+  // Right after start the profile is not ready yet: try every 2 s for the first
+  // 20 s (a connect that is refused costs nothing), then every 12 s.
+  uint32_t every = nowMs - startedAtMs < 20000UL ? 2000UL : 12000UL;
+  if (nowMs - last < every) return;
+  if (nowMs - startedAtMs < 1500UL) return;        // the profile needs a moment before it accepts a connect
+  last = nowMs;
+  Serial.println("[bt] paging the remembered headphones");
+  a2dp.connect_to(connectAddr);
+}
 // A remembered headphone is being (re)connected: playback waits for it a few seconds.
 inline bool linking() { return hasSaved && running && !scanOnly && !linkUp; }
 
 void setVolumePercent(int percent) {
-  volume127 = (uint8_t)constrain(percent * 127 / 100, 0, 127);
+  volume127 = (uint8_t)constrain((int)lroundf(127.0f * sqrtf(percent / 100.0f)), 0, 127);   // perceptual curve: the stream gain is linear
   if (running && !starting) a2dp.set_volume(volume127);
 }
 
-void flushAudio() { if (sb) xStreamBufferReset(sb); }
+void flushAudio() { flushReq = true; }
+
+// Keep the AVDTP stream in step with playback: suspended while paused (so the
+// headphone knows the next button press means "play"), started while playing.
+void maintainMedia(bool wantPlaying, uint32_t nowMs) {
+  if (!connected() || nowMs - lastMediaCmdMs < 1200UL) return;
+  if (!wantPlaying && audioState == ESP_A2D_AUDIO_STATE_STARTED) {
+    lastMediaCmdMs = nowMs;
+    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+    Serial.println("[bt] stream suspend");
+  } else if (wantPlaying && audioState != ESP_A2D_AUDIO_STATE_STARTED) {
+    lastMediaCmdMs = nowMs;
+    remoteSuspend = false;
+    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+    Serial.println("[bt] stream start");
+  }
+}
 
 // Queue interleaved stereo frames; waits up to `waitMs` for space. Returns frames queued.
 size_t write(const int16_t* stereo, size_t frames, uint32_t waitMs) {
-  if (!sb) return 0;
-  size_t sent = xStreamBufferSend(sb, stereo, frames * 4, pdMS_TO_TICKS(waitMs));
-  return sent / 4;
+  if (!ring) return 0;
+  uint32_t deadline = millis() + waitMs;
+  size_t done = 0;
+  while (done < frames) {
+    uint32_t freeFrames = RING_FRAMES - (rHead - rTail);
+    if (freeFrames == 0) {
+      if ((int32_t)(millis() - deadline) >= 0) break;
+      vTaskDelay(1);
+      continue;
+    }
+    size_t n = frames - done < freeFrames ? frames - done : freeFrames;
+    for (size_t i = 0; i < n; ++i) memcpy(&ring[(rHead + i) % RING_FRAMES], stereo + (done + i) * 2, 4);
+    __sync_synchronize();
+    rHead += n;
+    done += n;
+  }
+  return done;
 }
 
 }  // namespace lbt

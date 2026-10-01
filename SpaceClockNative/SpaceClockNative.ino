@@ -24,6 +24,7 @@ volatile bool netPaused = false;      // listening mode: background networking i
 volatile bool netTaskAlive = false;
 bool settingsServerStopped = false;   // web server closed while Wi-Fi is off
 bool listenModeActive = false;
+size_t listenEnterThreshold = 256;   // malloc size from which PSRAM is preferred while listening (t:thr to experiment)
 void enterListenMode();
 void leaveListenMode();
 volatile bool wifiPaused = false;  // Wi-Fi deliberately off (listening mode frees RAM for Bluetooth)
@@ -1157,7 +1158,7 @@ void applyDisplayBrightness(const m5::rtc_datetime_t& dt) {
 void wakeDisplay() {
   if (!screenSleeping) return;
   screenSleeping = false;
-  if (getCpuFrequencyMhz() != 160) setCpuFrequencyMhz(160);
+  if (!listenModeActive && getCpuFrequencyMhz() != 160) setCpuFrequencyMhz(160);
   signalNextPollAt = 0;  // catch up on messages right away
   lastUserActivity = millis();
   motionBaselineReady = false;
@@ -1192,6 +1193,7 @@ void updatePowerSaveMode(uint32_t nowMs) {
   }
   // 80 MHz while the screen is off on battery; back to 160 MHz otherwise.
   // Speed-changed playback needs the extra decode headroom; otherwise 160 MHz.
+  if (listenModeActive) return;   // the Bluetooth link needs a constant clock: listening mode runs at 240 MHz throughout
   uint32_t wantMhz = 160;
   if (listen::playing && (listen::SPEEDS[listen::speedCode] != 1.0f || lbt::connected())) wantMhz = 240;
   else if (powerSaveMode && screenSleeping && !listen::playing) wantMhz = 80;
@@ -6827,6 +6829,58 @@ int listenWrap(const String& text, int maxW, int maxLines, String* lines, bool* 
   return count;
 }
 
+// Large file names: the crisp 23 px font where it has the character, otherwise
+// the complete 16 px font enlarged 1.5x (so no character is ever missing).
+bool listenHas23(const String& ch) {
+  useUIMediumFont();
+  return M5.Display.textWidth(ch) > 0;
+}
+
+int listenBigWidth(const String& ch) {
+  if (listenHas23(ch)) { useUIMediumFont(); return M5.Display.textWidth(ch); }
+  M5.Display.setFont(&SourceHanSansTC_UI8pt8b);
+  M5.Display.setTextSize(1.5f);
+  return M5.Display.textWidth(ch);
+}
+
+int listenWrapBig(const String& text, int maxW, int maxLines, String* lines, bool* truncated) {
+  *truncated = false;
+  int count = 0, width = 0;
+  String cur;
+  int i = 0, len = text.length();
+  while (i < len && count < maxLines) {
+    int n = 1;
+    uint8_t c = text[i];
+    if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+    String ch = text.substring(i, i + n);
+    int w = listenBigWidth(ch);
+    if (width + w > maxW && cur.length()) {
+      if (count == maxLines - 1) { *truncated = true; lines[count++] = cur; return count; }
+      lines[count++] = cur; cur = ""; width = 0;
+    }
+    cur += ch; width += w; i += n;
+  }
+  if (cur.length() && count < maxLines) lines[count++] = cur;
+  return count;
+}
+
+void listenDrawBig(const String& line, int x, int y, uint16_t color, uint16_t bg) {
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(color, bg);
+  int i = 0, len = line.length();
+  while (i < len) {
+    int n = 1;
+    uint8_t c = line[i];
+    if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+    String ch = line.substring(i, i + n);
+    int w;
+    if (listenHas23(ch)) { useUIMediumFont(); w = M5.Display.textWidth(ch); M5.Display.drawString(ch, x, y); }
+    else { M5.Display.setFont(&SourceHanSansTC_UI8pt8b); M5.Display.setTextSize(1.5f); w = M5.Display.textWidth(ch); M5.Display.drawString(ch, x, y); }
+    x += w; i += n;
+  }
+  M5.Display.setTextSize(1);
+}
+
 String listenTime(uint32_t seconds) {
   char b[12]; snprintf(b, sizeof(b), "%u:%02u", (unsigned)(seconds / 60), (unsigned)(seconds % 60));
   return String(b);
@@ -7065,24 +7119,19 @@ void drawListenNow(bool full) {
     String clipped[1];
     listenWrap(where, 296 - countW - 12, 1, clipped);
     M5.Display.drawString(clipped[0], 12, 43);
-    // File name in large type: the biggest size that shows all of it.
-    static const float scales[3] = {2.0f, 1.5f, 1.0f};
-    static const int maxLines[3] = {1, 2, 3};
-    static const int pitch[3] = {33, 26, 17};
+    // File name in large type (crisp 23 px glyphs where available).
     String lines[3];
-    int n = 0, pick = 2;
-    for (int k = 0; k < 3; ++k) {
-      M5.Display.setTextSize(scales[k]);
-      bool truncated = false;
-      n = listenWrap(t.name, 296, maxLines[k], lines, &truncated);
-      pick = k;
-      if (!truncated) break;
+    bool truncated = false;
+    int n = listenWrapBig(t.name, 296, 2, lines, &truncated);
+    if (!truncated) {
+      for (int i = 0; i < n; ++i) listenDrawBig(lines[i], 12, 52 + i * 28, calTheme.text, calTheme.bg);
+    } else {                                   // very long name: smaller type, three lines
+      useUIFont(1);
+      M5.Display.setTextDatum(top_left);
+      M5.Display.setTextColor(calTheme.text, calTheme.bg);
+      n = listenWrap(t.name, 296, 3, lines);
+      for (int i = 0; i < n; ++i) M5.Display.drawString(lines[i], 12, 54 + i * 18);
     }
-    M5.Display.setTextSize(scales[pick]);
-    M5.Display.setTextDatum(top_left);
-    M5.Display.setTextColor(calTheme.text, calTheme.bg);
-    for (int i = 0; i < n; ++i) M5.Display.drawString(lines[i], 12, 54 + i * pitch[pick]);
-    M5.Display.setTextSize(1);
     drawListenButtons();
     drawListenNowBottomBar();
   }
@@ -7181,7 +7230,7 @@ void drawListenBt() {
     bool isCurrent = lbt::connected() && lbt::hasSaved && r.saved;
     M5.Display.fillRoundRect(8, y, 304, 40, 7, calTheme.panel);
     M5.Display.drawRoundRect(8, y, 304, 40, 7, isCurrent ? calTheme.accent : calTheme.border);
-    drawListenRowText((r.saved ? String("★ ") : String("")) + r.name, y, 16, isCurrent ? calTheme.accent : calTheme.text, calTheme.panel);
+    drawListenRowText((r.saved ? String("● ") : String("")) + r.name, y, 16, isCurrent ? calTheme.accent : calTheme.text, calTheme.panel);
     M5.Display.setTextDatum(middle_right);
     M5.Display.setTextColor(calTheme.muted, calTheme.panel);
     if (r.rssi) M5.Display.drawString(String(r.rssi) + " dBm", 306, y + 20);
@@ -7400,7 +7449,7 @@ void handleListenTap(int x, int y) {
     haptic(12);
     if (x < 107) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
     else if (x < 214) {
-      if (listen::playing) listen::paused = !listen::paused;
+      if (listen::playing) { listen::paused = !listen::paused; listen::pausedByLink = false; }
       else if (listen::current >= 0) { listen::startIndex(listen::current); drawListenNow(true); }
       drawListenNowBottomBar();
     } else listenExit();
@@ -7460,10 +7509,19 @@ void listenMaintain(uint32_t nowMs) {
       else if (listenView == ListenView::Now) { listenView = ListenView::Browse; listenLoad(); drawListenBrowse(); }
     }
   }
+  if (listenModeActive) {
+    lbt::retryConnect(nowMs);
+    lbt::maintainMedia(listen::playing && !listen::paused, nowMs);
+    if (lbt::remoteSuspend) {                                 // the headphone stopped the stream (taken off)
+      lbt::remoteSuspend = false;
+      if (listen::playing && !listen::paused) { listen::paused = true; listen::pausedByLink = false; if (screenNow == Screen::Listen && !screenSleeping && listenView == ListenView::Now) drawListenNowBottomBar(); }
+    }
+  }
   if (listenModeActive) {                                   // headphone buttons / in-ear sensor
     int8_t pr = lbt::playRequest, nv = lbt::navRequest;
     lbt::playRequest = 0; lbt::navRequest = 0;
     bool changed = false;
+    if (pr) listen::pausedByLink = false;
     if (pr < 0 && listen::playing && !listen::paused) { listen::paused = true; changed = true; }
     else if (pr > 0) {
       if (listen::playing && listen::paused) { listen::paused = false; changed = true; }
@@ -8118,6 +8176,7 @@ void handleSerialConfig() {
                     (unsigned)lbt::found.size(), lbt::hasSaved ? lbt::saved.name.c_str() : "-", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), netPaused);
       Serial.printf("[test] loop stack never used: %u bytes\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+      Serial.printf("[test] bt audio frames sent %u, silence %u, audioState %d\n", (unsigned)lbt::framesAudio, (unsigned)lbt::framesSilence, (int)lbt::audioState);
     } else if (cmd == "t:btscan") {
       lbt::end(); lbt::begin(nullptr, "");
     } else if (cmd.startsWith("t:btconnect ")) {
@@ -8133,8 +8192,21 @@ void handleSerialConfig() {
       lbt::end();
     } else if (cmd == "t:exitlisten") {
       listenExit();
+    } else if (cmd.startsWith("t:thr ")) {
+      listenEnterThreshold = (size_t)max(1L, (long)cmd.substring(6).toInt());
+      Serial.printf("[test] threshold %u\n", (unsigned)listenEnterThreshold);
     } else if (cmd == "t:enter") {
       showListen();
+    } else if (cmd.startsWith("t:glyph ")) {
+      String chars = cmd.substring(8);
+      for (int i = 0; i < (int)chars.length();) {
+        int n = 1; uint8_t c = chars[i];
+        if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+        String ch = chars.substring(i, i + n); i += n;
+        useUIMediumFont(); int w14 = M5.Display.textWidth(ch);
+        useUIFont(1); int w8 = M5.Display.textWidth(ch);
+        Serial.printf("[test] glyph %s: 23px width %d, 16px width %d\n", ch.c_str(), w14, w8);
+      }
     } else if (cmd == "t:markall") {
       Serial.printf("[test] marked %d conversation(s) read\n", signalMarkAllRead(false));
     } else if (cmd == "t:unread") {
@@ -8632,6 +8704,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
   const char* tabZh[] = {"Wi-Fi 網路", "時鐘與小夜燈", "鬧鐘", "靜心時鐘", "情緒觀察", "MQTT", "HASS 語音助理", "Companion", "日曆", "Signal", "聽法", "韌體更新"};
   page += "<nav class='tabs'>";
   for (int i = 0; i < 12; ++i) page += "<a class='" + String(pageId == pageIds[i] ? "active" : "") + "' href='/?page=" + pageIds[i] + "&lang=" + (zh ? "zh" : "en") + "'>" + tr(tabEn[i], tabZh[i]) + "</a>";
+  page += "<a href='/sd?lang=" + String(zh ? "zh" : "en") + "'>" + tr("SD card files", "SD 卡檔案") + "</a>";
   page += "</nav>";
   if (message.length()) page += "<p class='ok'>" + htmlEscape(message) + "</p>";
   if (pageId == "emotion") {
@@ -8905,8 +8978,182 @@ void sendHassAssistStatus() {
   settingsServer.send(200, "application/json; charset=utf-8", payload);
 }
 
+// ---------------------------------------------------------------------------
+// SD card file browser (web backend): upload, delete, move, rename, new folder
+// ---------------------------------------------------------------------------
+String sdUrlEncode(const String& s) {
+  String out;
+  for (size_t i = 0; i < s.length(); ++i) {
+    uint8_t c = s[i];
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+    else { char b[4]; snprintf(b, sizeof(b), "%%%02X", c); out += b; }
+  }
+  return out;
+}
+
+String sdCleanPath(String path) {
+  path.trim();
+  if (!path.startsWith("/")) path = "/" + path;
+  while (path.indexOf("//") >= 0) path.replace("//", "/");
+  if (path.indexOf("..") >= 0) path = "/";
+  while (path.length() > 1 && path.endsWith("/")) path.remove(path.length() - 1);
+  return path;
+}
+
+String sdSizeText(uint32_t bytes) {
+  if (bytes >= 1048576UL) return String(bytes / 1048576.0f, 1) + " MB";
+  if (bytes >= 1024) return String(bytes / 1024) + " KB";
+  return String(bytes) + " B";
+}
+
+File sdUploadFile;
+bool sdUploadOk = false;
+String sdUploadMessage;
+
+void sendSdBrowser(String dir, const String& message, bool zh) {
+  dir = sdCleanPath(dir);
+  auto tr = [zh](const char* en, const char* zhText) -> String { return zh ? String(zhText) : String(en); };
+  String lang = zh ? "zh" : "en";
+  String page = "<!doctype html><html lang='" + String(zh ? "zh-Hant" : "en") + "'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>SD</title><style>"
+    "html{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#08111f;color:#eef4ff;max-width:900px;margin:auto;padding:16px}"
+    "a{color:#65b9ff;text-decoration:none}h1{color:#65b9ff;font-size:23px;margin:6px 0}.muted{color:#aabbd0;font-size:14px}.ok{color:#70e39a}.warn{color:#ffb454}"
+    ".crumbs{margin:10px 0;font-size:15px;word-break:break-all}.panel{background:#101d2e;border:1px solid #263b52;border-radius:14px;padding:12px;margin:12px 0}"
+    "table{width:100%;border-collapse:collapse}td{padding:7px 4px;border-bottom:1px solid #1d3047;vertical-align:middle;font-size:15px}td.n{word-break:break-all}td.s{white-space:nowrap;color:#aabbd0;text-align:right}"
+    "form.i{display:inline-flex;gap:4px;margin:2px}input,select,button{font-size:14px;padding:6px 8px;border-radius:7px;border:1px solid #52657a;background:#142236;color:#fff}"
+    "button{background:#1688e5;border:0;cursor:pointer}button.d{background:#b3342f}button.s{background:#20354e}.bar{height:10px;background:#1d3047;border-radius:5px;overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;width:0;background:#1688e5}"
+    "</style></head><body>";
+  page += "<a href='/?page=listen&lang=" + lang + "'>&larr; " + tr("Settings", "設定") + "</a><h1>" + tr("SD card files", "SD 卡檔案") + "</h1>";
+  if (!listen::begin()) { page += "<p class='warn'>" + tr("No SD card found.", "找不到 SD 卡。") + "</p></body></html>"; settingsServer.send(200, "text/html; charset=utf-8", page); return; }
+  uint32_t total = (uint32_t)(SD.totalBytes() / 1048576), used = (uint32_t)(SD.usedBytes() / 1048576);
+  page += "<div class='muted'>" + tr("Used ", "已使用 ") + String(used) + " / " + String(total) + " MB</div>";
+  if (message.length()) page += "<p class='" + String(message.startsWith("!") ? "warn" : "ok") + "'>" + htmlEscape(message.startsWith("!") ? message.substring(1) : message) + "</p>";
+  // breadcrumbs
+  page += "<div class='crumbs'><a href='/sd?lang=" + lang + "'>SD</a>";
+  String walk = "";
+  int start = 1;
+  while (start < (int)dir.length()) {
+    int slash = dir.indexOf('/', start);
+    String part = slash < 0 ? dir.substring(start) : dir.substring(start, slash);
+    walk += "/" + part;
+    page += " / <a href='/sd?lang=" + lang + "&dir=" + sdUrlEncode(walk) + "'>" + htmlEscape(part) + "</a>";
+    if (slash < 0) break;
+    start = slash + 1;
+  }
+  page += "</div>";
+  // upload + new folder
+  page += "<div class='panel'><form id='upf'><input type='file' name='f' multiple> <button type='submit'>" + tr("Upload here", "上傳到這個資料夾") + "</button></form><div class='bar'><i id='pb'></i></div><div class='muted' id='pt'></div>"
+          "<form class='i' method='post' action='/sd/mkdir' style='margin-top:10px'><input type='hidden' name='dir' value='" + htmlEscape(dir) + "'><input type='hidden' name='lang' value='" + lang + "'><input name='name' maxlength='60' placeholder='" + tr("New folder", "新資料夾名稱") + "'><button class='s'>" + tr("Create", "建立") + "</button></form></div>";
+  // listing
+  std::vector<listen::Entry> entries;
+  {
+    listen::SdLock lock;
+    File d = SD.open(dir);
+    if (d) {
+      for (File e = d.openNextFile(); e && entries.size() < 300; e = d.openNextFile()) {
+        String name = e.name();
+        if (name.startsWith(".")) continue;
+        entries.push_back({name, dir == "/" ? "/" + name : dir + "/" + name, e.isDirectory(), (uint32_t)e.size()});
+      }
+      d.close();
+    }
+  }
+  std::sort(entries.begin(), entries.end(), [](const listen::Entry& a, const listen::Entry& b) { if (a.isDir != b.isDir) return a.isDir; return a.name < b.name; });
+  std::vector<String> folders; listen::allFolders(folders);
+  String destOptions = "<option value='/'>/ (SD)</option>";
+  for (auto& f : folders) destOptions += "<option value='" + htmlEscape(f) + "'>" + htmlEscape(f) + "</option>";
+  page += "<div class='panel'><table>";
+  if (dir != "/") page += "<tr><td colspan='3'><a href='/sd?lang=" + lang + "&dir=" + sdUrlEncode(listen::parentOf(dir)) + "'>&uarr; " + tr("Up", "上一層") + "</a></td></tr>";
+  if (entries.empty()) page += "<tr><td class='muted'>" + tr("Empty", "這裡是空的") + "</td></tr>";
+  for (auto& e : entries) {
+    String path = htmlEscape(e.path), q = "<input type='hidden' name='path' value='" + path + "'><input type='hidden' name='dir' value='" + htmlEscape(dir) + "'><input type='hidden' name='lang' value='" + lang + "'>";
+    page += "<tr><td class='n'>" + (e.isDir ? "&#128193; <a href='/sd?lang=" + lang + "&dir=" + sdUrlEncode(e.path) + "'>" + htmlEscape(e.name) + "</a>" : "&#127925; " + htmlEscape(e.name)) + "</td>"
+            "<td class='s'>" + (e.isDir ? String("") : sdSizeText(e.size)) + "</td><td style='text-align:right'>"
+            "<form class='i' method='post' action='/sd/move'>" + q + "<select name='dest'>" + destOptions + "</select><button class='s'>" + tr("Move", "移動") + "</button></form>"
+            "<form class='i' method='post' action='/sd/rename'>" + q + "<input name='name' maxlength='60' value='" + htmlEscape(e.name) + "' size='14'><button class='s'>" + tr("Rename", "更名") + "</button></form>"
+            "<form class='i' method='post' action='/sd/delete' onsubmit=\"return confirm('" + tr("Delete?", "確定刪除？") + "')\">" + q + "<button class='d'>" + tr("Delete", "刪除") + "</button></form></td></tr>";
+  }
+  page += "</table></div>";
+  page += "<script>var dir=" + String("'") + sdUrlEncode(dir) + "';"
+          "document.getElementById('upf').onsubmit=function(ev){ev.preventDefault();var fs=Array.from(this.f.files);if(!fs.length)return;var i=0,pb=document.getElementById('pb'),pt=document.getElementById('pt');"
+          "function next(){if(i>=fs.length){pt.textContent='" + tr("Done", "完成") + "';location.reload();return;}var f=fs[i],x=new XMLHttpRequest(),fd=new FormData();fd.append('f',f,f.name);"
+          "x.open('POST','/sd/upload?dir='+dir);x.upload.onprogress=function(e){if(e.lengthComputable){pb.style.width=(100*e.loaded/e.total)+'%';pt.textContent=(i+1)+'/'+fs.length+' '+f.name+' '+Math.round(100*e.loaded/e.total)+'%';}};"
+          "x.onload=function(){if(x.status!=200||x.responseText.indexOf('ok')!=0){pt.textContent='" + tr("Upload failed: ", "上傳失敗：") + "'+f.name+' '+x.responseText;return;}i++;next();};"
+          "x.onerror=function(){pt.textContent='" + tr("Connection lost", "連線中斷") + "';};x.send(fd);}next();};</script></body></html>";
+  settingsServer.send(200, "text/html; charset=utf-8", page);
+}
+
+void sdRedirect(const String& dir, const String& message, const String& lang) {
+  settingsServer.sendHeader("Location", "/sd?lang=" + lang + "&dir=" + sdUrlEncode(dir) + "&msg=" + sdUrlEncode(message));
+  settingsServer.send(303, "text/plain", "");
+}
+
+void setupSdWebRoutes() {
+  settingsServer.on("/sd", HTTP_GET, []() {
+    bool zh = settingsServer.arg("lang") != "en";
+    sendSdBrowser(settingsServer.arg("dir").length() ? settingsServer.arg("dir") : String("/"), settingsServer.arg("msg"), zh);
+  });
+  settingsServer.on("/sd/upload", HTTP_POST,
+    []() {
+      WiFi.setSleep(true);
+      settingsServer.send(sdUploadOk ? 200 : 500, "text/plain", sdUploadOk ? "ok" : (sdUploadMessage.length() ? sdUploadMessage : String("error")));
+    },
+    []() {
+      HTTPUpload& up = settingsServer.upload();
+      if (up.status == UPLOAD_FILE_START) {
+        lastUserActivity = millis();
+        WiFi.setSleep(false);                       // full radio speed for the transfer
+        sdUploadOk = false; sdUploadMessage = "";
+        String name = up.filename;
+        int slash = max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (slash >= 0) name = name.substring(slash + 1);
+        String dir = sdCleanPath(settingsServer.arg("dir").length() ? settingsServer.arg("dir") : String("/"));
+        if (!listen::begin() || name.startsWith(".") || name.indexOf(':') >= 0) { sdUploadMessage = "bad name or no SD card"; return; }
+        String path = dir == "/" ? "/" + name : dir + "/" + name;
+        listen::SdLock lock;
+        if (SD.exists(path)) SD.remove(path);
+        sdUploadFile = SD.open(path, FILE_WRITE);
+        if (!sdUploadFile) sdUploadMessage = "cannot create file";
+      } else if (up.status == UPLOAD_FILE_WRITE) {
+        lastUserActivity = millis();
+        if (sdUploadFile) {
+          listen::SdLock lock;
+          if (sdUploadFile.write(up.buf, up.currentSize) != up.currentSize) { sdUploadMessage = "SD write failed (card full?)"; sdUploadFile.close(); }
+        }
+      } else if (up.status == UPLOAD_FILE_END) {
+        if (sdUploadFile) { listen::SdLock lock; sdUploadFile.close(); sdUploadOk = sdUploadMessage.length() == 0; }
+        Serial.printf("[sd] upload %s %u bytes %s\n", up.filename.c_str(), (unsigned)up.totalSize, sdUploadOk ? "ok" : "FAILED");
+      } else if (up.status == UPLOAD_FILE_ABORTED) {
+        if (sdUploadFile) { listen::SdLock lock; sdUploadFile.close(); }
+        WiFi.setSleep(true);
+      }
+    });
+  settingsServer.on("/sd/delete", HTTP_POST, []() {
+    String lang = settingsServer.arg("lang"), dir = sdCleanPath(settingsServer.arg("dir"));
+    String err = listen::deleteItem(sdCleanPath(settingsServer.arg("path")));
+    sdRedirect(dir, err.length() ? "!" + err : String(lang == "en" ? "Deleted" : "已刪除"), lang);
+  });
+  settingsServer.on("/sd/move", HTTP_POST, []() {
+    String lang = settingsServer.arg("lang"), dir = sdCleanPath(settingsServer.arg("dir"));
+    String err = listen::moveItem(sdCleanPath(settingsServer.arg("path")), sdCleanPath(settingsServer.arg("dest")));
+    sdRedirect(dir, err.length() ? "!" + err : String(lang == "en" ? "Moved" : "已移動"), lang);
+  });
+  settingsServer.on("/sd/rename", HTTP_POST, []() {
+    String lang = settingsServer.arg("lang"), dir = sdCleanPath(settingsServer.arg("dir"));
+    String name = settingsServer.arg("name"); name.trim();
+    String err = listen::renameItem(sdCleanPath(settingsServer.arg("path")), name);
+    sdRedirect(dir, err.length() ? "!" + err : String(lang == "en" ? "Renamed" : "已更名"), lang);
+  });
+  settingsServer.on("/sd/mkdir", HTTP_POST, []() {
+    String lang = settingsServer.arg("lang"), dir = sdCleanPath(settingsServer.arg("dir"));
+    String name = settingsServer.arg("name"); name.trim();
+    String err = listen::makeDir(dir, name);
+    sdRedirect(dir, err.length() ? "!" + err : String(lang == "en" ? "Folder created" : "已建立資料夾"), lang);
+  });
+}
+
 void setupSettingsServer() {
   settingsServer.on("/", HTTP_GET, []() { sendSettingsPage(); });
+  setupSdWebRoutes();
   settingsServer.on("/hass-status", HTTP_GET, []() { sendHassAssistStatus(); });
   settingsServer.on("/mqtt-guide", HTTP_GET, []() {
     settingsServer.send_P(200, "text/html; charset=utf-8", MQTT_GUIDE_HTML);
@@ -9453,9 +9700,11 @@ void enterListenMode() {
   pauseNetwork();
   // The Bluetooth stack wants ~80 KB of heap and internal RAM is scarce: while
   // listening, every malloc of 256 bytes or more is served from PSRAM.
-  listen::mallocThreshold = 256;
-  heap_caps_malloc_extmem_enable(256);
+  setCpuFrequencyMhz(240);         // fixed for the whole session (changing it breaks the Bluetooth link)
+  listen::mallocThreshold = listenEnterThreshold;
+  heap_caps_malloc_extmem_enable(listenEnterThreshold);
   listenModeActive = true;
+  esp_log_level_set("BT_AV", ESP_LOG_VERBOSE); esp_log_level_set("BT_APP", ESP_LOG_VERBOSE);   // connection diagnostics (shown only in debug builds)
   lbt::loadSaved();
   if (lbt::hasSaved) lbt::begin(lbt::saved.addr, lbt::saved.name);   // reconnect the remembered headphones
 }
@@ -9468,6 +9717,7 @@ void leaveListenMode() {
   listen::mallocThreshold = 16384;
   heap_caps_malloc_extmem_enable(16384);               // back to the normal threshold
   listenModeActive = false;
+  setCpuFrequencyMhz(160);
   resumeNetwork();
 }
 
