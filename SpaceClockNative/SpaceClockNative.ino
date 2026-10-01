@@ -58,7 +58,7 @@ volatile bool wifiPaused = false;  // Wi-Fi deliberately off (listening mode fre
 #endif
 #include "mqtt_guide.h"
 
-enum class ListenView : uint8_t { Browse, Now, Pick, Confirm, Bluetooth };
+enum class ListenView : uint8_t { Browse, Now, Pick, Confirm, Bluetooth, Setting };
 enum class Screen : uint8_t { Clock, Menu, Faces, Companion, Alarms, Settings, Meditation, MeditationSettings, EmotionObservation, EmotionRecords, EmotionSettings, EmotionReminder, HassAssist, FirmwareUpdate, About, NightLight, Calendar, Messages, MessageDetail, MessageReply, MessageFull, MessageHub, WifiSwitch, Listen };
 enum class ClockFace : uint8_t { Space, Minimal, Matrix };
 enum class MeditationState : uint8_t { Ready, Running, Paused, Done };
@@ -444,6 +444,8 @@ uint32_t companionNavPressStarted = 0;
 bool companionNavPressValid = false;
 uint32_t lastMqttReconnect = 0;
 uint32_t lastMqttPublish = 0;
+uint32_t mqttBackoffUntil = 0;     // a slow/blocked broker link pauses MQTT so it cannot freeze the UI
+uint32_t mqttPublishGapMs = 1000;
 bool mqttSettingsDirty = true;
 bool mqttReconnectRequested = false;
 bool mqttDiscoveryDirty = true;
@@ -1016,7 +1018,11 @@ void maintainSavedWifi(uint32_t nowMs) {
     wifiRecoveryPhaseStartedAt = nowMs;
     if (!settingsServerReady) setupSettingsServer();
     else if (settingsServerStopped) { settingsServer.begin(); settingsServerStopped = false; }
-    if (!sdRawStarted) { sdRawServer.begin(); sdRawStarted = true; }
+    if (!sdRawStarted) {
+      sdRawServer.begin(); sdRawStarted = true;
+      static bool taskStarted = false;
+      if (!taskStarted) { taskStarted = true; xTaskCreatePinnedToCore(sdRawTask, "sdRaw", 6144, nullptr, 1, nullptr, 0); }
+    }
     if (justConnected) {
       // Arduino's hostByName() clears lwIP's DNS cache (without the TCPIP lock)
       // the first time after the IP changes. If SNTP is resolving at that
@@ -6757,6 +6763,7 @@ void handleSignalTap(int x, int y) {
 static const int LISTEN_ROWS = 4;
 ListenView listenView = ListenView::Browse;
 ListenView listenPickReturn = ListenView::Browse;
+int listenSetKind = 0;                              // Setting page: 0 playback speed, 1 rewind seconds, 2 fast-forward seconds
 ListenView listenBtBack = ListenView::Browse;      // page to return to from the Bluetooth page
 String listenLoc = "/";                 // "/", "/folder", "@playlists", "@pl:NAME"
 std::vector<listen::Entry> listenEntries;
@@ -7327,6 +7334,105 @@ void handleListenBtTap(int x, int y) {
   else if (pages > 1 && y >= 34) { /* empty row */ }
 }
 
+
+// ---- Setting page: speed / rewind / fast-forward (opened by a long press on the player) ----
+static const uint16_t LISTEN_SKIP_PRESETS[7] = {5, 10, 15, 30, 60, 120, 300};
+static constexpr int LISTEN_SET_SLIDER_X = 28, LISTEN_SET_SLIDER_W = 264, LISTEN_SET_SLIDER_Y = 174;
+
+String listenSecondsText(int seconds) { return seconds >= 60 && seconds % 60 == 0 ? String(seconds / 60) + " 分" : String(seconds) + " 秒"; }
+int listenSetCount() { return listenSetKind == 0 ? 5 : 7; }
+String listenSetPresetLabel(int i) { return listenSetKind == 0 ? String(listen::SPEED_LABELS[i]) : listenSecondsText(LISTEN_SKIP_PRESETS[i]); }
+bool listenSetPresetActive(int i) {
+  if (listenSetKind == 0) return listen::speedCode == i;
+  return (listenSetKind == 1 ? listenSkipBack : listenSkipFwd) == LISTEN_SKIP_PRESETS[i];
+}
+void listenSetPresetRect(int i, int& x, int& y, int& w, int& h) {
+  int n = listenSetCount(), cols = n == 5 ? 5 : 4, pitch = 304 / cols;
+  w = pitch - 5; h = 40; x = 8 + (i % cols) * pitch; y = 38 + (i / cols) * 46;
+}
+float listenSetFrac() {
+  if (listenSetKind == 0) return listen::speedCode / 4.0f;
+  int v = listenSetKind == 1 ? listenSkipBack : listenSkipFwd;
+  return constrain((v - 5) / 295.0f, 0.0f, 1.0f);
+}
+
+// Everything under the title; redrawn while the slider moves.
+void drawListenSettingBody() {
+  M5.Display.fillRect(0, 32, 320, 178, calTheme.bg);
+  int n = listenSetCount();
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  for (int i = 0; i < n; ++i) {
+    int x, y, w, h; listenSetPresetRect(i, x, y, w, h);
+    bool on = listenSetPresetActive(i);
+    M5.Display.fillRoundRect(x, y, w, h, 8, on ? calTheme.accent : calTheme.panel);
+    M5.Display.drawRoundRect(x, y, w, h, 8, calTheme.accent);
+    M5.Display.setTextColor(on ? calTheme.bg : calTheme.accent, on ? calTheme.accent : calTheme.panel);
+    M5.Display.drawString(listenSetPresetLabel(i), x + w / 2, y + h / 2);
+  }
+  String now = listenSetKind == 0 ? String(listen::SPEED_LABELS[listen::speedCode]) : listenSecondsText(listenSetKind == 1 ? listenSkipBack : listenSkipFwd);
+  M5.Display.setTextColor(TFT_WHITE, calTheme.bg);
+  M5.Display.drawString("目前 " + now, 160, 146);
+  int tx = LISTEN_SET_SLIDER_X, tw = LISTEN_SET_SLIDER_W, ty = LISTEN_SET_SLIDER_Y;
+  M5.Display.fillRoundRect(tx, ty - 3, tw, 6, 3, calTheme.border);
+  int kx = tx + (int)(listenSetFrac() * tw);
+  M5.Display.fillRoundRect(tx, ty - 3, kx - tx, 6, 3, calTheme.accent);
+  M5.Display.fillCircle(kx, ty, 11, calTheme.accent);
+  M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.drawString(listenSetKind == 0 ? "0.5X" : "5 秒", tx, ty + 24);
+  M5.Display.setTextDatum(middle_right);
+  M5.Display.drawString(listenSetKind == 0 ? "2X" : "5 分", tx + tw, ty + 24);
+}
+
+void drawListenSetting() {
+  M5.Display.fillScreen(calTheme.bg);
+  useUIFont(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(calTheme.accent, calTheme.bg);
+  M5.Display.drawString(listenSetKind == 0 ? "播放速度" : (listenSetKind == 1 ? "倒退秒數" : "前進秒數"), 160, 15);
+  M5.Display.drawFastHLine(8, 30, 304, calTheme.border);
+  drawListenSettingBody();
+  drawCalendarBottomBar("上一頁", "", "");
+}
+
+void listenOpenSetting(int kind) {
+  listenSetKind = kind;
+  listenView = ListenView::Setting;
+  drawListenSetting();
+}
+
+// Slider position (0..1) -> value. Speed snaps to its five steps, seconds go in steps of 5.
+void listenSetFromFrac(float frac) {
+  frac = constrain(frac, 0.0f, 1.0f);
+  if (listenSetKind == 0) {
+    uint8_t code = (uint8_t)(frac * 4.0f + 0.5f);
+    if (code != listen::speedCode) listen::setSpeedCode(code);
+  } else {
+    uint16_t v = (uint16_t)(((int)(5 + frac * 295.0f + 2.5f)) / 5 * 5);
+    v = constrain((int)v, 5, 300);
+    uint16_t& ref = listenSetKind == 1 ? listenSkipBack : listenSkipFwd;
+    ref = v;
+  }
+}
+
+void handleListenSettingTap(int x, int y) {
+  if (y >= 212) {                                           // back to the player
+    if (x < 107) { haptic(12); listenView = ListenView::Now; drawListenNow(true); }
+    return;
+  }
+  for (int i = 0; i < listenSetCount(); ++i) {
+    int bx, by, bw, bh; listenSetPresetRect(i, bx, by, bw, bh);
+    if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+      haptic(12);
+      if (listenSetKind == 0) listen::setSpeedCode(i);
+      else { (listenSetKind == 1 ? listenSkipBack : listenSkipFwd) = LISTEN_SKIP_PRESETS[i]; saveSettings(); }
+      drawListenSettingBody();
+      return;
+    }
+  }
+}
+
 void listenRedraw() {
   switch (listenView) {
     case ListenView::Browse: drawListenBrowse(); break;
@@ -7334,6 +7440,7 @@ void listenRedraw() {
     case ListenView::Pick: drawListenPick(); break;
     case ListenView::Confirm: drawListenConfirm(); break;
     case ListenView::Bluetooth: drawListenBt(); break;
+    case ListenView::Setting: drawListenSetting(); break;
   }
 }
 
@@ -7421,6 +7528,7 @@ void listenSkip(int seconds) {
 
 void handleListenTap(int x, int y) {
   lastUserActivity = millis();
+  if (listenView == ListenView::Setting) { handleListenSettingTap(x, y); return; }
   if (y < 30 && x >= 288 && listenView != ListenView::Bluetooth && listenView != ListenView::Confirm) {   // Bluetooth icon
     haptic(12);
     listenBtBack = listenView == ListenView::Now ? ListenView::Now : ListenView::Browse;
@@ -7540,16 +7648,9 @@ void handleListenLong(int x, int y) {
     }
     return;
   }
-  if (listenView == ListenView::Now && y >= 164 && y < 208) {      // long-press rewind / fast-forward: choose the seconds
-    int hit = -1;
-    for (int i = 1; i <= 3; i += 2) { int bx, bw; listenButtonRect(i, bx, bw); if (x >= bx - 2 && x < bx + bw + 3) hit = i; }
-    if (hit < 0) return;
-    static const uint16_t choices[] = {5, 10, 15, 30, 60, 120, 300};
-    uint16_t& value = hit == 1 ? listenSkipBack : listenSkipFwd;
-    int next = 0; for (int i = 0; i < 7; ++i) if (value == choices[i]) next = (i + 1) % 7;
-    value = choices[next];
-    saveSettings();
-    drawListenButton(hit);
+  if (listenView == ListenView::Now && y < 30 && x < 62) { listenOpenSetting(0); return; }   // long-press the speed: speed page
+  if (listenView == ListenView::Now && y >= 164 && y < 208) {      // long-press rewind / fast-forward: its seconds page
+    for (int i = 1; i <= 3; i += 2) { int bx, bw; listenButtonRect(i, bx, bw); if (x >= bx - 2 && x < bx + bw + 3) { listenOpenSetting(i == 1 ? 1 : 2); return; } }
     return;
   }
   if (listenView != ListenView::Browse || y < 34 || y >= 210) return;
@@ -7869,6 +7970,26 @@ void handleTouch() {
       } else if (millis() - lastDragDraw >= 60UL) {
         lastDragDraw = millis();
         drawListenDynamic(true);
+      }
+      return;
+    }
+  }
+  if (screenNow == Screen::Listen && listenView == ListenView::Setting && !screenSleeping && !wakeTouchConsumed) {
+    static bool setDrag = false;
+    static uint32_t lastSetDraw = 0;
+    if (t.wasPressed()) setDrag = t.y >= 150 && t.y < 208;
+    if (setDrag && (t.isPressed() || t.wasReleased())) {
+      lastUserActivity = millis();
+      pressHandled = true;
+      listenSetFromFrac(((int)t.x - LISTEN_SET_SLIDER_X) / (float)LISTEN_SET_SLIDER_W);
+      if (t.wasReleased()) {
+        setDrag = false;
+        if (listenSetKind != 0) saveSettings();
+        haptic(8);
+        drawListenSettingBody();
+      } else if (millis() - lastSetDraw >= 70UL) {
+        lastSetDraw = millis();
+        drawListenSettingBody();
       }
       return;
     }
@@ -8812,6 +8933,8 @@ void maintainMqtt(uint32_t nowMs) {
   // Away from home: a LAN broker cannot be reached; don't block on it.
   if (!homeLanChecked) return;
   if (!homeLanReachable && hostIsPrivate(mqttHost)) { if (mqttClient.connected()) mqttClient.disconnect(); return; }
+  if ((int32_t)(nowMs - mqttBackoffUntil) < 0) return;
+  uint32_t workStart = millis();
   if (!mqttClient.connected()) {
     if (nowMs-lastMqttReconnect < 5000UL) return;
     lastMqttReconnect=nowMs;
@@ -8822,19 +8945,32 @@ void maintainMqtt(uint32_t nowMs) {
     String clientId="SpaceClock-"+String((uint32_t)ESP.getEfuseMac(),HEX);
     bool ok = mqttUsername.length() ? mqttClient.connect(clientId.c_str(),mqttUsername.c_str(),mqttPassword.c_str()) : mqttClient.connect(clientId.c_str());
     if(ok) {
+      mqttNetworkClient.setNoDelay(true);   // small publishes + delayed ACK on a slow link stalled the UI for seconds
       mqttClient.subscribe((mqttBaseTopic+"/command/#").c_str());
       mqttClient.subscribe((mqttBaseTopic+"/set").c_str());
       mqttSettingsDirty = true;
       mqttDiscoveryDirty = true;
     }
   }
-  if (!mqttClient.connected()) return;
+  if (!mqttClient.connected()) {
+    if (millis() - workStart > 1500UL) { mqttBackoffUntil = millis() + 20000UL; mqttPublishGapMs = 5000; }
+    return;
+  }
   mqttClient.loop();
   if (mqttDiscoveryDirty) publishHomeAssistantDiscovery();
   if (mqttSettingsDirty) publishMqttSettings();
-  if(nowMs-lastMqttPublish >= 1000UL) {
+  if(nowMs-lastMqttPublish >= mqttPublishGapMs) {
     lastMqttPublish=nowMs;
     publishMqttState();
+  }
+  // On a weak Wi-Fi link a blocking publish can stall the whole UI for seconds:
+  // drop the connection, back off, and publish less often.
+  uint32_t spent = millis() - workStart;
+  if (spent > 1500UL) {
+    Serial.printf("[mqtt] link too slow (%lu ms, rssi %d): backing off\n", (unsigned long)spent, WiFi.RSSI());
+    mqttClient.disconnect();
+    mqttBackoffUntil = millis() + 20000UL;
+    mqttPublishGapMs = min<uint32_t>(mqttPublishGapMs * 2, 10000UL);
   }
 }
 
@@ -9176,6 +9312,8 @@ String sdUploadMessage;
 static const size_t SD_UPLOAD_BUF = 32768;
 uint8_t* sdUploadBuf = nullptr;
 size_t sdUploadFill = 0;
+volatile bool sdRawBusy = false;            // the raw upload runs in its own task; the loop only draws the progress
+volatile uint32_t sdRawReceived = 0, sdRawTotal = 0;
 
 void sdUploadFlush() {
   if (!sdUploadFill || !sdUploadFile) { sdUploadFill = 0; return; }
@@ -9333,6 +9471,7 @@ void sdRawHandle() {
   String target = dir == "/" ? "/" + name : dir + "/" + name;
   lastUserActivity = millis();
   WiFi.setSleep(false);
+  sdRawReceived = 0; sdRawTotal = contentLength; sdRawBusy = true;
   bool failed = false;
   {
     listen::SdLock lock;
@@ -9342,7 +9481,7 @@ void sdRawHandle() {
   }
   uint32_t received = 0, lastData = millis();
   sdUploadFill = 0; sdUploadMessage = "";
-  while (!failed && received < contentLength && c.connected() && millis() - lastData < 20000UL) {
+  while (!failed && sdRawStarted && received < contentLength && c.connected() && millis() - lastData < 20000UL) {
     int avail = c.available();
     if (avail <= 0) { taskYIELD(); continue; }        // no 1 ms sleep: that alone capped the speed
     size_t room = SD_UPLOAD_BUF - sdUploadFill;
@@ -9352,7 +9491,7 @@ void sdRawHandle() {
     lastData = millis();
     sdUploadFill += n; received += n;
     if (sdUploadFill == SD_UPLOAD_BUF) { sdUploadFlush(); if (!sdUploadFile) failed = true; }
-    sdUploadPump(received, (int)contentLength);
+    sdRawReceived = received;
   }
   sdUploadFlush();
   if (!sdUploadFile) failed = true;
@@ -9366,9 +9505,18 @@ void sdRawHandle() {
     } else SD.remove(SD_UPLOAD_TMP);
   }
   Serial.printf("[sd] fast upload %s %u/%u bytes %s\n", name.c_str(), (unsigned)received, (unsigned)contentLength, ok ? "ok" : "FAILED");
+  sdRawBusy = false;
   sdRawReply(c, ok ? 200 : 500, ok ? "ok" : "upload failed");
   c.stop();
   if (screenNow == Screen::Clock && !screenSleeping) { drawClock(true); drawAstronaut(); }
+}
+
+// Receives raw uploads on core 0 so the clock, touch and the other screens keep working meanwhile.
+void sdRawTask(void*) {
+  for (;;) {
+    if (sdRawStarted && !netPaused && WiFi.status() == WL_CONNECTED) sdRawHandle();
+    vTaskDelay(pdMS_TO_TICKS(sdRawStarted ? 5 : 100));
+  }
 }
 
 void setupSdWebRoutes() {
@@ -9900,7 +10048,7 @@ void setup() {
 
 // Report any loop section that blocks the UI for more than 300 ms.
 #define SLOW_SECTION(name, code) do { uint32_t _t0 = millis(); code; uint32_t _dt = millis() - _t0; \
-  if (_dt > 300) Serial.printf("[slow] %s took %lu ms\n", name, (unsigned long)_dt); } while (0)
+  if (_dt > 300) Serial.printf("[slow] %s took %lu ms rssi %d\n", name, (unsigned long)_dt, WiFi.RSSI()); } while (0)
 
 // Is the home network reachable? Try the Home Assistant / MQTT host briefly.
 void checkHomeLan(uint32_t nowMs) {
@@ -9978,7 +10126,11 @@ void pauseNetwork() {
   if (hassAssistSocketStarted) { hassAssistWebSocket.disconnect(); hassAssistSocketStarted = false; hassAssistSocketConnected = false; hassAssistAuthenticated = false; }
   if (mqttClient.connected()) mqttClient.disconnect();
   if (settingsServerReady) { settingsServer.stop(); settingsServerStopped = true; }
-  if (sdRawStarted) { sdRawServer.end(); sdRawStarted = false; }
+  if (sdRawStarted) {
+    sdRawStarted = false;                                 // the upload task sees this and stops
+    for (int i = 0; i < 60 && sdRawBusy; ++i) delay(50);
+    sdRawServer.end();
+  }
   wifiPaused = true;
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
@@ -10034,7 +10186,8 @@ void leaveListenMode() {
 
 void loop() {
   M5.update();
-  if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); if (sdRawStarted) sdRawHandle(); }
+  if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); }
+  if (sdRawBusy) sdUploadPump(sdRawReceived, (int)sdRawTotal);
   if (companionWebSocketMode) { companionWebSocket.loop(); probeAndPreferLocalCompanion(millis()); }
   if (!companionWebSocketMode && companionClient.connected()) {
     while (companionClient.available()) processCompanionLine(companionClient.readStringUntil('\n'));
@@ -10119,6 +10272,7 @@ void loop() {
     meditationElapsedBeforeRun = meditationDurationSeconds;
     meditationState = MeditationState::Done;
     meditationLightEventStarted = nowMs;
+    lastUserActivity = nowMs;   // the standby timer starts counting only now, so the screen stays on for the end bell
     playMeditationSound(meditationEndSound, meditationEndVolume);
     drawMeditation();
   }
@@ -10127,7 +10281,7 @@ void loop() {
   if (listenModeActive && (screenNow != Screen::Listen || alarmActive >= 0)) leaveListenMode();   // e.g. an alarm took the screen
   listenMaintain(nowMs);
   updateAlarmBaseLights(nowMs);
-  if (!screenSleeping && alarmActive < 0 && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
+  if (!screenSleeping && alarmActive < 0 && meditationState != MeditationState::Running && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
     sleepDisplay(nowMs, false);   // standby timer
   }
   checkMotionWake(nowMs);
