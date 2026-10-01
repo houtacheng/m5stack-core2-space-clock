@@ -6995,12 +6995,7 @@ void drawListenRowText(const String& text, int y, int left, uint16_t color, uint
 void drawListenBrowse() {
   M5.Display.fillScreen(calTheme.bg);
   useUIFont(1);
-  bool atRoot = listenLoc == "/";
-  int titleLeft = 10;
-  if (!atRoot) {
-    drawListenPill(6, 3, 54, "◀ 返回");
-    titleLeft = 66;
-  }
+  int titleLeft = 10;   // no back button: swipe left to go up one folder
   M5.Display.setTextDatum(middle_left);
   M5.Display.setTextColor(calTheme.title, calTheme.bg);
   bool pill = listenHasMp3();
@@ -7589,8 +7584,7 @@ void handleListenTap(int x, int y) {
   }
   if (listenView == ListenView::Browse) {
     if (y < 30) {
-      if (x < 62 && listenLoc != "/") { haptic(12); listenGoTo(listenParentLoc(listenLoc)); }
-      else if (x >= 182 && x < 288 && listenHasMp3()) {
+      if (x >= 182 && x < 288 && listenHasMp3()) {
         haptic(12);
         String key = listenKeyForLoc(listenLoc);
         listen::setMode(key, (listen::modeFor(key) + 1) % 4);
@@ -8014,6 +8008,17 @@ void handleTouch() {
         lastSetDraw = millis();
         drawListenSettingBody();
       }
+      return;
+    }
+  }
+  if (screenNow == Screen::Listen && listenView == ListenView::Browse && !screenSleeping && !wakeTouchConsumed
+      && t.wasReleased() && !pressHandled && listenLoc != "/") {
+    int dx = (int)t.x - pressX, dy = (int)t.y - pressY;
+    if (dx <= -60 && abs(dy) < 60 && abs(dx) > 2 * abs(dy)) {      // swipe left = back (up one folder)
+      pressHandled = true;
+      haptic(15);
+      lastUserActivity = millis();
+      listenGoTo(listenParentLoc(listenLoc));
       return;
     }
   }

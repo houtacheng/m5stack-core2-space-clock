@@ -1,7 +1,7 @@
 {
-  "version": "2.9.40",
+  "version": "3.0.11",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "da0db0c03571c3777631cae532643f85f0d6600d4905cd5d3a6c439273d239a8",
-  "size": 4915536,
-  "notes": "Night light LED follows the brightness slider, power button turns the screen off/on, choose touch or button to wake, message bubbles show colour-coded counts, Teams messages no longer missed and Sync checks Teams immediately."
+  "sha256": "2726698ef3659c2fc91c76875d0076b0d335db214b00b6f5aa30b12f927883b6",
+  "size": 5955456,
+  "notes": "Listening mode: SD-card MP3 player with folders, playlists, loop modes, speed 0.5X-2X, Bluetooth headphones or speaker, web SD file browser. Separate manual/auto screen-off settings, no standby screen-off during meditation, MQTT stall guard for weak Wi-Fi."
 }

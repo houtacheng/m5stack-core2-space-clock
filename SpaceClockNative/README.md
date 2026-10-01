@@ -56,6 +56,8 @@ the blue pill until it dissolves on Matrix. Snooze remains available.
 - MQTT state publishing and remote modification of settings
 - Push-to-talk Home Assistant Assist using the built-in microphone and speaker
 - GitHub firmware checks plus optional scheduled automatic update
+- Listening mode (swipe left on the clock): MP3 player for the SD card with folders, playlists, loop/shuffle modes, per-file speed (0.5X–2X, pitch preserved), draggable progress and volume, configurable skip seconds, Bluetooth headphones (AirPods etc., remembered and auto-connected, headphone buttons work) or the built-in speaker; a web SD file browser at `/sd` (upload, rename, move, delete). Wi-Fi is switched off while listening mode is open
+- Separate screen-off behaviour for the power button and for the standby timer (LED and wake mode each); the standby timer never blanks the screen during a meditation countdown
 
 ## First setup
 
@@ -146,6 +148,12 @@ local Wi-Fi credentials are excluded from the binary:
 ```sh
 bash tools/build_public.sh
 ```
+
+Listening mode uses Bluetooth Classic, which does not fit the stock SDK's IRAM:
+the script runs `tools/make_bt_sdk.py` to create a patched SDK copy under
+`.arduino-build/sdk-esp32` and builds with `compiler.sdk.path` pointing to it and with
+`-O2` (needed for real-time 2X playback). It needs the ESP32-A2DP library
+(pschatzmann) from GitHub.
 
 The script validates embedded font bitmaps and uses
 `compiler.cpp.extra_flags=-DSPACE_CLOCK_PUBLIC_BUILD`. **Do not replace
