@@ -1010,6 +1010,28 @@ void startWifiProfileScan(uint32_t nowMs) {
   wifiRecoveryPhaseStartedAt = nowMs;
 }
 
+// Every network the clock joins successfully is remembered in a free profile slot
+// (hotspot setup, the legacy stored network, or a typed-in one), so moving between
+// places never forgets the earlier networks. A full list is left untouched.
+void rememberCurrentWifi() {
+  String ssid = WiFi.SSID();
+  if (!ssid.length()) return;
+  String password = WiFi.psk();
+  int freeSlot = -1;
+  for (int i = 0; i < SAVED_WIFI_COUNT; ++i) {
+    if (savedWifiSsids[i] == ssid) {
+      if (password.length() && savedWifiPasswords[i] != password) { savedWifiPasswords[i] = password; saveSettings(); Serial.printf("[wifi] updated the password of '%s'\n", ssid.c_str()); }
+      return;
+    }
+    if (freeSlot < 0 && !savedWifiSsids[i].length()) freeSlot = i;
+  }
+  if (freeSlot < 0) { Serial.printf("[wifi] '%s' not remembered: all %d profiles are in use\n", ssid.c_str(), (int)SAVED_WIFI_COUNT); return; }
+  savedWifiSsids[freeSlot] = ssid;
+  savedWifiPasswords[freeSlot] = password;
+  saveSettings();
+  Serial.printf("[wifi] remembered '%s' as profile %d\n", ssid.c_str(), freeSlot + 1);
+}
+
 void maintainSavedWifi(uint32_t nowMs) {
   if (wifiPaused) return;
   static wl_status_t lastLoggedStatus = (wl_status_t)255;
@@ -1023,6 +1045,7 @@ void maintainSavedWifi(uint32_t nowMs) {
   if (WiFi.status() == WL_CONNECTED) {
     bool justConnected = !wifiWasConnected;
     wifiWasConnected = true;
+    if (justConnected) rememberCurrentWifi();
     wifiDefaultFallbackAttempted = false;
     wifiRecoveryPhase = WifiRecoveryPhase::Primary;
     wifiRecoveryPhaseStartedAt = nowMs;
