@@ -199,7 +199,7 @@ def add(envelope):
         "from": "我" if own else (envelope.get("sourceName") or envelope.get("sourceNumber") or ""),
         "own": own,
         "group": group["name"] if group else "",
-        "text": text[:600],
+        "text": text[:1000],
         "attachments": attachments,
         "read": own,  # own messages are read; incoming stay unread until opened
         "_to": (group or {}).get("id") or peer_number,
@@ -406,7 +406,7 @@ def teams_add(chat, msg):
     name = "Teams · " + teams_chat_name(chat)
     item = {"chat": "teams:" + chat["id"], "chat_name": name, "ts": ts,
             "from": "我" if own else (sender.get("displayName") or "Teams"), "own": own,
-            "group": name if chat.get("chatType") != "oneOnOne" else "", "text": text[:600],
+            "group": name if chat.get("chatType") != "oneOnOne" else "", "text": text[:1000],
             "attachments": attachments, "read": own, "_to": "teams:" + chat["id"], "_sender": None,
             "_source": "teams", "_teams_id": msg.get("id"), "_created": msg.get("createdDateTime", "")}
     with lock:

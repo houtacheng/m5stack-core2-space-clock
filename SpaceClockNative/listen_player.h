@@ -458,7 +458,9 @@ static void decodeTask(void* arg) {
   Serial.printf("[listen] file opened %u ms after the request\n", (unsigned)(millis() - startRequestedMs));
   bool firstSound = false;
   HMP3Decoder dec = f ? newDecoder() : nullptr;
-  const size_t INBUF = 6 * 1024, SLOT = 2816;   // 64 ms per slot at 44.1 kHz: cushion against SD / Wi-Fi hiccups
+  // Cushions against SD stalls and busy moments (2X playback has little CPU headroom): a 16 KB read-ahead
+  // that is topped up below 8 KB, and 139 ms speaker slots at 44.1 kHz (two queued).
+  const size_t INBUF = 16 * 1024, LOW_WATER = 8 * 1024, SLOT = 6144;
   uint8_t* in = (uint8_t*)heap_caps_malloc(INBUF, MALLOC_CAP_SPIRAM);
   // Internal RAM is scarce while Bluetooth runs: keep the buffers in PSRAM.
   int16_t* pcm = (int16_t*)heap_caps_malloc(1152 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -467,7 +469,7 @@ static void decodeTask(void* arg) {
   Wsola* ws = new Wsola();
   bool ok = f && dec && in && pcm && mono && out && ws;
   if (!ok) Serial.printf("[listen] cannot start %s\n", t.path.c_str());
-  size_t have = 0;
+  size_t have = 0, off = 0;   // `have` bytes of undecoded MP3 start at in + off
   bool eof = false, flushed = false, wsActive = false, wsFinished = false, started = false;
   int slot = 0, acc = 0, rate = 44100;
   int64_t startUs = esp_timer_get_time(), busyUs = 0, waitUs = 0;
@@ -549,6 +551,7 @@ static void decodeTask(void* arg) {
   while (ok && !stopReq) {
     int64_t iterStart = esp_timer_get_time(), waitBefore = waitUs;
     lbt::wantAudio = !paused && !seekReq;
+    lbt::fillCap = SPEEDS[usedSpeed] == 1.0f ? 16384 : 28672;
     if (paused && pausedByLink && lbt::connected()) { paused = false; pausedByLink = false; }   // the headphones are back
     if (paused) {
       if (!flushed) {
@@ -564,7 +567,7 @@ static void decodeTask(void* arg) {
     if (seekReq) {
       float frac = constrain((float)seekFrac, 0.0f, 0.995f);
       { SdLock lock; f.seek(dataStart + (size_t)((totalBytes - dataStart) * frac)); }
-      have = 0; eof = false; acc = 0; wsFinished = false;
+      have = 0; off = 0; eof = false; acc = 0; wsFinished = false;
       if (wsActive) ws->reset();
       seekReq = false;
       lbt::fadeTarget = 0.0f; if (lbt::connected()) vTaskDelay(pdMS_TO_TICKS(50));
@@ -586,7 +589,8 @@ static void decodeTask(void* arg) {
       if (stopReq || paused || seekReq) continue;
     }
 
-    if (have < 2048 && !eof) {
+    if (have < LOW_WATER && !eof) {
+      if (off) { memmove(in, in + off, have); off = 0; }
       size_t n;
       { SdLock lock; n = f.read(in + have, INBUF - have); }
       if (n == 0) eof = true; else have += n;
@@ -597,17 +601,17 @@ static void decodeTask(void* arg) {
       if (acc) emit(acc);
       break;
     }
-    int sync = MP3FindSyncWord(in, (int)have);
-    if (sync < 0) { have = 0; continue; }   // next pass reads more or flushes at the end
-    if (sync > 0) { memmove(in, in + sync, have - sync); have -= sync; }
-    unsigned char* ptr = in;
+    int sync = MP3FindSyncWord(in + off, (int)have);
+    if (sync < 0) { have = 0; off = 0; continue; }   // next pass reads more or flushes at the end
+    if (sync > 0) { off += sync; have -= sync; }
+    unsigned char* ptr = in + off;
     int bytesLeft = (int)have;
     int r = MP3Decode(dec, &ptr, &bytesLeft, pcm, 0);
     size_t used = have - bytesLeft;
     if (used == 0) used = 1;
-    memmove(in, in + used, have - used);
+    off += used;
     have -= used;
-    if (r != ERR_MP3_NONE) { ++decodeErrors; if (eof && have < 4) have = 0; continue; }
+    if (r != ERR_MP3_NONE) { ++decodeErrors; if (eof && have < 4) { have = 0; off = 0; } continue; }
     MP3FrameInfo info; MP3GetLastFrameInfo(dec, &info);
     bitrate = info.bitrate;
     int ch = max(1, info.nChans);

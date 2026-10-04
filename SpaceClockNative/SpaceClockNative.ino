@@ -74,7 +74,7 @@ struct SignalMessage {
   char group[40];
   char chat[128];     // conversation key (group id, phone number, or teams:<chat id> ~100 bytes)
   char chatName[40];  // conversation title
-  char text[400];
+  char text[3200];   // up to ~1000 CJK characters (3 bytes each) so long messages are not cut off
 };
 String signalLanUrl, signalPublicUrl, signalToken;
 SignalMessage* signalMessages = nullptr;  // ring buffer in PSRAM, newest at the end
@@ -575,7 +575,7 @@ static const char* const EMOTION_GROUNDING_ACTIONS[] = {
   "踩地感受支撐", "看固定物30秒", "慢慢數呼吸"
 };
 
-void useUIFont(uint8_t scale = 1) {
+void useUIFont(float scale = 1) {
   M5.Display.setFont(&SourceHanSansTC_UI8pt8b);
   M5.Display.setTextSize(scale);
 }
@@ -646,6 +646,16 @@ static constexpr int SETTINGS_ROW_PITCH = 44;
 int settingsRowAt(int y) {
   if (y < SETTINGS_ROW_TOP || y >= SETTINGS_ROW_TOP + 4 * SETTINGS_ROW_PITCH || y >= 210) return -1;
   return (y - SETTINGS_ROW_TOP) / SETTINGS_ROW_PITCH;
+}
+
+// The message list: 3 taller rows per page (the preview line is drawn at
+// double size), so it needs its own row metrics rather than settingsRowAt's.
+static constexpr int SIGNAL_LIST_ROWS = 3;
+static constexpr int SIGNAL_LIST_ROW_TOP = 39;
+static constexpr int SIGNAL_LIST_ROW_PITCH = 58;
+int signalListRowAt(int y) {
+  if (y < SIGNAL_LIST_ROW_TOP || y >= SIGNAL_LIST_ROW_TOP + SIGNAL_LIST_ROWS * SIGNAL_LIST_ROW_PITCH || y >= 210) return -1;
+  return (y - SIGNAL_LIST_ROW_TOP) / SIGNAL_LIST_ROW_PITCH;
 }
 void drawSettingsRow(uint8_t index, const String& label, const String& value, int32_t swatch = -1) {
   int y = SETTINGS_ROW_TOP + index * SETTINGS_ROW_PITCH;
@@ -6353,12 +6363,38 @@ void drawSignalSyncButton(const char* label = "同步") {
   M5.Display.drawString(label, 289, 16);
 }
 
+// Message text is drawn at the UI font's native 16 px size (1:1, no scaling). The helper keeps
+// the old name/shape so the callers can switch size again by changing these constants.
+static constexpr float SMOOTH_ZOOM = 1.0f;
+static constexpr int SMOOTH_LINE_1X = 24;   // line pitch of the full-message page
+static constexpr int SMOOTH_LINE = 20;      // line pitch inside a chat bubble
+
+// Draw `count` lines of text with its top-left corner at screen (x, y), clipped to `w1x` wide.
+// Colours must match what is behind the text.
+void drawSmoothText(const String* lines, int count, int x, int y, int w1x, uint16_t fg, uint16_t bg, int lineH1x = SMOOTH_LINE_1X) {
+  if (count <= 0 || w1x <= 0) return;
+  useUIFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(fg, bg);
+  M5.Display.setClipRect(x, y, w1x, count * lineH1x);
+  for (int k = 0; k < count; ++k) M5.Display.drawString(lines[k], x, y + k * lineH1x);
+  M5.Display.clearClipRect();
+}
+
+// Cut a UTF-8 string to at most maxBytes without splitting a character.
+String utf8Head(const String& text, size_t maxBytes) {
+  if (text.length() <= maxBytes) return text;
+  size_t cut = maxBytes;
+  while (cut > 0 && ((uint8_t)text[cut] & 0xC0) == 0x80) --cut;
+  return text.substring(0, cut);
+}
+
 void drawSignalList() {
   if (screenNow != Screen::Messages) return;
   applyCalendarTheme();
   int chats[SIGNAL_MAX_CHATS];
   int chatCount = signalMessages ? signalConversations(chats, SIGNAL_MAX_CHATS) : 0;
-  int pages = max(1, (chatCount + 3) / 4);
+  int pages = max(1, (chatCount + SIGNAL_LIST_ROWS - 1) / SIGNAL_LIST_ROWS);
   if (signalListPage >= pages) signalListPage = pages - 1;
   M5.Display.fillScreen(calTheme.bg);
   useUIMediumFont();
@@ -6383,14 +6419,15 @@ void drawSignalList() {
     M5.Display.setTextColor(calTheme.muted, calTheme.bg);
     M5.Display.drawString(signalConfigured() ? "尚無訊息" : "請先在網頁後台「Signal」填入網址與權杖", 160, 120);
   }
-  for (int row = 0; row < 4; ++row) {
-    int k = signalListPage * 4 + row;
+  for (int row = 0; row < SIGNAL_LIST_ROWS; ++row) {
+    int k = signalListPage * SIGNAL_LIST_ROWS + row;
     if (k >= chatCount) break;
     const SignalMessage& m = signalMessages[chats[k]];
     int unread = signalChatUnread(m.chat);
-    int y = SETTINGS_ROW_TOP + row * SETTINGS_ROW_PITCH;
+    int y = SIGNAL_LIST_ROW_TOP + row * SIGNAL_LIST_ROW_PITCH;
     uint16_t fill = row & 1 ? calTheme.panelAlt : calTheme.panel;
-    M5.Display.fillRoundRect(6, y, 308, SETTINGS_ROW_PITCH - 4, 7, fill);
+    M5.Display.fillRoundRect(6, y, 308, SIGNAL_LIST_ROW_PITCH - 4, 7, fill);
+    useUIFont(1);
     M5.Display.setTextDatum(top_left);
     M5.Display.setTextColor(unread ? calTheme.text : calTheme.accent, fill);
     M5.Display.setClipRect(12, y, 200, 20);
@@ -6405,12 +6442,10 @@ void drawSignalList() {
       M5.Display.setTextColor(TFT_BLACK, 0xFD20);
       M5.Display.drawString(String(unread), 293, y + 10);
     }
+    // Preview content drawn smoothly at medium size; the title/time above stay normal.
     String preview = m.own ? String("我：") + signalBodyText(m) : (m.group[0] ? String(m.from) + "：" + signalBodyText(m) : signalBodyText(m));
-    M5.Display.setTextDatum(top_left);
-    M5.Display.setTextColor(unread ? calTheme.text : calTheme.muted, fill);
-    M5.Display.setClipRect(12, y + 19, 296, 20);
-    M5.Display.drawString(preview, 12, y + 19);
-    M5.Display.clearClipRect();
+    String one[1] = {utf8Head(preview, 120)};
+    drawSmoothText(one, 1, 12, y + 20, (int)(296 / SMOOTH_ZOOM), unread ? calTheme.text : calTheme.muted, fill, 18);
   }
   drawCalendarBottomBar(signalListPage ? "上一頁" : "", signalListPage + 1 < pages ? "下一頁" : "", "返回");
 }
@@ -6525,13 +6560,17 @@ void drawSignalDetail() {
     const SignalMessage& m = signalMessages[i];
     if (signalChatKey != m.chat) continue;
     if (skipped++ < signalChatScroll) continue;
+    // Bubble content is drawn smoothly at medium size for readability; the time/sender
+    // meta line stays at normal size.
+    useUIFont(1);
     String lines[5];
-    int n = signalWrap(signalBodyText(m), 196, lines, 5);
+    const int wrapW = (int)(220 / SMOOTH_ZOOM);
+    int n = signalWrap(signalBodyText(m), wrapW, lines, 5);
     int width = 0;
-    for (int k = 0; k < n; ++k) width = max(width, (int)M5.Display.textWidth(lines[k]));
+    for (int k = 0; k < n; ++k) width = max(width, (int)(M5.Display.textWidth(lines[k]) * SMOOTH_ZOOM + 0.5f));
     String meta = (isGroup && !m.own ? String(m.from) + " · " : String("")) + signalWhenText(m.when);
     int bubbleW = max(width, (int)M5.Display.textWidth(meta)) + 16;
-    int bubbleH = n * 20 + 26;
+    int bubbleH = n * SMOOTH_LINE + 26;
     y -= bubbleH + 4;
     if (y < 34 - bubbleH) break;
     int x = m.own ? 282 - bubbleW : 38;  // leave the edge strips for paging
@@ -6541,7 +6580,7 @@ void drawSignalDetail() {
     M5.Display.setTextColor(m.own ? calTheme.todayText : calTheme.muted, fill);
     M5.Display.drawString(meta, x + 8, y + 3);
     M5.Display.setTextColor(m.own ? calTheme.todayText : calTheme.text, fill);
-    for (int k = 0; k < n; ++k) M5.Display.drawString(lines[k], x + 8, y + 22 + k * 20);
+    drawSmoothText(lines, n, x + 8, y + 22, wrapW + 2, m.own ? calTheme.todayText : calTheme.text, fill, SMOOTH_LINE);
     if (signalBubbleHitCount < 12) signalBubbleHits[signalBubbleHitCount++] = {(int16_t)x, (int16_t)max(y, 34), (int16_t)(x + bubbleW), (int16_t)(y + bubbleH), (int16_t)i};
     ++signalChatVisible;
     if (y < 34) break;
@@ -6558,30 +6597,32 @@ void drawSignalDetail() {
 }
 
 // One message in full, paged; tap right half = next page, left half = previous.
+// Body text is drawn smoothly at medium size (drawSmoothText) for easier reading; a
+// long message (up to ~1000 CJK characters) needs many lines, so `lines` is
+// static rather than a large stack array.
 void drawSignalFull() {
   if (screenNow != Screen::MessageFull || signalFullIndex < 0 || signalFullIndex >= signalMessageCount) return;
   applyCalendarTheme();
   const SignalMessage& m = signalMessages[signalFullIndex];
   M5.Display.fillScreen(calTheme.bg);
   useUIFont(1);
-  String lines[48];
-  int n = signalWrap(signalBodyText(m), 300, lines, 48);
-  const int perPage = 7;
-  int pages = max(1, (n + perPage - 1) / perPage);
-  signalFullPage = constrain(signalFullPage, 0, pages - 1);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(calTheme.accent, calTheme.bg);
   M5.Display.setClipRect(10, 4, 230, 26);
   M5.Display.drawString(m.own ? String("我") : String(m.from), 10, 8);
   M5.Display.clearClipRect();
+  M5.Display.drawFastHLine(8, 32, 304, calTheme.border);
+  useUIFont(1);                             // wrap at 1x; the body is drawn smoothly scaled up
+  static String lines[160];
+  const int wrapW = (int)(300 / SMOOTH_ZOOM);
+  int n = signalWrap(signalBodyText(m), wrapW, lines, 160);
+  const int perPage = 7;
+  int pages = max(1, (n + perPage - 1) / perPage);
+  signalFullPage = constrain(signalFullPage, 0, pages - 1);
   M5.Display.setTextDatum(top_right);
   M5.Display.setTextColor(calTheme.muted, calTheme.bg);
   M5.Display.drawString(signalWhenText(m.when) + "  " + String(signalFullPage + 1) + "/" + String(pages), 312, 8);
-  M5.Display.drawFastHLine(8, 32, 304, calTheme.border);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(calTheme.text, calTheme.bg);
-  for (int k = 0; k < perPage && signalFullPage * perPage + k < n; ++k)
-    M5.Display.drawString(lines[signalFullPage * perPage + k], 10, 40 + k * 24);
+  drawSmoothText(lines + signalFullPage * perPage, min(perPage, n - signalFullPage * perPage), 10, 40, wrapW + 2, calTheme.text, calTheme.bg);
   drawCalendarBottomBar(signalFullPage ? "上一頁" : "", "返回", signalFullPage + 1 < pages ? "下一頁" : "");
 }
 
@@ -6703,15 +6744,15 @@ void handleSignalTap(int x, int y) {
   if (screenNow == Screen::Messages) {
     int chats[SIGNAL_MAX_CHATS];
     int chatCount = signalMessages ? signalConversations(chats, SIGNAL_MAX_CHATS) : 0;
-    int pages = max(1, (chatCount + 3) / 4);
+    int pages = max(1, (chatCount + SIGNAL_LIST_ROWS - 1) / SIGNAL_LIST_ROWS);
     if (y >= 210) {
       if (x < 107 && signalListPage) { --signalListPage; drawSignalList(); }
       else if (x >= 107 && x < 214 && signalListPage + 1 < pages) { ++signalListPage; drawSignalList(); }
       else if (x >= 214) { showMessageHub(); }
       return;
     }
-    int row = settingsRowAt(y);
-    int k = row < 0 ? -1 : signalListPage * 4 + row;
+    int row = signalListRowAt(y);
+    int k = row < 0 ? -1 : signalListPage * SIGNAL_LIST_ROWS + row;
     if (k >= 0 && k < chatCount) openSignalChat(signalMessages[chats[k]].chat);
   } else if (screenNow == Screen::MessageDetail) {
     if (y < 210) {

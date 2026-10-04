@@ -67,7 +67,7 @@ bool scanOnly = false;
 // Frame-aligned single-producer / single-consumer ring (decoder -> Bluetooth
 // callback). A byte-oriented stream buffer can split a stereo frame between two
 // transfers, which shifts every later sample and sounds like heavy static.
-static const uint32_t RING_FRAMES = 16384;     // ~370 ms of 44.1 kHz stereo (absorbs decoder stalls)
+static const uint32_t RING_FRAMES = 32768;     // ~740 ms of 44.1 kHz stereo (absorbs decoder stalls at 2X speed)
 uint32_t* ring = nullptr;                      // PSRAM; one frame = left | right << 16
 volatile uint32_t rHead = 0, rTail = 0;        // monotonic counters
 volatile bool flushReq = false;
@@ -75,6 +75,7 @@ volatile float fadeTarget = 1.0f;            // 0 = fade the output out, 1 = ful
 static float cbGain = 0.0f;                  // gain currently applied by the callback
 static bool cbWasSilent = true;              // the previous callback delivered silence
 inline uint32_t buffered() { return rHead - rTail; }
+volatile uint32_t fillCap = 16384;   // how far the decoder may run ahead (frames); larger at 2X where it has little headroom, smaller = less audio skipped on pause
 uint8_t volume127 = 76;
 volatile int8_t playRequest = 0;    // from the headphone buttons / in-ear sensor: 1 play, -1 pause
 volatile int8_t navRequest = 0;     // +1 next track, -1 previous track
@@ -320,7 +321,8 @@ size_t write(const int16_t* stereo, size_t frames, uint32_t waitMs) {
   uint32_t deadline = millis() + waitMs;
   size_t done = 0;
   while (done < frames) {
-    uint32_t freeFrames = RING_FRAMES - (rHead - rTail);
+    uint32_t used = rHead - rTail, cap = fillCap < RING_FRAMES ? fillCap : RING_FRAMES;
+    uint32_t freeFrames = used < cap ? cap - used : 0;
     if (freeFrames == 0) {
       if ((int32_t)(millis() - deadline) >= 0) break;
       vTaskDelay(1);
