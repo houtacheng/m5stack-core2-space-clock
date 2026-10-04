@@ -6399,9 +6399,15 @@ void drawSmoothText(const String* lines, int count, int x, int y, int w1x, uint1
   useUIFont(1);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(fg, bg);
-  M5.Display.setClipRect(x, y, w1x, count * lineH1x);
+  // Keep the caller's clip rectangle (chat bubbles are clipped below the header): intersect, then restore.
+  int32_t cx, cy, cw, ch;
+  M5.Display.getClipRect(&cx, &cy, &cw, &ch);
+  int x0 = max<int>(x, cx), y0 = max<int>(y, cy);
+  int x1 = min<int>(x + w1x, cx + cw), y1 = min<int>(y + count * lineH1x, cy + ch);
+  if (x1 <= x0 || y1 <= y0) return;
+  M5.Display.setClipRect(x0, y0, x1 - x0, y1 - y0);
   for (int k = 0; k < count; ++k) M5.Display.drawString(lines[k], x, y + k * lineH1x);
-  M5.Display.clearClipRect();
+  M5.Display.setClipRect(cx, cy, cw, ch);
 }
 
 // Cut a UTF-8 string to at most maxBytes without splitting a character.
