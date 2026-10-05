@@ -1,6 +1,6 @@
 #pragma once
 
-#define SPACE_CLOCK_VERSION "3.0.19"
+#define SPACE_CLOCK_VERSION "3.0.20"
 
 // Replacing build.extra_flags drops the board's PSRAM initialization define.
 // Fail at compile time rather than publishing a blank Matrix display again.

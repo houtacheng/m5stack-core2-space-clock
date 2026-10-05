@@ -10258,7 +10258,9 @@ void enterListenMode() {
   M5.Display.setTextDatum(middle_center);
   M5.Display.setTextColor(calTheme.muted, calTheme.bg);
   M5.Display.drawString("進入聽法模式…", 160, 120);
+  uint32_t enterT0 = millis();
   pauseNetwork();
+  Serial.printf("[listen] network paused in %u ms\n", (unsigned)(millis() - enterT0));
   // The Bluetooth stack wants ~80 KB of heap and internal RAM is scarce: while
   // listening, every malloc of 256 bytes or more is served from PSRAM.
   setCpuFrequencyMhz(240);         // fixed for the whole session (changing it breaks the Bluetooth link)
@@ -10268,6 +10270,7 @@ void enterListenMode() {
   esp_log_level_set("BT_AV", ESP_LOG_VERBOSE); esp_log_level_set("BT_APP", ESP_LOG_VERBOSE);   // connection diagnostics (shown only in debug builds)
   lbt::loadSaved();
   if (lbt::preferred()) lbt::begin(lbt::saved.addr, lbt::saved.name);   // reconnect the remembered headphones
+  Serial.printf("[listen] listening mode entered in %u ms\n", (unsigned)(millis() - enterT0));
 }
 
 void leaveListenMode() {

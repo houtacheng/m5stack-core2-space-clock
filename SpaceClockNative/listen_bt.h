@@ -14,6 +14,9 @@ struct Device { String name; uint8_t addr[6]; int rssi; };
 // The library sleeps 10 s inside its stack-up handler before it connects (and
 // polls every 10 s afterwards). This copy of that handler starts connecting at
 // once and polls every 2 s.
+uint32_t beginMs = 0;                 // when begin() was called (connection timing log)
+bool firstAudioLogged = false;
+
 class LinkSource : public BluetoothA2DPSource {
  protected:
   void av_hdl_stack_evt(uint16_t event, void* p_param) override {
@@ -37,7 +40,7 @@ class LinkSource : public BluetoothA2DPSource {
       memcpy(peer_bd_addr, last_connection, ESP_BD_ADDR_LEN);
       connect_to(last_connection);
       s_a2d_state = APP_AV_STATE_CONNECTING;
-      Serial.println("[bt] connecting right away");
+      Serial.printf("[bt +%u ms] connecting right away\n", (unsigned)(millis() - beginMs));
     } else {
       s_a2d_state = APP_AV_STATE_DISCOVERING;
       esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
@@ -147,7 +150,7 @@ static void onConnection(esp_a2d_connection_state_t state, void*) {
   linkUp = state == ESP_A2D_CONNECTION_STATE_CONNECTED;
   connecting = state == ESP_A2D_CONNECTION_STATE_CONNECTING || state == ESP_A2D_CONNECTION_STATE_DISCONNECTING;
   status = linkUp ? "已連線" : (state == ESP_A2D_CONNECTION_STATE_CONNECTING ? "連線中…" : "未連線");
-  Serial.printf("[bt] connection state %d\n", (int)state);
+  Serial.printf("[bt +%u ms] connection state %d\n", (unsigned)(millis() - beginMs), (int)state);
   ++version;
 }
 
@@ -168,7 +171,7 @@ static void onKey(uint8_t key, bool released) {
 static void onAudioState(esp_a2d_audio_state_t state, void*) {
   audioState = (int)state;
   if (state == ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND) remoteSuspend = true;
-  Serial.printf("[bt] audio state %d\n", (int)state);
+  Serial.printf("[bt +%u ms] audio state %d\n", (unsigned)(millis() - beginMs), (int)state);
   ++version;
 }
 
@@ -196,6 +199,7 @@ static int32_t dataCb(Frame* frames, int32_t count) {
     if (wantAudio) { ++starveEvents; starveFrames += count - gotFrames; }
     cbWasSilent = true;
   }
+  if (gotFrames && !firstAudioLogged) { firstAudioLogged = true; Serial.printf("[bt +%u ms] first audio sent to the headphones\n", (unsigned)(millis() - beginMs)); }
   framesAudio += gotFrames; framesSilence += count - gotFrames;
   if ((int32_t)gotFrames < count) memset(frames + gotFrames, 0, (count - gotFrames) * 4);
   return count;
@@ -220,7 +224,7 @@ static void startTask(void*) {
   starting = false;
   startedAtMs = millis();
   status = scanOnly ? "掃描中…" : "連線中…";
-  Serial.printf("[bt] started (free internal %u)\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  Serial.printf("[bt +%u ms] stack started (free internal %u)\n", (unsigned)(millis() - beginMs), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   ++version;
   vTaskDelete(nullptr);
 }
@@ -236,6 +240,7 @@ bool begin(const uint8_t* addr, const String& name) {
   if (addr) memcpy(connectAddr, addr, 6);
   connectName = name;
   scanOnly = addr == nullptr;
+  beginMs = millis(); firstAudioLogged = false;
   running = true; starting = true; linkUp = false;
   status = "啟動中…";
   ++version;
