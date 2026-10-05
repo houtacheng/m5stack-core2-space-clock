@@ -19,6 +19,8 @@ bool firstAudioLogged = false;
 
 class LinkSource : public BluetoothA2DPSource {
  protected:
+  // connect_to() calls this before every attempt; the library default switches page scan off.
+  void set_scan_mode_connectable_default() override { esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE); }
   void av_hdl_stack_evt(uint16_t event, void* p_param) override {
     if (event != 0 /* BT_APP_EVT_STACK_UP */) { BluetoothA2DPSource::av_hdl_stack_evt(event, p_param); return; }
     esp_bt_gap_set_device_name(dev_name);
@@ -35,7 +37,9 @@ class LinkSource : public BluetoothA2DPSource {
     esp_a2d_source_init();
     esp_a2d_register_callback(&ccall_app_a2d_callback);
     esp_a2d_source_register_data_callback(&ccall_bt_app_a2d_data_cb);
-    set_scan_mode_connectable(false);
+    // Connectable (but not discoverable): headphones that were switched on or put in the ears page us
+    // by themselves, which is usually faster than waiting for our own paging to hit their page-scan window.
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
     if (reconnect_status == AutoReconnect && has_last_connection()) {
       memcpy(peer_bd_addr, last_connection, ESP_BD_ADDR_LEN);
       connect_to(last_connection);
