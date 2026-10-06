@@ -63,12 +63,36 @@ struct SdLock {
   ~SdLock() { xSemaphoreGiveRecursive(sdMutex()); }
 };
 
+// A card that dropped off the bus (contact, power dip) keeps `sdMounted` true forever and every access
+// fails: check that the root directory is really readable and mount again when it is not.
+static bool sdRootReadable() {
+  File r = SD.open("/");
+  bool ok = r && r.isDirectory();
+  if (r) r.close();
+  return ok;
+}
+
 bool mountSd() {
   SdLock lock;
-  if (sdMounted) return true;
+  if (sdMounted) {
+    if (sdRootReadable()) return true;
+    Serial.println("[sd] card not readable: mounting again");
+    SD.end();
+    sdMounted = false;
+    delay(50);
+  }
   SPI.begin(18, 38, 23, -1);
   sdMounted = SD.begin(4, SPI, 25000000);
   return sdMounted;
+}
+
+// Force a fresh mount (after a failed write).
+bool remountSd() {
+  SdLock lock;
+  SD.end();
+  sdMounted = false;
+  delay(100);
+  return mountSd();
 }
 
 static void loadSettings() {

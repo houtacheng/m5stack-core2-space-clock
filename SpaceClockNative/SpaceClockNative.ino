@@ -9419,7 +9419,18 @@ volatile uint32_t sdRawReceived = 0, sdRawTotal = 0;
 void sdUploadFlush() {
   if (!sdUploadFill || !sdUploadFile) { sdUploadFill = 0; return; }
   listen::SdLock lock;
-  if (sdUploadFile.write(sdUploadBuf, sdUploadFill) != sdUploadFill) { sdUploadMessage = "SD write failed (card full?)"; sdUploadFile.close(); }
+  size_t written = sdUploadFile.write(sdUploadBuf, sdUploadFill);
+  if (written != sdUploadFill) {
+    // The card may have dropped off the bus for a moment: mount again, reopen the partial file
+    // for appending and write what is missing once before giving up.
+    Serial.printf("[sd] write of %u bytes returned %u: trying to recover\n", (unsigned)sdUploadFill, (unsigned)written);
+    sdUploadFile.close();
+    if (listen::remountSd()) {
+      sdUploadFile = SD.open(SD_UPLOAD_TMP, FILE_APPEND);
+      if (sdUploadFile && sdUploadFile.write(sdUploadBuf + written, sdUploadFill - written) == sdUploadFill - written) written = sdUploadFill;
+    }
+    if (written != sdUploadFill) { sdUploadMessage = "SD write failed (card full?)"; if (sdUploadFile) sdUploadFile.close(); }
+  }
   sdUploadFill = 0;
 }
 
