@@ -29,6 +29,11 @@ void enterListenMode();
 void leaveListenMode();
 WiFiServer sdRawServer(8081);       // fast SD upload endpoint (see sdRawHandle)
 bool sdRawStarted = false;
+uint32_t sdWifiAwakeUntil = 0;             // the web SD page / an upload is in use: Wi-Fi power saving stays off
+volatile bool sdRawBusy = false;            // the raw upload runs in its own task; the loop only draws the progress
+// While files are being uploaded (or the SD page was used in the last 10 minutes) the clock must not go to
+// standby: no screen-off, no 80 MHz battery-saver clock, no Wi-Fi modem sleep.
+#define sdWebActive(nowMs) (sdRawBusy || (sdWifiAwakeUntil && (int32_t)((nowMs) - sdWifiAwakeUntil) < 0))   // a macro: a function here would move Arduino's generated prototypes above the type definitions
 volatile bool wifiPaused = false;  // Wi-Fi deliberately off (listening mode frees RAM for Bluetooth)
 #include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
@@ -1256,7 +1261,7 @@ void updatePowerSaveMode(uint32_t nowMs) {
   if (listenModeActive) return;   // the Bluetooth link needs a constant clock: listening mode runs at 240 MHz throughout
   uint32_t wantMhz = 160;
   if (listen::playing && (listen::SPEEDS[listen::speedCode] != 1.0f || lbt::connected())) wantMhz = 240;
-  else if (powerSaveMode && screenSleeping && !listen::playing) wantMhz = 80;
+  else if (powerSaveMode && screenSleeping && !listen::playing && !sdWebActive(nowMs)) wantMhz = 80;
   if (getCpuFrequencyMhz() != wantMhz) setCpuFrequencyMhz(wantMhz);
 }
 
@@ -9400,7 +9405,6 @@ String sdSizeText(uint32_t bytes) {
   return String(bytes) + " B";
 }
 
-uint32_t sdWifiAwakeUntil = 0;
 File sdUploadFile;
 String sdUploadTarget;
 static const char* SD_UPLOAD_TMP = "/.upload.tmp";   // written first, renamed when complete (a reset leaves no half file)
@@ -9410,7 +9414,6 @@ String sdUploadMessage;
 static const size_t SD_UPLOAD_BUF = 32768;
 uint8_t* sdUploadBuf = nullptr;
 size_t sdUploadFill = 0;
-volatile bool sdRawBusy = false;            // the raw upload runs in its own task; the loop only draws the progress
 volatile uint32_t sdRawReceived = 0, sdRawTotal = 0;
 
 void sdUploadFlush() {
@@ -9427,6 +9430,7 @@ void sdUploadPump(uint32_t received, int total = -1) {
   if (millis() - last < 900UL) return;
   last = millis();
   lastUserActivity = millis();
+  sdWifiAwakeUntil = millis() + 600000UL;   // uploading: no standby, no Wi-Fi sleep
   if (screenNow != Screen::Clock || screenSleeping || alarmActive >= 0) return;
   drawClock(false);
   if (total < 0) total = settingsServer.clientContentLength();
@@ -10218,7 +10222,13 @@ void netTask(void*) {
 void pauseNetwork() {
   if (netPaused) return;
   netPaused = true;
-  { NetLock lock; }                                     // let a running HTTPS request finish
+  // A background download in flight (calendar, messages) used to keep us waiting for up to 8 s.
+  // Dropping the Wi-Fi link resets its sockets, so the request fails and releases the lock at once.
+  if (netMutex) {
+    if (xSemaphoreTakeRecursive(netMutex, 0) == pdTRUE) xSemaphoreGiveRecursive(netMutex);
+    else { wifiPaused = true; WiFi.setAutoReconnect(false); WiFi.disconnect(false, false); }
+  }
+  { NetLock lock; }                                     // let the aborted HTTPS request unwind
   for (int i = 0; i < 60 && netTaskAlive; ++i) delay(50);   // the network task deletes itself
   stopCompanion();
   if (hassAssistSocketStarted) { hassAssistWebSocket.disconnect(); hassAssistSocketStarted = false; hassAssistSocketConnected = false; hassAssistAuthenticated = false; }
@@ -10377,12 +10387,13 @@ void loop() {
     playMeditationSound(meditationEndSound, meditationEndVolume);
     drawMeditation();
   }
+  if (sdRawBusy) sdWifiAwakeUntil = nowMs + 600000UL;      // a running upload keeps the window open
   if (sdWifiAwakeUntil && (int32_t)(nowMs - sdWifiAwakeUntil) >= 0) { sdWifiAwakeUntil = 0; WiFi.setSleep(true); }
   updatePowerSaveMode(nowMs);
   if (listenModeActive && (screenNow != Screen::Listen || alarmActive >= 0)) leaveListenMode();   // e.g. an alarm took the screen
   listenMaintain(nowMs);
   updateAlarmBaseLights(nowMs);
-  if (!screenSleeping && alarmActive < 0 && meditationState != MeditationState::Running && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
+  if (!screenSleeping && alarmActive < 0 && meditationState != MeditationState::Running && !sdWebActive(nowMs) && screenNow != Screen::NightLight && screenOffSeconds > 0 && nowMs - lastUserActivity >= (uint32_t)screenOffSeconds * 1000UL) {
     sleepDisplay(nowMs, false);   // standby timer
   }
   checkMotionWake(nowMs);

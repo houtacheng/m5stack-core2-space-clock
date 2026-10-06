@@ -19,8 +19,24 @@ bool firstAudioLogged = false;
 
 class LinkSource : public BluetoothA2DPSource {
  protected:
-  // connect_to() calls this before every attempt; the library default switches page scan off.
+  // connect_to() calls this before every attempt; the library default switches page scan off, which
+  // would stop a headphone that was switched on or put in the ears from connecting to us by itself.
   void set_scan_mode_connectable_default() override { esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE); }
+  void app_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) override {
+    if (event == ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT)
+      Serial.printf("[bt +%u ms] ACL link status %d (0 = up)\n", (unsigned)(millis() - beginMs), (int)param->acl_conn_cmpl_stat.stat);
+    BluetoothA2DPSource::app_gap_callback(event, param);
+  }
+  // While paging, the library polls "is the stream ready" on every heartbeat and treats the answer
+  // as proof of a finished connection; a failed page then went unnoticed until the next heartbeat
+  // (up to 2 s of silence per 5 s attempt). Ignore those polls and page again as soon as an attempt fails.
+  void bt_app_av_sm_hdlr(uint16_t event, void* param) override {
+    const uint16_t HEART_BEAT = 0xff00;
+    if (s_a2d_state == APP_AV_STATE_CONNECTING && (event == HEART_BEAT || event == ESP_A2D_MEDIA_CTRL_ACK_EVT)) return;
+    const bool wasPaging = s_a2d_state == APP_AV_STATE_CONNECTING;
+    BluetoothA2DPSource::bt_app_av_sm_hdlr(event, param);
+    if (wasPaging && event == ESP_A2D_CONNECTION_STATE_EVT && s_a2d_state == APP_AV_STATE_UNCONNECTED) handle_reconnect_logic();
+  }
   void av_hdl_stack_evt(uint16_t event, void* p_param) override {
     if (event != 0 /* BT_APP_EVT_STACK_UP */) { BluetoothA2DPSource::av_hdl_stack_evt(event, p_param); return; }
     esp_bt_gap_set_device_name(dev_name);
@@ -37,8 +53,6 @@ class LinkSource : public BluetoothA2DPSource {
     esp_a2d_source_init();
     esp_a2d_register_callback(&ccall_app_a2d_callback);
     esp_a2d_source_register_data_callback(&ccall_bt_app_a2d_data_cb);
-    // Connectable (but not discoverable): headphones that were switched on or put in the ears page us
-    // by themselves, which is usually faster than waiting for our own paging to hit their page-scan window.
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
     if (reconnect_status == AutoReconnect && has_last_connection()) {
       memcpy(peer_bd_addr, last_connection, ESP_BD_ADDR_LEN);
@@ -155,6 +169,8 @@ static void onConnection(esp_a2d_connection_state_t state, void*) {
   connecting = state == ESP_A2D_CONNECTION_STATE_CONNECTING || state == ESP_A2D_CONNECTION_STATE_DISCONNECTING;
   status = linkUp ? "已連線" : (state == ESP_A2D_CONNECTION_STATE_CONNECTING ? "連線中…" : "未連線");
   Serial.printf("[bt +%u ms] connection state %d\n", (unsigned)(millis() - beginMs), (int)state);
+  // The library only checks whether the stream can start on its next 2 s heartbeat; ask right away.
+  if (linkUp) esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
   ++version;
 }
 
@@ -255,6 +271,8 @@ bool begin(const uint8_t* addr, const String& name) {
 void end() {
   if (!running) return;
   for (int i = 0; i < 100 && starting; ++i) delay(50);
+  a2dp.set_auto_reconnect(false);               // no new paging attempt may start while we wind down
+  esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);   // and nobody may page us back mid-teardown
   // Hang up first and let the stack drain its queue: tearing the profile down while
   // events are still queued crashes it.
   if (linkUp) {
