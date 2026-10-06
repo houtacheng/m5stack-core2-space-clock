@@ -27,10 +27,10 @@ bool listenModeActive = false;
 size_t listenEnterThreshold = 256;   // malloc size from which PSRAM is preferred while listening (t:thr to experiment)
 void enterListenMode();
 void leaveListenMode();
-WiFiServer sdRawServer(8081);       // fast SD upload endpoint (see sdRawHandle)
+WiFiServer sdRawServer(8081);       // fast SD upload endpoint (see sdRawPump)
 bool sdRawStarted = false;
 uint32_t sdWifiAwakeUntil = 0;             // the web SD page / an upload is in use: Wi-Fi power saving stays off
-volatile bool sdRawBusy = false;            // the raw upload runs in its own task; the loop only draws the progress
+volatile bool sdRawBusy = false;            // a raw upload is in progress (stepped by sdRawPump from loop())
 // While files are being uploaded (or the SD page was used in the last 10 minutes) the clock must not go to
 // standby: no screen-off, no 80 MHz battery-saver clock, no Wi-Fi modem sleep.
 #define sdWebActive(nowMs) (sdRawBusy || (sdWifiAwakeUntil && (int32_t)((nowMs) - sdWifiAwakeUntil) < 0))   // a macro: a function here would move Arduino's generated prototypes above the type definitions
@@ -1056,11 +1056,7 @@ void maintainSavedWifi(uint32_t nowMs) {
     wifiRecoveryPhaseStartedAt = nowMs;
     if (!settingsServerReady) setupSettingsServer();
     else if (settingsServerStopped) { settingsServer.begin(); settingsServerStopped = false; }
-    if (!sdRawStarted) {
-      sdRawServer.begin(); sdRawStarted = true;
-      static bool taskStarted = false;
-      if (!taskStarted) { taskStarted = true; xTaskCreatePinnedToCore(sdRawTask, "sdRaw", 6144, nullptr, 1, nullptr, 0); }
-    }
+    if (!sdRawStarted) { sdRawServer.begin(); sdRawStarted = true; }
     if (justConnected) {
       // Arduino's hostByName() clears lwIP's DNS cache (without the TCPIP lock)
       // the first time after the IP changes. If SNTP is resolving at that
@@ -9551,10 +9547,38 @@ void sdRawReply(WiFiClient& c, int code, const char* text) {
   c.flush();
 }
 
-void sdRawHandle() {
+// The raw upload is a small state machine that the main loop() steps (no extra task): the display and the
+// SD card share one SPI bus, and writing the card from another thread while the loop draws corrupted it.
+// Each step reads for at most ~25 ms plus one 32 KB card write, so touch and the clock stay responsive.
+static WiFiClient sdRawClient;
+static String sdRawTarget, sdRawName;
+static uint32_t sdRawLastData = 0;
+static bool sdRawFailed = false;
+
+static void sdRawFinish() {
+  bool ok = !sdRawFailed && sdRawReceived == sdRawTotal;
+  sdUploadFlush();
+  if (!sdUploadFile) ok = false;
+  {
+    listen::SdLock lock;
+    if (sdUploadFile) sdUploadFile.close();
+    if (ok) {
+      if (SD.exists(sdRawTarget)) SD.remove(sdRawTarget);
+      ok = SD.rename(SD_UPLOAD_TMP, sdRawTarget);
+    } else SD.remove(SD_UPLOAD_TMP);
+  }
+  Serial.printf("[sd] fast upload %s %u/%u bytes %s\n", sdRawName.c_str(), (unsigned)sdRawReceived, (unsigned)sdRawTotal, ok ? "ok" : "FAILED");
+  sdRawBusy = false;
+  sdRawReply(sdRawClient, ok ? 200 : 500, ok ? "ok" : "upload failed");
+  sdRawClient.stop();
+  if (screenNow == Screen::Clock && !screenSleeping) { drawClock(true); drawAstronaut(); }
+}
+
+// Accept a connection and read its request line and headers.
+static void sdRawBegin() {
   WiFiClient c = sdRawServer.accept();
   if (!c) return;
-  c.setTimeout(8);
+  c.setTimeout(3);
   String request = c.readStringUntil('\n');
   uint32_t contentLength = 0;
   for (int i = 0; i < 40; ++i) {                      // headers
@@ -9581,55 +9605,40 @@ void sdRawHandle() {
   }
   if (!sdUploadBuf) sdUploadBuf = (uint8_t*)heap_caps_malloc(SD_UPLOAD_BUF, MALLOC_CAP_SPIRAM);
   if (!sdUploadBuf) { sdRawReply(c, 500, "no memory"); c.stop(); return; }
-  String target = dir == "/" ? "/" + name : dir + "/" + name;
+  sdRawClient = c;
+  sdRawName = name;
+  sdRawTarget = dir == "/" ? "/" + name : dir + "/" + name;
   lastUserActivity = millis();
   WiFi.setSleep(false);
   sdRawReceived = 0; sdRawTotal = contentLength; sdRawBusy = true;
-  bool failed = false;
+  sdRawFailed = false; sdRawLastData = millis();
+  sdUploadFill = 0; sdUploadMessage = "";
   {
     listen::SdLock lock;
     if (SD.exists(SD_UPLOAD_TMP)) SD.remove(SD_UPLOAD_TMP);
     sdUploadFile = SD.open(SD_UPLOAD_TMP, FILE_WRITE);
-    failed = !sdUploadFile;
+    sdRawFailed = !sdUploadFile;
   }
-  uint32_t received = 0, lastData = millis();
-  sdUploadFill = 0; sdUploadMessage = "";
-  while (!failed && sdRawStarted && received < contentLength && c.connected() && millis() - lastData < 20000UL) {
-    int avail = c.available();
-    if (avail <= 0) { taskYIELD(); continue; }        // no 1 ms sleep: that alone capped the speed
-    size_t room = SD_UPLOAD_BUF - sdUploadFill;
-    size_t want = min<size_t>(min<size_t>(avail, room), contentLength - received);
-    int n = c.read(sdUploadBuf + sdUploadFill, want);
-    if (n <= 0) { taskYIELD(); continue; }
-    lastData = millis();
-    sdUploadFill += n; received += n;
-    if (sdUploadFill == SD_UPLOAD_BUF) { sdUploadFlush(); if (!sdUploadFile) failed = true; }
-    sdRawReceived = received;
-  }
-  sdUploadFlush();
-  if (!sdUploadFile) failed = true;
-  bool ok = !failed && received == contentLength;
-  {
-    listen::SdLock lock;
-    if (sdUploadFile) sdUploadFile.close();
-    if (ok) {
-      if (SD.exists(target)) SD.remove(target);
-      ok = SD.rename(SD_UPLOAD_TMP, target);
-    } else SD.remove(SD_UPLOAD_TMP);
-  }
-  Serial.printf("[sd] fast upload %s %u/%u bytes %s\n", name.c_str(), (unsigned)received, (unsigned)contentLength, ok ? "ok" : "FAILED");
-  sdRawBusy = false;
-  sdRawReply(c, ok ? 200 : 500, ok ? "ok" : "upload failed");
-  c.stop();
-  if (screenNow == Screen::Clock && !screenSleeping) { drawClock(true); drawAstronaut(); }
+  if (sdRawFailed) sdRawFinish();
 }
 
-// Receives raw uploads on core 0 so the clock, touch and the other screens keep working meanwhile.
-void sdRawTask(void*) {
-  for (;;) {
-    if (sdRawStarted && !netPaused && WiFi.status() == WL_CONNECTED) sdRawHandle();
-    vTaskDelay(pdMS_TO_TICKS(sdRawStarted ? 5 : 100));
+// Called from loop().
+void sdRawPump() {
+  if (!sdRawStarted || netPaused) return;
+  if (!sdRawBusy) { sdRawBegin(); return; }
+  uint32_t t0 = millis();
+  while (!sdRawFailed && sdRawReceived < sdRawTotal && millis() - t0 < 25UL) {
+    int avail = sdRawClient.available();
+    if (avail <= 0) break;
+    size_t room = SD_UPLOAD_BUF - sdUploadFill;
+    size_t want = min<size_t>(min<size_t>(avail, room), sdRawTotal - sdRawReceived);
+    int n = sdRawClient.read(sdUploadBuf + sdUploadFill, want);
+    if (n <= 0) break;
+    sdRawLastData = millis();
+    sdUploadFill += n; sdRawReceived += n;
+    if (sdUploadFill == SD_UPLOAD_BUF) { sdUploadFlush(); if (!sdUploadFile) sdRawFailed = true; }
   }
+  if (sdRawFailed || sdRawReceived >= sdRawTotal || (!sdRawClient.connected() && !sdRawClient.available()) || millis() - sdRawLastData > 20000UL) sdRawFinish();
 }
 
 void setupSdWebRoutes() {
@@ -10247,7 +10256,7 @@ void pauseNetwork() {
   if (settingsServerReady) { settingsServer.stop(); settingsServerStopped = true; }
   if (sdRawStarted) {
     sdRawStarted = false;                                 // the upload task sees this and stops
-    for (int i = 0; i < 60 && sdRawBusy; ++i) delay(50);
+    if (sdRawBusy) { sdRawFailed = true; sdRawFinish(); }    // an upload in progress is abandoned
     sdRawServer.end();
   }
   wifiPaused = true;
@@ -10308,7 +10317,7 @@ void leaveListenMode() {
 
 void loop() {
   M5.update();
-  if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); }
+  if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); sdRawPump(); }
   if (sdRawBusy) sdUploadPump(sdRawReceived, (int)sdRawTotal);
   if (companionWebSocketMode) { companionWebSocket.loop(); probeAndPreferLocalCompanion(millis()); }
   if (!companionWebSocketMode && companionClient.connected()) {
