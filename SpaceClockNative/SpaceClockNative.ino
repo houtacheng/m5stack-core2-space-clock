@@ -241,6 +241,7 @@ uint8_t alarmLightMode = 0;
 bool nightLightEnabled = false;
 uint32_t nightLightColor = 0xFFF0C8;
 uint8_t nightLightBrightness = 18;
+uint8_t unreadLightBrightness = 15;   // peak brightness (%) of the light-blue glow for unread messages; 0 = off
 uint8_t nightLightMode = 0;
 uint16_t nightLightSeconds = 60;
 // A long press can temporarily force the night light on or off without
@@ -724,6 +725,7 @@ void saveSettings() {
   prefs.putBool("nightLight", nightLightEnabled);
   prefs.putUInt("nightColor", nightLightColor);
   prefs.putUChar("nightBri", nightLightBrightness);
+  prefs.putUChar("unreadBri", unreadLightBrightness);
   prefs.putUChar("nightMode", nightLightMode);
   prefs.putUShort("nightSecs", nightLightSeconds);
   prefs.putBool("mqttOn", mqttEnabled);
@@ -831,6 +833,7 @@ void loadSettings() {
   autoOffLed = prefs.getBool("autoLed", nightLightEnabled);
   nightLightColor = prefs.getUInt("nightColor", 0xFFF0C8) & 0xFFFFFF;
   nightLightBrightness = constrain((int)prefs.getUChar("nightBri", 18), 1, 100);
+  unreadLightBrightness = constrain((int)prefs.getUChar("unreadBri", 15), 0, 100);
   nightLightMode = constrain((int)prefs.getUChar("nightMode", 0), 0, 2);
   nightLightSeconds = constrain((int)prefs.getUShort("nightSecs", 60), 5, 3600);
   mqttEnabled = prefs.getBool("mqttOn", false);
@@ -4017,7 +4020,9 @@ void updateAlarmBaseLights(uint32_t nowMs) {
   lastAlarmLedUpdate = nowMs;
   uint32_t color = 0;
   uint8_t strength = 0;
+  const char* cause = "off";   // why the LEDs are lit (logged when it changes)
   if (alarmActive >= 0 && alarmLightEnabled) {
+    cause = "alarm";
     uint32_t age = nowMs - alarmLightEventStarted;
     if (alarmLightMode == 0 || alarmLightMode == 2) {
       if (alarmLightMode == 0 || age < 9000UL) {
@@ -4029,15 +4034,18 @@ void updateAlarmBaseLights(uint32_t nowMs) {
     }
     color = alarmLightColor;
   } else if (screenNow == Screen::NightLight) {
+    cause = "night-light screen";
     color = nightLightColor;
     strength = screenNightBrightness ? screenNightBrightness : nightLightBrightness;
   } else if (manualNightLightOverride) {
     if (manualNightLightActive) {
+      cause = "manual night light";
       color = nightLightColor;
       strength = nightLightBrightness;
     }
   } else if (meditationLightEnabled && (screenNow == Screen::Meditation || meditationState == MeditationState::Running || meditationState == MeditationState::Paused || meditationState == MeditationState::Done)) {
     uint32_t age = nowMs - meditationLightEventStarted;
+    cause = "meditation";
     if (meditationState == MeditationState::Ready || meditationState == MeditationState::Paused) {
       color = 0xFFE2A8; strength = 20;
     } else if (meditationState == MeditationState::Running && age < 650UL) {
@@ -4050,15 +4058,33 @@ void updateAlarmBaseLights(uint32_t nowMs) {
     }
   } else if (screenSleeping && (screenSleepManual ? manualOffLed : autoOffLed)) {
     uint32_t age = nowMs - screenSleepStarted;
+    cause = screenSleepManual ? "screen off (power button)" : "screen off (standby timer)";
     color = nightLightColor;
     if (nightLightMode == 0) strength = nightLightBrightness;
     else if (age < (uint32_t)nightLightSeconds * 1000UL) strength = nightLightBrightness;
     else if (nightLightMode == 2 && age < (uint32_t)nightLightSeconds * 1000UL + 5000UL)
       strength = nightLightBrightness * ((uint32_t)nightLightSeconds * 1000UL + 5000UL - age) / 5000UL;
+  } else if (signalUnread > 0 && unreadLightBrightness > 0 && !listenModeActive) {
+    // Unread messages (Signal or Teams): a soft light-blue glow that slowly breathes.
+    cause = "unread messages";
+    float phase = (nowMs % 4000UL) * (2.0f * PI / 4000.0f);
+    color = 0x7FC4FF;
+    uint8_t low = max<int>(1, unreadLightBrightness * 3 / 10);
+    strength = low + (uint8_t)((1.0f - cosf(phase)) * 0.5f * (unreadLightBrightness - low));
   }
   // Only the manual night light (long press on the right button) enables
   // the full-screen night light.
   nightLedShowing = alarmActive < 0 && !screenSleeping && manualNightLightOverride && manualNightLightActive;
+  {
+    static const char* lastCause = nullptr;
+    static bool lastLit = false;
+    bool lit = strength > 0;
+    if (cause != lastCause && (lit || lastLit || !lastCause)) {
+      Serial.printf("[led] %s (color %06X, strength %u%%)\n", lit ? cause : "off", (unsigned)color, (unsigned)strength);
+    }
+    if (cause != lastCause) lastCause = cause;
+    lastLit = lit;
+  }
   uint8_t r = ((color >> 16) & 255) * strength / 100;
   uint8_t g = ((color >> 8) & 255) * strength / 100;
   uint8_t b = (color & 255) * strength / 100;
@@ -8822,6 +8848,7 @@ void publishMqttSettings() {
   JsonObject night = doc["night_light"].to<JsonObject>();
   night["enabled"] = nightLightEnabled; night["color"] = colorHex(nightLightColor);
   night["brightness"] = nightLightBrightness; night["mode"] = nightLightMode; night["seconds"] = nightLightSeconds;
+  night["unread_brightness"] = unreadLightBrightness;
   JsonObject alarmLight = doc["alarm_light"].to<JsonObject>();
   alarmLight["enabled"] = alarmLightEnabled; alarmLight["color"] = colorHex(alarmLightColor);
   alarmLight["brightness"] = alarmLightBrightness; alarmLight["mode"] = alarmLightMode;
@@ -8895,6 +8922,7 @@ bool applyMqttSettings(const String& payload, String& error) {
     if (night["brightness"].is<int>()) nightLightBrightness = constrain(night["brightness"].as<int>(), 1, 100);
     if (night["mode"].is<int>()) nightLightMode = constrain(night["mode"].as<int>(), 0, 2);
     if (night["seconds"].is<int>()) nightLightSeconds = constrain(night["seconds"].as<int>(), 5, 3600);
+    if (night["unread_brightness"].is<int>()) unreadLightBrightness = constrain(night["unread_brightness"].as<int>(), 0, 100);
   }
   JsonObjectConst alarmLight = root["alarm_light"];
   if (!alarmLight.isNull()) {
@@ -9160,6 +9188,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     page += "<label class='field'>" + tr("LED brightness", "LED 亮度") + ": <output id='nightLedOut'>" + String(nightLightBrightness) + "%</output><input type='range' min='1' max='100' name='nightLedBrightness' value='" + String(nightLightBrightness) + "' oninput='nightLedOut.value=this.value+\"%\"'></label></div>";
     page += "<label class='field'>" + tr("Automatic mode", "自動模式") + "<select name='nightLightMode'><option value='0'" + String(nightLightMode == 0 ? " selected" : "") + ">" + tr("Stay on while screen is off", "螢幕關閉期間持續亮起") + "</option><option value='1'" + String(nightLightMode == 1 ? " selected" : "") + ">" + tr("Turn off after set time", "指定時間後關閉") + "</option><option value='2'" + String(nightLightMode == 2 ? " selected" : "") + ">" + tr("Fade out after set time", "指定時間後逐漸熄滅") + "</option></select></label>";
     page += "<label class='field'>" + tr("On time (seconds)", "持續時間（秒）") + "<input type='number' min='5' max='3600' name='nightLightSeconds' value='" + String(nightLightSeconds) + "'></label>";
+    page += "<label class='field'>" + tr("Unread message light (soft blue glow)", "未讀訊息淺藍燈") + ": <output id='unreadLedOut'>" + (unreadLightBrightness ? String(unreadLightBrightness) + "%" : tr("Off", "關閉")) + "</output><input type='range' min='0' max='100' name='unreadLedBrightness' value='" + String(unreadLightBrightness) + "' oninput='unreadLedOut.value=this.value==0?\"關閉\":this.value+\"%\"'></label>";
   } else if (pageId == "alarms") {
     page += "<h2>" + tr("Alarm sound", "鬧鐘音效") + "</h2><label class='field'>" + tr("Volume", "音量") + ": <output id='volumeOut'>" + String(alarmVolume) + "%</output><input type='range' min='10' max='100' step='5' name='alarmVolume' value='" + String(alarmVolume) + "' oninput='volumeOut.value=this.value+\"%\"'></label>";
     const char* soundsEn[] = {"Da Ban", "Chime", "Stream", "Water drop"}; const char* soundsZh[] = {"打版", "磬聲", "流水聲", "水滴聲"};
@@ -9877,6 +9906,7 @@ void setupSettingsServer() {
       nightLightBrightness = constrain(settingsServer.arg("nightLedBrightness").toInt(), 1, 100);
       nightLightMode = constrain(settingsServer.arg("nightLightMode").toInt(), 0, 2);
       nightLightSeconds = constrain(settingsServer.arg("nightLightSeconds").toInt(), 5, 3600);
+      unreadLightBrightness = constrain(settingsServer.arg("unreadLedBrightness").toInt(), 0, 100);
     } else if (pageId == "alarms") {
       alarmVolume = constrain(settingsServer.arg("alarmVolume").toInt(), 10, 100);
       alarmSound = constrain(settingsServer.arg("alarmSound").toInt(), 0, 3);
