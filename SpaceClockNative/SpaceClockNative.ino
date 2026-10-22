@@ -284,6 +284,15 @@ bool clockSettingsPressValid = false;
 uint32_t clockMiddlePressedAt = 0;
 bool clockMiddlePressValid = false;
 WiFiClient companionClient;
+// The TCP link to Companion is serviced by its own task (companionRxTask): it answers the server's PINGs
+// at once, so a long blocking call in loop() (Home Assistant, MQTT, ...) can no longer make Companion
+// declare the satellite dead. All use of companionClient goes through this recursive mutex.
+SemaphoreHandle_t companionMutex = nullptr;
+QueueHandle_t companionQueue = nullptr;          // complete lines (String*) for loop() to process
+struct CompLock {
+  CompLock() { if (!companionMutex) companionMutex = xSemaphoreCreateRecursiveMutex(); xSemaphoreTakeRecursive(companionMutex, portMAX_DELAY); }
+  ~CompLock() { xSemaphoreGiveRecursive(companionMutex); }
+};
 WebSocketsClient companionWebSocket;
 bool companionWebSocketMode = false;
 bool companionWebSocketConnected = false;
@@ -2166,20 +2175,23 @@ void clearCompanionPageData() {
 }
 
 bool companionConnected() {
-  return companionWebSocketMode ? companionWebSocketConnected : companionClient.connected();
+  if (companionWebSocketMode) return companionWebSocketConnected;
+  CompLock lock;
+  return companionClient.connected();
 }
 
 void sendCompanionMessage(const String& message) {
   if (companionWebSocketMode) {
     if (companionWebSocketConnected) { String payload = message; companionWebSocket.sendTXT(payload); }
-  } else if (companionClient.connected()) {
-    companionClient.print(message);
+  } else {
+    CompLock lock;
+    if (companionClient.connected()) companionClient.print(message);
   }
 }
 
 void stopCompanion() {
   companionPongSeen = false;
-  companionClient.stop();
+  { CompLock lock; companionClient.stop(); }
   companionWebSocket.disconnect();
   companionWebSocketConnected = false;
   companionWebSocketMode = false;
@@ -2270,11 +2282,13 @@ void beginCompanionTarget(String target, bool isInternet) {
     else companionWebSocket.begin(host.c_str(), port ? port : 80, path.c_str());
   } else {
     while (target.endsWith("/")) target.remove(target.length() - 1);
+    CompLock lock;
     companionClient.connect(target.c_str(), companionPorts[companionPage]);
   }
 }
 
 void connectCompanion() {
+  startCompanionTask();
   if (WiFi.status() != WL_CONNECTED || companionConnected()) return;
   if (!companionHosts[companionPage].length() && !companionInternetUrls[companionPage].length()) return;
   stopCompanion();
@@ -2284,9 +2298,62 @@ void connectCompanion() {
     while (local.endsWith("/")) local.remove(local.length() - 1);
     companionWebSocketMode = false;
     companionUsingInternet = false;
-    if (companionClient.connect(local.c_str(), companionPorts[companionPage], 2500)) { lastCompanionRx = millis(); return; }   // bounded: a dead host must not freeze the UI
+    bool ok;
+    { CompLock lock; ok = companionClient.connect(local.c_str(), companionPorts[companionPage], 2500); }   // bounded: a dead host must not freeze the UI
+    if (ok) { lastCompanionRx = millis(); return; }
   }
   if (companionInternetUrls[companionPage].length()) beginCompanionTarget(companionInternetUrls[companionPage], true);
+}
+
+// Services the plain-TCP Companion link: reads lines, answers PINGs immediately, pings the server and drops a
+// silent link. Everything else is handed to loop() through companionQueue.
+static void companionRxTask(void*) {
+  String rx;
+  uint32_t lastPing = 0;
+  for (;;) {
+    String lines[6];
+    int count = 0;
+    bool busy = false;
+    if (!netPaused && !companionWebSocketMode) {
+      CompLock lock;
+      if (companionClient.connected()) {
+        while (companionClient.available() && count < 6) {
+          int c = companionClient.read();
+          if (c < 0) break;
+          busy = true;
+          if (c != '\n') { if (rx.length() < 12000) rx += (char)c; continue; }
+          rx.trim();
+          lastCompanionRx = millis();
+          if (rx.startsWith("PING ")) companionClient.print("PONG " + rx.substring(5) + "\n");
+          else if (rx.length()) { if (rx.startsWith("PONG")) companionPongSeen = true; lines[count++] = rx; }
+          rx = "";
+        }
+        if (millis() - lastPing > 2000UL) { lastPing = millis(); companionClient.print("PING " + String(millis()) + "\n"); }
+        // The server answers every PING: eight silent seconds mean a half-open connection (Wi-Fi hiccup,
+        // server restart). TCP would take minutes to notice, so drop it and let loop() reconnect.
+        if (companionPongSeen && millis() - lastCompanionRx > 8000UL) {
+          Serial.println("[companion] no reply for 8 s: reconnecting");
+          companionClient.stop();
+          companionPongSeen = false;
+        }
+      } else { rx = ""; }
+    }
+    for (int i = 0; i < count; ++i) {                        // hand the lines to loop() (outside the lock)
+      String* m = new String(lines[i]);
+      while (m && xQueueSend(companionQueue, &m, pdMS_TO_TICKS(100)) != pdTRUE) {
+        if (netPaused || companionWebSocketMode) { delete m; m = nullptr; }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(busy ? 1 : 10));
+  }
+}
+
+void startCompanionTask() {
+  static bool started = false;
+  if (started) return;
+  started = true;
+  companionQueue = xQueueCreate(16, sizeof(String*));
+  xTaskCreatePinnedToCore(companionRxTask, "companion", 5120, nullptr, 1, nullptr, 1);
 }
 
 void probeAndPreferLocalCompanion(uint32_t nowMs) {
@@ -10355,23 +10422,22 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); sdRawPump(); }
   if (sdRawBusy) sdUploadPump(sdRawReceived, (int)sdRawTotal);
   if (companionWebSocketMode) { companionWebSocket.loop(); probeAndPreferLocalCompanion(millis()); }
-  if (!companionWebSocketMode && companionClient.connected()) {
-    while (companionClient.available()) processCompanionLine(companionClient.readStringUntil('\n'));
-    static uint32_t lastCompanionPing = 0;
-    if (millis() - lastCompanionPing > 2000) { lastCompanionPing = millis(); sendCompanionMessage("PING " + String(millis()) + "\n"); }
-    // The server answers every PING: eight silent seconds mean a half-open connection (Wi-Fi hiccup,
-    // server restart). TCP would take minutes to notice, so drop it and reconnect.
-    if (companionPongSeen && millis() - lastCompanionRx > 8000UL) {
-      Serial.println("[companion] no reply for 8 s: reconnecting");
-      stopCompanion();
-    }
-  } else if (!companionWebSocketMode && screenNow == Screen::Companion) {
-    // Retry with a growing pause (2 s, 4 s ... 15 s) instead of a blocking connect on every pass.
-    static uint32_t lastTry = 0, wait = 2000;
-    if (millis() - lastTry >= wait) {
-      lastTry = millis();
-      connectCompanion();
-      wait = companionConnected() ? 2000 : min<uint32_t>(wait * 2, 15000);
+  if (!companionWebSocketMode) {
+    // Lines read by companionRxTask (key images, labels, BEGIN ...): process them here, on the UI thread.
+    String* msg;
+    while (companionQueue && xQueueReceive(companionQueue, &msg, 0) == pdTRUE) { processCompanionLine(*msg); delete msg; }
+    // Keep the link up in the background (not only while the panel is open) with a growing pause: 2 s ... 15 s.
+    // Away from the home LAN a private Companion address cannot be reached: do not try (a connect blocks up to 2.5 s).
+    String companionLocal = companionHosts[companionPage]; companionLocal.trim();
+    bool reachable = !companionLocal.length() || homeLanReachable || !hostIsPrivate(companionLocal);
+    if (!companionConnected() && WiFi.status() == WL_CONNECTED && !netPaused && !wifiPaused && reachable) {
+      static uint32_t lastTry = 0, wait = 2000;
+      if (millis() - lastTry >= wait) {
+        lastTry = millis();
+        connectCompanion();
+        // On the panel retry quickly; in the background a down server costs 2.5 s per attempt, so retry slowly.
+        wait = companionConnected() ? 2000 : min<uint32_t>(wait * 2, screenNow == Screen::Companion ? 15000UL : 60000UL);
+      }
     }
   }
   {
