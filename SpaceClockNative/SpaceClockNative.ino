@@ -289,6 +289,8 @@ bool companionWebSocketMode = false;
 bool companionWebSocketConnected = false;
 bool companionUsingInternet = false;
 uint32_t lastCompanionLocalProbe = 0;
+bool companionPongSeen = false;      // this server answers PINGs, so silence means a dead link
+uint32_t lastCompanionRx = 0;          // last time anything arrived from the Companion server (stale-link detection)
 // Home Assistant Assist uses the official WebSocket pipeline API. The token
 // stays in Preferences and is never emitted to MQTT, the UI, or public builds.
 bool hassAssistEnabled = false;
@@ -2176,6 +2178,7 @@ void sendCompanionMessage(const String& message) {
 }
 
 void stopCompanion() {
+  companionPongSeen = false;
   companionClient.stop();
   companionWebSocket.disconnect();
   companionWebSocketConnected = false;
@@ -2185,7 +2188,9 @@ void stopCompanion() {
 }
 
 void processCompanionLine(String line) {
+  lastCompanionRx = millis();
   line.trim();
+  if (line.startsWith("PONG")) companionPongSeen = true;
   if (line.startsWith("PING ")) { sendCompanionMessage("PONG " + line.substring(5) + "\n"); return; }
   if (line.startsWith("BEGIN ")) {
     uint64_t chip = ESP.getEfuseMac();
@@ -2279,7 +2284,7 @@ void connectCompanion() {
     while (local.endsWith("/")) local.remove(local.length() - 1);
     companionWebSocketMode = false;
     companionUsingInternet = false;
-    if (companionClient.connect(local.c_str(), companionPorts[companionPage])) return;
+    if (companionClient.connect(local.c_str(), companionPorts[companionPage], 2500)) { lastCompanionRx = millis(); return; }   // bounded: a dead host must not freeze the UI
   }
   if (companionInternetUrls[companionPage].length()) beginCompanionTarget(companionInternetUrls[companionPage], true);
 }
@@ -10354,7 +10359,31 @@ void loop() {
     while (companionClient.available()) processCompanionLine(companionClient.readStringUntil('\n'));
     static uint32_t lastCompanionPing = 0;
     if (millis() - lastCompanionPing > 2000) { lastCompanionPing = millis(); sendCompanionMessage("PING " + String(millis()) + "\n"); }
-  } else if (!companionWebSocketMode && screenNow == Screen::Companion) connectCompanion();
+    // The server answers every PING: eight silent seconds mean a half-open connection (Wi-Fi hiccup,
+    // server restart). TCP would take minutes to notice, so drop it and reconnect.
+    if (companionPongSeen && millis() - lastCompanionRx > 8000UL) {
+      Serial.println("[companion] no reply for 8 s: reconnecting");
+      stopCompanion();
+    }
+  } else if (!companionWebSocketMode && screenNow == Screen::Companion) {
+    // Retry with a growing pause (2 s, 4 s ... 15 s) instead of a blocking connect on every pass.
+    static uint32_t lastTry = 0, wait = 2000;
+    if (millis() - lastTry >= wait) {
+      lastTry = millis();
+      connectCompanion();
+      wait = companionConnected() ? 2000 : min<uint32_t>(wait * 2, 15000);
+    }
+  }
+  {
+    // Wi-Fi modem sleep adds up to ~300 ms of delay and drops idle links: keep it off while the Companion panel is open.
+    static bool companionAwake = false;
+    bool want = screenNow == Screen::Companion && !screenSleeping;
+    if (want != companionAwake) {
+      companionAwake = want;
+      if (want) WiFi.setSleep(false);
+      else if (!sdWebActive(millis())) WiFi.setSleep(true);
+    }
+  }
   handleTouch();
   handleSerialConfig();
   uint32_t nowMs = millis();
