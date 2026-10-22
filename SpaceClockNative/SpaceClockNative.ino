@@ -2240,10 +2240,12 @@ void processCompanionLine(String line) {
 
 void onCompanionWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   if (type == WStype_CONNECTED) {
+    Serial.println("[companion] websocket connected");
     companionWebSocketConnected = true;
     companionRegistered = false;
     if (screenNow == Screen::Companion) drawCompanionPageBar();
   } else if (type == WStype_DISCONNECTED) {
+    Serial.printf("[companion] websocket disconnected (payload %u bytes: %.60s)\n", (unsigned)length, payload ? (const char*)payload : "");
     companionWebSocketConnected = false;
     companionRegistered = false;
     if (screenNow == Screen::Companion) drawCompanionPageBar();
@@ -2277,7 +2279,9 @@ void beginCompanionTarget(String target, bool isInternet) {
     if (colon > 0) { port = host.substring(colon + 1).toInt(); host = host.substring(0, colon); }
     companionWebSocket.onEvent(onCompanionWebSocketEvent);
     companionWebSocket.setReconnectInterval(3000);
-    companionWebSocket.enableHeartbeat(2000, 1500, 2);
+    // Ping every 15 s, allow 8 s for the pong, give up after 3 misses. The old 2 s / 1.5 s / 2 settings dropped the
+    // link every 3-4 s whenever loop() was busy for a moment or the Internet path was slow.
+    companionWebSocket.enableHeartbeat(15000, 8000, 3);
     if (secure) companionWebSocket.beginSSL(host.c_str(), port, path.c_str());
     else companionWebSocket.begin(host.c_str(), port ? port : 80, path.c_str());
   } else {
@@ -2300,9 +2304,10 @@ void connectCompanion() {
     companionUsingInternet = false;
     bool ok;
     { CompLock lock; ok = companionClient.connect(local.c_str(), companionPorts[companionPage], 2500); }   // bounded: a dead host must not freeze the UI
+    Serial.printf("[companion] local TCP %s:%u %s\n", local.c_str(), (unsigned)companionPorts[companionPage], ok ? "connected" : "FAILED");
     if (ok) { lastCompanionRx = millis(); return; }
   }
-  if (companionInternetUrls[companionPage].length()) beginCompanionTarget(companionInternetUrls[companionPage], true);
+  if (companionInternetUrls[companionPage].length()) { Serial.println("[companion] using the Internet URL"); beginCompanionTarget(companionInternetUrls[companionPage], true); }
 }
 
 // Services the plain-TCP Companion link: reads lines, answers PINGs immediately, pings the server and drops a
@@ -10421,9 +10426,20 @@ void loop() {
   M5.update();
   if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); sdRawPump(); }
   if (sdRawBusy) sdUploadPump(sdRawReceived, (int)sdRawTotal);
-  if (companionWebSocketMode) { companionWebSocket.loop(); probeAndPreferLocalCompanion(millis()); }
+  if (companionWebSocketMode) {
+    companionWebSocket.loop();
+    probeAndPreferLocalCompanion(millis());
+    // Companion closes a satellite connection that stays silent for ~5 s. The TCP link already pinged every
+    // 2 s but the WebSocket link never did, so it was dropped about 5.5 s after every connect.
+    static uint32_t lastWsPing = 0;
+    if (companionWebSocketConnected && millis() - lastWsPing > 2000UL) { lastWsPing = millis(); sendCompanionMessage("PING " + String(millis()) + "\n"); }
+  }
   if (!companionWebSocketMode) {
     // Lines read by companionRxTask (key images, labels, BEGIN ...): process them here, on the UI thread.
+    static bool wasConnected = false;
+    bool nowConnected = companionConnected();
+    if (wasConnected && !nowConnected) Serial.println("[companion] link lost");
+    wasConnected = nowConnected;
     String* msg;
     while (companionQueue && xQueueReceive(companionQueue, &msg, 0) == pdTRUE) { processCompanionLine(*msg); delete msg; }
     // Keep the link up in the background (not only while the panel is open) with a growing pause: 2 s ... 15 s.
