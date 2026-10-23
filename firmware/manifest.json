@@ -1,7 +1,7 @@
 {
-  "version": "3.0.11",
+  "version": "3.0.31",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "2726698ef3659c2fc91c76875d0076b0d335db214b00b6f5aa30b12f927883b6",
-  "size": 5955456,
-  "notes": "Listening mode: SD-card MP3 player with folders, playlists, loop modes, speed 0.5X-2X, Bluetooth headphones or speaker, web SD file browser. Separate manual/auto screen-off settings, no standby screen-off during meditation, MQTT stall guard for weak Wi-Fi."
+  "sha256": "a715d2b3815e12fca7efb1abe6648ee58af56b1cb6c7f8b6311dbeec99dab22e",
+  "size": 5963216,
+  "notes": "Listening mode refinements (speed/skip setting pages, speaker or Bluetooth with remembered headphones, smoother 2X playback), 16 px message text, steadier Companion link (kept only while its panel is open), Wi-Fi networks are remembered automatically, adjustable light-blue unread-message LED, no standby during web SD uploads, SD card drop-out recovery."
 }
