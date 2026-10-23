@@ -10434,6 +10434,9 @@ void loop() {
     static uint32_t lastWsPing = 0;
     if (companionWebSocketConnected && millis() - lastWsPing > 2000UL) { lastWsPing = millis(); sendCompanionMessage("PING " + String(millis()) + "\n"); }
   }
+  // The link is only kept while the Companion panel is on screen: leave the panel and the satellite goes offline
+  // (TCP or WebSocket).
+  if (screenNow != Screen::Companion && (companionWebSocketMode || companionConnected())) { Serial.println("[companion] panel closed: disconnecting"); stopCompanion(); }
   if (!companionWebSocketMode) {
     // Lines read by companionRxTask (key images, labels, BEGIN ...): process them here, on the UI thread.
     static bool wasConnected = false;
@@ -10442,17 +10445,13 @@ void loop() {
     wasConnected = nowConnected;
     String* msg;
     while (companionQueue && xQueueReceive(companionQueue, &msg, 0) == pdTRUE) { processCompanionLine(*msg); delete msg; }
-    // Keep the link up in the background (not only while the panel is open) with a growing pause: 2 s ... 15 s.
-    // Away from the home LAN a private Companion address cannot be reached: do not try (a connect blocks up to 2.5 s).
-    String companionLocal = companionHosts[companionPage]; companionLocal.trim();
-    bool reachable = !companionLocal.length() || homeLanReachable || !hostIsPrivate(companionLocal);
-    if (!companionConnected() && WiFi.status() == WL_CONNECTED && !netPaused && !wifiPaused && reachable) {
+    // Reconnect (only on the panel) with a growing pause.
+    if (screenNow == Screen::Companion && !companionConnected() && WiFi.status() == WL_CONNECTED && !netPaused && !wifiPaused) {
       static uint32_t lastTry = 0, wait = 2000;
       if (millis() - lastTry >= wait) {
         lastTry = millis();
         connectCompanion();
-        // On the panel retry quickly; in the background a down server costs 2.5 s per attempt, so retry slowly.
-        wait = companionConnected() ? 2000 : min<uint32_t>(wait * 2, screenNow == Screen::Companion ? 15000UL : 60000UL);
+        wait = companionConnected() ? 2000 : min<uint32_t>(wait * 2, 15000UL);   // 2 s, 4 s ... 15 s
       }
     }
   }
