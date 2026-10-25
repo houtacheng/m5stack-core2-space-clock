@@ -4794,7 +4794,15 @@ bool verifyEmotionApiConnection(bool force) {
   return connected;
 }
 
+// The offline queue file is touched by the UI thread (submit) and by the network task (upload): serialise it.
+SemaphoreHandle_t emotionQueueMutex = nullptr;
+struct EmoQueueLock {
+  EmoQueueLock() { if (!emotionQueueMutex) emotionQueueMutex = xSemaphoreCreateRecursiveMutex(); xSemaphoreTakeRecursive(emotionQueueMutex, portMAX_DELAY); }
+  ~EmoQueueLock() { xSemaphoreGiveRecursive(emotionQueueMutex); }
+};
+
 bool saveEmotionQueue(const String& localId, const String& body) {
+  EmoQueueLock queueLock;
   if (!emotionStorageReady || !emotionApiUserId.length() || body.length() > 8192) return false;
   DynamicJsonDocument queue(32768);
   File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
@@ -4814,6 +4822,7 @@ bool saveEmotionQueue(const String& localId, const String& body) {
 }
 
 uint8_t countEmotionQueue() {
+  EmoQueueLock queueLock;
   if (!emotionStorageReady) return 0;
   File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
   if (!input) return 0;
@@ -4859,14 +4868,19 @@ bool flushOneEmotionRecord() {
   NetLock netLock;  // one HTTPS session at a time
   if (!emotionStorageReady || WiFi.status() != WL_CONNECTED || !emotionApiConfigured() || millis() - emotionLastQueueSyncAt < 5000UL) return false;
   emotionLastQueueSyncAt = millis();
-  File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
-  if (!input) { emotionPendingCount = 0; return false; }
-  DynamicJsonDocument queue(32768);
-  if (deserializeJson(queue, input) || !queue.is<JsonArray>() || queue.size() == 0) { input.close(); return false; }
-  input.close();
-  JsonArray items = queue.as<JsonArray>();
-  if (String((const char*)(items[0]["user"] | "")) != emotionApiUserId) return false;
-  String body = items[0]["body"] | "";
+  String body, postedId;
+  {
+    EmoQueueLock queueLock;
+    File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
+    if (!input) { emotionPendingCount = 0; return false; }
+    DynamicJsonDocument queue(32768);
+    if (deserializeJson(queue, input) || !queue.is<JsonArray>() || queue.size() == 0) { input.close(); return false; }
+    input.close();
+    JsonArray items = queue.as<JsonArray>();
+    if (String((const char*)(items[0]["user"] | "")) != emotionApiUserId) return false;
+    body = items[0]["body"] | "";
+    postedId = items[0]["local_id"] | "";
+  }
   if (!body.length()) return false;
   String base = normalizeEmotionApiBase(emotionApiBase);
   WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
@@ -4885,11 +4899,24 @@ bool flushOneEmotionRecord() {
     code = retry.POST(body); retry.end(); retrySecure.stop();
   } else { http.end(); secure.stop(); }
   if (code != 200 && code != 201) return false;
-  queue.as<JsonArray>().remove(0);
-  File output = SPIFFS.open("/emotion_queue.json", FILE_WRITE);
-  if (!output) return false;
-  serializeJson(queue, output); output.close();
-  emotionPendingCount = queue.size();
+  {
+    // Re-read the file: records may have been added while the upload was running. Remove only the one sent.
+    EmoQueueLock queueLock;
+    File input = SPIFFS.open("/emotion_queue.json", FILE_READ);
+    if (!input) return false;
+    DynamicJsonDocument queue(32768);
+    bool parsed = !deserializeJson(queue, input) && queue.is<JsonArray>();
+    input.close();
+    if (!parsed) return false;
+    JsonArray items = queue.as<JsonArray>();
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (String((const char*)(items[i]["local_id"] | "")) == postedId) { items.remove(i); break; }
+    }
+    File output = SPIFFS.open("/emotion_queue.json", FILE_WRITE);
+    if (!output) return false;
+    serializeJson(queue, output); output.close();
+    emotionPendingCount = items.size();
+  }
   emotionApiState = EmotionApiState::Connected;
   emotionApiLastChecked = millis();
   return true;
@@ -4975,6 +5002,13 @@ int fetchEmotionStatistics(DynamicJsonDocument& result, String& errorBody) {
   return code;
 }
 
+volatile bool emotionStatsRequested = false;     // UI -> network task: fetch fresh statistics
+volatile bool emotionStatsDone = false;          // network task -> UI: result ready
+DynamicJsonDocument* emotionStatsResult = nullptr;
+int emotionStatsCode = 0;
+bool emotionStatsHadCache = false;
+volatile bool emotionRedrawNeeded = false;       // network task -> UI: connection state or queue changed
+
 bool loadEmotionRecordStats() {
   emotionRecordsState = EmotionRecordsState::Loading;
   emotionRecordsError = "";
@@ -5000,45 +5034,103 @@ bool loadEmotionRecordStats() {
     emotionRecordsState = EmotionRecordsState::Error;
     return false;
   }
-  DynamicJsonDocument stats(3072);
-  String errorBody;
-  int code = fetchEmotionStatistics(stats, errorBody);
-  if (code == 401 && refreshEmotionApiToken()) {
-    stats.clear();
-    errorBody = "";
-    code = fetchEmotionStatistics(stats, errorBody);
-  }
-  if (code != 200) {
-    if (haveCache) { emotionApiState = EmotionApiState::Disconnected; return true; }
-    if (code == 401) emotionRecordsError = "登入已過期，請從網頁重新登入";
-    else if (code == -10002) emotionRecordsError = "統計資料格式解析失敗";
-    else if (code < 0) emotionRecordsError = "HTTPS／網路連線失敗";
-    else emotionRecordsError = "統計 API 回應 HTTP " + String(code);
-    emotionRecordsState = EmotionRecordsState::Error;
-    if (code == 401) emotionApiState = EmotionApiState::Disconnected;
-    return false;
-  }
-
-  JsonObject summary = stats["data"]["summary"].as<JsonObject>();
-  if (summary.isNull()) {
-    emotionRecordsError = "統計 API 缺少 summary 欄位";
-    emotionRecordsState = EmotionRecordsState::Error;
-    return false;
-  }
-  applyEmotionStatistics(stats);
-  if (emotionStorageReady) {
-    DynamicJsonDocument stored(4096);
-    stored["user"] = emotionApiUserId;
-    stored["data"] = stats;
-    File cache = SPIFFS.open("/emotion_stats.json", FILE_WRITE);
-    if (cache) { serializeJson(stored, cache); cache.close(); }
-  }
-  emotionStatsCacheAt = millis();
-
-  emotionApiState = EmotionApiState::Connected;
-  emotionApiLastChecked = millis();
-  emotionRecordsState = EmotionRecordsState::Ready;
+  // The HTTPS request (TLS handshake alone takes ~2 s) runs in the network task; the cached numbers are
+  // already on screen and finishEmotionStatsFetch() (called from loop) shows the fresh ones.
+  emotionStatsHadCache = haveCache;
+  emotionStatsRequested = true;
   return true;
+}
+
+// Called from loop() when the network task has fetched the statistics.
+void finishEmotionStatsFetch() {
+  DynamicJsonDocument* stats = emotionStatsResult;
+  emotionStatsResult = nullptr;
+  int code = emotionStatsCode;
+  bool haveCache = emotionStatsHadCache;
+  emotionStatsDone = false;
+  if (!stats) return;
+  bool ok = false;
+  if (code != 200) {
+    if (haveCache) { emotionApiState = EmotionApiState::Disconnected; emotionRecordsState = EmotionRecordsState::Ready; ok = true; }
+    else {
+      if (code == 401) emotionRecordsError = "登入已過期，請從網頁重新登入";
+      else if (code == -10002) emotionRecordsError = "統計資料格式解析失敗";
+      else if (code < 0) emotionRecordsError = "HTTPS／網路連線失敗";
+      else emotionRecordsError = "統計 API 回應 HTTP " + String(code);
+      emotionRecordsState = EmotionRecordsState::Error;
+      if (code == 401) emotionApiState = EmotionApiState::Disconnected;
+    }
+  } else {
+    JsonObject summary = (*stats)["data"]["summary"].as<JsonObject>();
+    if (summary.isNull()) {
+      emotionRecordsError = "統計 API 缺少 summary 欄位";
+      emotionRecordsState = EmotionRecordsState::Error;
+    } else {
+      applyEmotionStatistics(*stats);
+      if (emotionStorageReady) {
+        DynamicJsonDocument stored(4096);
+        stored["user"] = emotionApiUserId;
+        stored["data"] = *stats;
+        File cache = SPIFFS.open("/emotion_stats.json", FILE_WRITE);
+        if (cache) { serializeJson(stored, cache); cache.close(); }
+      }
+      emotionStatsCacheAt = millis();
+      emotionApiState = EmotionApiState::Connected;
+      emotionApiLastChecked = millis();
+      emotionRecordsState = EmotionRecordsState::Ready;
+      ok = true;
+    }
+  }
+  (void)ok;
+  delete stats;
+  if (screenNow == Screen::EmotionRecords) drawEmotionRecords();
+}
+
+// Runs in the network task (never the UI thread): statistics requests, the offline-queue upload and the
+// periodic database connection check. The UI only gets a redraw request afterwards.
+void maintainEmotionBackground(uint32_t nowMs) {
+  if (emotionStatsRequested) {
+    emotionStatsRequested = false;
+    DynamicJsonDocument* stats = new DynamicJsonDocument(3072);
+    String errorBody;
+    int code = fetchEmotionStatistics(*stats, errorBody);
+    if (code == 401 && refreshEmotionApiToken()) { stats->clear(); errorBody = ""; code = fetchEmotionStatistics(*stats, errorBody); }
+    delete emotionStatsResult;
+    emotionStatsResult = stats;
+    emotionStatsCode = code;
+    emotionStatsDone = true;
+    return;
+  }
+  // Upload the offline emotion queue in the background on every screen. Skip only while audio must not stutter
+  // (alarm ringing, Assist recording or speaking) and back off after failures.
+  static uint8_t emotionSyncFailures = 0;
+  uint32_t emotionSyncInterval = emotionSyncFailures ? min(300000UL, 15000UL << min<uint8_t>(emotionSyncFailures - 1, 5)) : 5000UL;
+  if (WiFi.status() == WL_CONNECTED && emotionPendingCount && alarmActive < 0
+      && !hassAssistMicRunning && !hassAssistAudioData && !hassAssistMp3Decoder
+      && nowMs - emotionLastQueueSyncAt >= emotionSyncInterval) {
+    if (flushOneEmotionRecord()) {
+      emotionSyncFailures = 0;
+      Serial.printf("[emotion] queued record synced; remaining=%u\n", emotionPendingCount);
+    } else {
+      emotionLastQueueSyncAt = millis();
+      if (emotionSyncFailures < 250) ++emotionSyncFailures;
+      Serial.printf("[emotion] background sync failed (%u); retry in %lu s\n", emotionSyncFailures,
+                    (unsigned long)(min(300000UL, 15000UL << min<uint8_t>(emotionSyncFailures - 1, 5)) / 1000));
+    }
+    emotionRedrawNeeded = true;
+    return;
+  }
+  // Database connection check while an emotion page is open.
+  if ((screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings) && WiFi.status() == WL_CONNECTED
+      && emotionApiToken.length() && emotionApiUserId.length()) {
+    bool retryDisconnected = emotionApiState == EmotionApiState::Disconnected && nowMs - emotionApiLastChecked >= 15000UL;
+    bool periodicCheck = emotionApiState == EmotionApiState::Connected && nowMs - emotionApiLastChecked >= 300000UL;
+    if (emotionApiState == EmotionApiState::Unknown || retryDisconnected || periodicCheck) {
+      refreshEmotionApiToken();
+      emotionApiLastChecked = millis();
+      emotionRedrawNeeded = true;
+    }
+  }
 }
 
 void showEmotionRecords(bool refresh) {
@@ -5060,7 +5152,7 @@ void showEmotionRecords(bool refresh) {
 }
 
 bool submitEmotionObservation() {
-  NetLock netLock;  // one HTTPS session at a time
+  // No network lock here: the record is only saved locally (instantly) and uploaded later by the network task.
   if (!emotionApiConfigured()) { emotionSubmitMessage = "請先從網頁登入情緒觀察 API。"; drawEmotionObservation(); return false; }
   time_t now = time(nullptr); struct tm utcNow;
   bool hasUtc = now >= 1700000000 && gmtime_r(&now, &utcNow);
@@ -5128,6 +5220,7 @@ bool submitEmotionObservation() {
     drawEmotionObservation();
     return false;
   }
+  NetLock netLock;  // direct upload (local storage unavailable): one HTTPS session at a time
   WiFiClientSecure secure; secure.setCACert(EMOTION_API_ROOT_CA);
   HTTPClient http; http.setTimeout(8000);
   String base = normalizeEmotionApiBase(emotionApiBase);
@@ -10336,6 +10429,7 @@ void netTask(void*) {
     }
     checkHomeLan(nowMs);
     fetchSignalMessagesInBackground(nowMs);
+    maintainEmotionBackground(nowMs);
     maintainCalendar(nowMs);
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -10493,39 +10587,15 @@ void loop() {
 
   SLOW_SECTION("signal", pollSignalMessages(nowMs));
 
-  // Upload the offline emotion queue in the background on every screen.
-  // Skip only while audio must not stutter (alarm ringing, Assist recording
-  // or speaking), and back off after failures so a dead network does not
-  // keep freezing the UI with 8 s HTTPS timeouts.
-  static uint8_t emotionSyncFailures = 0;
-  uint32_t emotionSyncInterval = emotionSyncFailures ? min(300000UL, 15000UL << min<uint8_t>(emotionSyncFailures - 1, 5)) : 5000UL;
-  if (WiFi.status() == WL_CONNECTED && emotionPendingCount && alarmActive < 0
-      && !hassAssistMicRunning && !hassAssistAudioData && !hassAssistMp3Decoder
-      && nowMs - emotionLastQueueSyncAt >= emotionSyncInterval) {
-    if (flushOneEmotionRecord()) {
-      emotionSyncFailures = 0;
-      Serial.printf("[emotion] queued record synced; remaining=%u\n", emotionPendingCount);
-    } else {
-      emotionLastQueueSyncAt = millis();
-      if (emotionSyncFailures < 250) ++emotionSyncFailures;
-      Serial.printf("[emotion] background sync failed (%u); retry in %lu s\n", emotionSyncFailures,
-                    (unsigned long)(min(300000UL, 15000UL << min<uint8_t>(emotionSyncFailures - 1, 5)) / 1000));
-    }
-  }
+  if (emotionStatsDone) finishEmotionStatsFetch();
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings) {
-    bool redrawConnection = false;
+    // The network work itself runs in the network task (maintainEmotionBackground); here only the redraws.
+    bool redrawConnection = emotionRedrawNeeded;
+    emotionRedrawNeeded = false;
     if (WiFi.status() != WL_CONNECTED && emotionApiState != EmotionApiState::Disconnected) {
       emotionApiState = EmotionApiState::Disconnected;
       emotionApiLastChecked = nowMs;
       redrawConnection = true;
-    } else if (screenNow != Screen::EmotionObservation && WiFi.status() == WL_CONNECTED
-               && emotionApiToken.length() && emotionApiUserId.length()) {
-      bool retryDisconnected = emotionApiState == EmotionApiState::Disconnected && nowMs - emotionApiLastChecked >= 15000UL;
-      bool periodicCheck = emotionApiState == EmotionApiState::Connected && nowMs - emotionApiLastChecked >= 300000UL;
-      if (emotionApiState == EmotionApiState::Unknown || retryDisconnected || periodicCheck) {
-        verifyEmotionApiConnection(true);
-        redrawConnection = true;
-      }
     }
     if (redrawConnection) {
       if (screenNow == Screen::EmotionObservation) drawEmotionObservation();
