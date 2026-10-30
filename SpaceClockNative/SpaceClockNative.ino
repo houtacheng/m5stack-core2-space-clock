@@ -297,7 +297,19 @@ WebSocketsClient companionWebSocket;
 bool companionWebSocketMode = false;
 bool companionWebSocketConnected = false;
 bool companionUsingInternet = false;
+// The WebSocket link (Internet/WSS) is serviced by companionWsTask: the TLS handshake blocks for ~1.2 s and must
+// not freeze the UI. loop() talks to it through these: a command, the target, and an outgoing queue.
+QueueHandle_t companionOutQueue = nullptr;     // String* messages for the WebSocket task
+volatile uint8_t companionWsCmd = 0;           // 1 = (re)connect, 2 = disconnect
+String companionWsHost, companionWsPath;
+uint16_t companionWsPort = 443;
+bool companionWsSecure = true;
+bool companionAccepted = false;                // Companion has acknowledged our ADD-DEVICE: key presses are accepted
+String companionPendingPress[4];               // presses made before that (sent once accepted, if still fresh)
+uint32_t companionPendingAt[4] = {0, 0, 0, 0};
+uint8_t companionPendingCount = 0;
 uint32_t lastCompanionLocalProbe = 0;
+uint32_t companionPanelOpenedAt = 0;      // for the start-up timing log
 bool companionPongSeen = false;      // this server answers PINGs, so silence means a dead link
 uint32_t lastCompanionRx = 0;          // last time anything arrived from the Companion server (stale-link detection)
 // Home Assistant Assist uses the official WebSocket pipeline API. The token
@@ -488,10 +500,14 @@ String companionDeviceId = "core2";
 static constexpr uint8_t COMPANION_COLS = 3;
 static constexpr uint8_t COMPANION_ROWS = 2;
 static constexpr uint8_t COMPANION_KEYS = COMPANION_COLS * COMPANION_ROWS;
-String companionLabels[COMPANION_KEYS] = {"Button 1", "Button 2", "Button 3", "Button 4", "Button 5", "Button 6"};
-uint16_t companionColors[COMPANION_KEYS] = {0x2945, 0x2945, 0x2945, 0x2945, 0x2945, 0x2945};
+// Every page keeps its own keys, so switching pages (all pages share one Companion link) is instant.
+String companionLabelsAll[COMPANION_PAGE_COUNT][COMPANION_KEYS];
+uint16_t companionColorsAll[COMPANION_PAGE_COUNT][COMPANION_KEYS];
+#define companionLabels companionLabelsAll[companionPage]
+#define companionColors companionColorsAll[companionPage]
 struct CompanionImage { uint8_t* data = nullptr; size_t size = 0; };
-CompanionImage companionImages[COMPANION_KEYS];
+CompanionImage companionImagesAll[COMPANION_PAGE_COUNT][COMPANION_KEYS];
+#define companionImages companionImagesAll[companionPage]
 M5Canvas astronautCanvas(&M5.Display);
 M5Canvas companionButtonCanvas(&M5.Display);
 M5Canvas meditationCardCanvas(&M5.Display);
@@ -2092,7 +2108,7 @@ String decodeBase64Text(const String& encoded) {
   return String((char*)decoded);
 }
 
-bool storeCompanionPng(int key, const String& dataUrl) {
+bool storeCompanionPng(int key, const String& dataUrl, int page) {
   int comma = dataUrl.indexOf(',');
   String encoded = comma >= 0 ? dataUrl.substring(comma + 1) : dataUrl;
   size_t required = 0;
@@ -2105,9 +2121,9 @@ bool storeCompanionPng(int key, const String& dataUrl) {
   if (mbedtls_base64_decode(image, required, &written, (const uint8_t*)encoded.c_str(), encoded.length()) != 0) {
     free(image); return false;
   }
-  free(companionImages[key].data);
-  companionImages[key].data = image;
-  companionImages[key].size = written;
+  free(companionImagesAll[page][key].data);
+  companionImagesAll[page][key].data = image;
+  companionImagesAll[page][key].size = written;
   return true;
 }
 
@@ -2165,13 +2181,38 @@ void drawCompanionPageBar() {
   M5.Display.drawString(name, 160, 228);
 }
 
-void clearCompanionPageData() {
-  for (int i = 0; i < COMPANION_KEYS; ++i) {
-    companionLabels[i] = "Button " + String(i + 1);
-    companionColors[i] = 0x2945;
-    free(companionImages[i].data);
-    companionImages[i] = {};
+void clearCompanionPageData(int page = -1) {
+  for (int pg = 0; pg < COMPANION_PAGE_COUNT; ++pg) {
+    if (page >= 0 && pg != page) continue;
+    for (int i = 0; i < COMPANION_KEYS; ++i) {
+      companionLabelsAll[pg][i] = "Button " + String(i + 1);
+      companionColorsAll[pg][i] = 0x2945;
+      free(companionImagesAll[pg][i].data);
+      companionImagesAll[pg][i] = {};
+    }
   }
+}
+
+// All pages use the same remote Companion URL and no local host: one connection carries all four satellites.
+bool companionSharedLink() {
+  static uint32_t checkedAt = 0;
+  static bool shared = false;
+  if (millis() - checkedAt < 2000UL && checkedAt) return shared;
+  checkedAt = millis();
+  String url = companionInternetUrls[0]; url.trim();
+  bool ok = url.length() > 0;
+  for (int i = 0; i < COMPANION_PAGE_COUNT && ok; ++i) {
+    String u = companionInternetUrls[i]; u.trim();
+    if (companionHosts[i].length() || u != url) ok = false;
+  }
+  shared = ok;
+  return shared;
+}
+
+int companionPageForDevice(const String& id) {
+  int p = id.lastIndexOf("-p");
+  int n = p >= 0 ? id.substring(p + 2).toInt() : 0;
+  return (n >= 1 && n <= COMPANION_PAGE_COUNT) ? n - 1 : companionPage;
 }
 
 bool companionConnected() {
@@ -2182,7 +2223,7 @@ bool companionConnected() {
 
 void sendCompanionMessage(const String& message) {
   if (companionWebSocketMode) {
-    if (companionWebSocketConnected) { String payload = message; companionWebSocket.sendTXT(payload); }
+    if (companionWebSocketConnected && companionOutQueue) { String* m = new String(message); if (xQueueSend(companionOutQueue, &m, 0) != pdTRUE) delete m; }
   } else {
     CompLock lock;
     if (companionClient.connected()) companionClient.print(message);
@@ -2192,73 +2233,156 @@ void sendCompanionMessage(const String& message) {
 void stopCompanion() {
   companionPongSeen = false;
   { CompLock lock; companionClient.stop(); }
-  companionWebSocket.disconnect();
+  companionWsCmd = 2;                               // the WebSocket task closes its link
   companionWebSocketConnected = false;
   companionWebSocketMode = false;
   companionUsingInternet = false;
   companionRegistered = false;
+  companionAccepted = false;
+  companionPendingCount = 0;
 }
 
 void processCompanionLine(String line) {
   lastCompanionRx = millis();
   line.trim();
+  if (line.length() && line[0] == '\x01') {                  // connection marker from companionWsTask
+    companionRegistered = false;
+    if (screenNow == Screen::Companion) drawCompanionPageBar();
+    return;
+  }
+  if (line.startsWith("ADD-DEVICE OK")) {
+    companionAccepted = true;
+    // Key presses made while the link was still coming up: send the fresh ones now.
+    for (uint8_t i = 0; i < companionPendingCount; ++i)
+      if (millis() - companionPendingAt[i] < 2500UL) sendCompanionMessage(companionPendingPress[i]);
+    companionPendingCount = 0;
+    return;
+  }
   if (line.startsWith("PONG")) companionPongSeen = true;
   if (line.startsWith("PING ")) { sendCompanionMessage("PONG " + line.substring(5) + "\n"); return; }
   if (line.startsWith("BEGIN ")) {
+    Serial.printf("[companion +%u ms] BEGIN received\n", (unsigned)(millis() - companionPanelOpenedAt));
     uint64_t chip = ESP.getEfuseMac();
-    char id[17]; snprintf(id, sizeof(id), "%08lx-p%u", (unsigned long)(chip & 0xffffffff), companionPage + 1);
-    companionDeviceId = id;
-    String add = "ADD-DEVICE DEVICEID=" + String(id) + " SERIAL=core2:" + String(id) +
-      " PRODUCT_NAME=\"M5Stack Core2 Page " + String(companionPage + 1) +
-      "\" KEYS_TOTAL=6 KEYS_PER_ROW=3 BITMAPS=96 BITMAP_FORMAT=png COLORS=hex TEXT=true TEXT_STYLE=true BRIGHTNESS=false\n";
-    sendCompanionMessage(add);
+    // One link for all pages (shared Companion URL): register every page as its own satellite; otherwise only the open page.
+    bool all = companionSharedLink();
+    for (int pg = 0; pg < COMPANION_PAGE_COUNT; ++pg) {
+      if (!all && pg != companionPage) continue;
+      char id[17]; snprintf(id, sizeof(id), "%08lx-p%u", (unsigned long)(chip & 0xffffffff), pg + 1);
+      if (pg == companionPage) companionDeviceId = id;
+      String add = "ADD-DEVICE DEVICEID=" + String(id) + " SERIAL=core2:" + String(id) +
+        " PRODUCT_NAME=\"M5Stack Core2 Page " + String(pg + 1) +
+        "\" KEYS_TOTAL=6 KEYS_PER_ROW=3 BITMAPS=96 BITMAP_FORMAT=png COLORS=hex TEXT=true TEXT_STYLE=true BRIGHTNESS=false\n";
+      sendCompanionMessage(add);
+    }
     companionRegistered = true;
     if (screenNow == Screen::Companion) drawCompanionPageBar();
     return;
   }
   if (line.startsWith("KEYS-CLEAR")) {
+    int pg = companionPageForDevice(commandValue(line, "DEVICEID"));
     for (int i = 0; i < COMPANION_KEYS; ++i) {
-      companionLabels[i] = ""; companionColors[i] = TFT_BLACK;
-      free(companionImages[i].data); companionImages[i] = {};
+      companionLabelsAll[pg][i] = ""; companionColorsAll[pg][i] = TFT_BLACK;
+      free(companionImagesAll[pg][i].data); companionImagesAll[pg][i] = {};
     }
-    if (screenNow == Screen::Companion) drawCompanionButtons();
+    if (screenNow == Screen::Companion && pg == companionPage) drawCompanionButtons();
     return;
   }
   if (line.startsWith("KEY-STATE")) {
+    int pg = companionPageForDevice(commandValue(line, "DEVICEID"));
     int key = commandValue(line, "KEY").toInt();
     if (key >= 0 && key < COMPANION_KEYS) {
       String text64 = commandValue(line, "TEXT");
-      if (text64.length()) companionLabels[key] = decodeBase64Text(text64);
+      if (text64.length()) companionLabelsAll[pg][key] = decodeBase64Text(text64);
       String color = commandValue(line, "COLOR");
-      if (color.length()) companionColors[key] = rgbHexTo565(color);
+      if (color.length()) companionColorsAll[pg][key] = rgbHexTo565(color);
       String bitmap = commandValue(line, "BITMAP");
-      if (bitmap.length()) storeCompanionPng(key, bitmap);
-      if (screenNow == Screen::Companion) drawCompanionButton(key);
+      if (bitmap.length()) storeCompanionPng(key, bitmap, pg);
+      if (screenNow == Screen::Companion && pg == companionPage) drawCompanionButton(key);
     }
   }
 }
 
+// Runs inside companionWsTask. Anything that touches the UI goes through companionQueue to loop().
+static void companionPushLine(const String& line) {
+  if (!companionQueue) return;
+  String* m = new String(line);
+  for (int i = 0; i < 20; ++i) {
+    if (xQueueSend(companionQueue, &m, pdMS_TO_TICKS(50)) == pdTRUE) return;
+    if (!companionWebSocketMode) break;
+  }
+  delete m;
+}
+
 void onCompanionWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   if (type == WStype_CONNECTED) {
-    Serial.println("[companion] websocket connected");
+    Serial.printf("[companion +%u ms] websocket connected\n", (unsigned)(millis() - companionPanelOpenedAt));
     companionWebSocketConnected = true;
     companionRegistered = false;
-    if (screenNow == Screen::Companion) drawCompanionPageBar();
+    companionAccepted = false;
+    companionPushLine("\x01" "CONNECTED");
   } else if (type == WStype_DISCONNECTED) {
     Serial.printf("[companion] websocket disconnected (payload %u bytes: %.60s)\n", (unsigned)length, payload ? (const char*)payload : "");
     companionWebSocketConnected = false;
     companionRegistered = false;
-    if (screenNow == Screen::Companion) drawCompanionPageBar();
+    companionAccepted = false;
+    companionPushLine("\x01" "DISCONNECTED");
   } else if (type == WStype_TEXT && payload && length) {
     String incoming((char*)payload, length);
     int start = 0;
     while (start < (int)incoming.length()) {
       int end = incoming.indexOf('\n', start);
       if (end < 0) end = incoming.length();
-      if (end > start) processCompanionLine(incoming.substring(start, end));
+      if (end > start) {
+        String line = incoming.substring(start, end);
+        line.trim();
+        if (line.startsWith("PING ")) { String pong = "PONG " + line.substring(5) + "\n"; companionWebSocket.sendTXT(pong); }   // answered at once
+        else if (line.length()) companionPushLine(line);
+      }
       start = end + 1;
     }
   }
+}
+
+static void companionWsTask(void*) {
+  bool active = false;
+  uint32_t lastPing = 0;
+  for (;;) {
+    uint8_t cmd = companionWsCmd;
+    if (cmd) {
+      companionWsCmd = 0;
+      if (active) { companionWebSocket.disconnect(); active = false; }
+      if (cmd == 1) {
+        companionWebSocket.onEvent(onCompanionWebSocketEvent);
+        companionWebSocket.setReconnectInterval(3000);
+        companionWebSocket.enableHeartbeat(15000, 8000, 3);   // lenient: the app-level PING below is what Companion needs
+        if (companionWsSecure) companionWebSocket.beginSSL(companionWsHost.c_str(), companionWsPort, companionWsPath.c_str());
+        else companionWebSocket.begin(companionWsHost.c_str(), companionWsPort ? companionWsPort : 80, companionWsPath.c_str());
+        active = true;
+      }
+    }
+    String* m;
+    if (active && !netPaused) {
+      companionWebSocket.loop();                              // the TLS handshake blocks here, not in the UI thread
+      while (companionOutQueue && xQueueReceive(companionOutQueue, &m, 0) == pdTRUE) {
+        if (companionWebSocketConnected) companionWebSocket.sendTXT(*m);
+        delete m;
+      }
+      // Companion closes a satellite connection that stays silent for ~5 s: ping every 2 s.
+      if (companionWebSocketConnected && millis() - lastPing > 2000UL) { lastPing = millis(); String ping = "PING " + String(millis()) + "\n"; companionWebSocket.sendTXT(ping); }
+    } else {
+      while (companionOutQueue && xQueueReceive(companionOutQueue, &m, 0) == pdTRUE) delete m;
+    }
+    vTaskDelay(pdMS_TO_TICKS(active ? 2 : 20));
+  }
+}
+
+static void startCompanionWsTask() {
+  static bool started = false;
+  if (started) return;
+  started = true;
+  if (!companionQueue) companionQueue = xQueueCreate(16, sizeof(String*));
+  companionOutQueue = xQueueCreate(16, sizeof(String*));
+  xTaskCreatePinnedToCore(companionWsTask, "companionWs", 12288, nullptr, 1, nullptr, 1);
 }
 
 void beginCompanionTarget(String target, bool isInternet) {
@@ -2277,13 +2401,9 @@ void beginCompanionTarget(String target, bool isInternet) {
     int colon = host.lastIndexOf(':');
     uint16_t port = secure ? 443 : companionPorts[companionPage];
     if (colon > 0) { port = host.substring(colon + 1).toInt(); host = host.substring(0, colon); }
-    companionWebSocket.onEvent(onCompanionWebSocketEvent);
-    companionWebSocket.setReconnectInterval(3000);
-    // Ping every 15 s, allow 8 s for the pong, give up after 3 misses. The old 2 s / 1.5 s / 2 settings dropped the
-    // link every 3-4 s whenever loop() was busy for a moment or the Internet path was slow.
-    companionWebSocket.enableHeartbeat(15000, 8000, 3);
-    if (secure) companionWebSocket.beginSSL(host.c_str(), port, path.c_str());
-    else companionWebSocket.begin(host.c_str(), port ? port : 80, path.c_str());
+    companionWsHost = host; companionWsPath = path; companionWsPort = port; companionWsSecure = secure;
+    startCompanionWsTask();
+    companionWsCmd = 1;                                // the WebSocket task connects in the background
   } else {
     while (target.endsWith("/")) target.remove(target.length() - 1);
     CompLock lock;
@@ -2357,7 +2477,7 @@ void startCompanionTask() {
   static bool started = false;
   if (started) return;
   started = true;
-  companionQueue = xQueueCreate(16, sizeof(String*));
+  if (!companionQueue) companionQueue = xQueueCreate(16, sizeof(String*));
   xTaskCreatePinnedToCore(companionRxTask, "companion", 5120, nullptr, 1, nullptr, 1);
 }
 
@@ -2373,14 +2493,24 @@ void probeAndPreferLocalCompanion(uint32_t nowMs) {
 
 void showCompanion() {
   screenNow = Screen::Companion;
+  companionPanelOpenedAt = millis();
+  Serial.println("[companion +0 ms] panel opened");
   connectCompanion();
+  Serial.printf("[companion +%u ms] connectCompanion returned\n", (unsigned)(millis() - companionPanelOpenedAt));
   drawCompanionButtons();
+  Serial.printf("[companion +%u ms] first draw done\n", (unsigned)(millis() - companionPanelOpenedAt));
 }
 
 void changeCompanionPage(int direction) {
+  if (companionSharedLink()) {                         // one link serves every page: just show the other page's keys
+    companionPage = (companionPage + COMPANION_PAGE_COUNT + direction) % COMPANION_PAGE_COUNT;
+    drawCompanionButtons();
+    connectCompanion();                                // no-op while the link is up
+    return;
+  }
   stopCompanion();
   companionPage = (companionPage + COMPANION_PAGE_COUNT + direction) % COMPANION_PAGE_COUNT;
-  clearCompanionPageData();
+  clearCompanionPageData(companionPage);
   drawCompanionButtons();
   connectCompanion();
 }
@@ -8476,15 +8606,18 @@ void handleTouch() {
         bool longPress = companionCenterPressedAt && millis() - companionCenterPressedAt >= 700;
         companionCenterPressedAt = 0;
         if (longPress) {
-          stopCompanion();
+          if (!companionSharedLink()) stopCompanion();   // a shared link stays up in the background
           screenNow = Screen::Clock;
           drawClock(true); drawAstronaut();
         } else if (companionPage != 0) {
-          stopCompanion();
-          companionPage = 0;
-          clearCompanionPageData();
-          drawCompanionButtons();
-          connectCompanion();
+          if (companionSharedLink()) { companionPage = 0; drawCompanionButtons(); connectCompanion(); }
+          else {
+            stopCompanion();
+            companionPage = 0;
+            clearCompanionPageData(0);
+            drawCompanionButtons();
+            connectCompanion();
+          }
         }
       }
     }
@@ -8492,7 +8625,14 @@ void handleTouch() {
   }
   if (screenNow == Screen::Companion && t.y < 210 && (t.wasPressed() || t.wasReleased())) {
     int key = (t.y >= 105 ? 1 : 0) * COMPANION_COLS + min((int)COMPANION_COLS - 1, t.x / 106);
-    if (companionConnected()) sendCompanionMessage("KEY-PRESS DEVICEID=" + companionDeviceId + " KEY=" + String(key) + " PRESSED=" + (t.wasPressed() ? "true\n" : "false\n"));
+    uint64_t chip = ESP.getEfuseMac();
+    char devId[17]; snprintf(devId, sizeof(devId), "%08lx-p%u", (unsigned long)(chip & 0xffffffff), companionPage + 1);   // same id as in ADD-DEVICE
+    String press = "KEY-PRESS DEVICEID=" + String(devId) + " KEY=" + String(key) + " PRESSED=" + (t.wasPressed() ? "true\n" : "false\n");
+    if (companionConnected() && companionAccepted) sendCompanionMessage(press);
+    else if (companionPendingCount < 4) {              // link still coming up: send it as soon as Companion accepts the device
+      companionPendingPress[companionPendingCount] = press;
+      companionPendingAt[companionPendingCount++] = millis();
+    }
     if (t.wasPressed()) haptic(12);
     return;
   }
@@ -9169,7 +9309,7 @@ bool applyMqttSettings(const String& payload, String& error) {
   String nextSsid, nextPassword;
   if (!wifi.isNull() && wifi["ssid"].is<const char*>()) nextSsid = wifi["ssid"].as<const char*>();
   if (!wifi.isNull() && wifi["password"].is<const char*>()) nextPassword = wifi["password"].as<const char*>();
-  if (reconnectCompanion) { stopCompanion(); clearCompanionPageData(); }
+  if (reconnectCompanion) { stopCompanion(); clearCompanionPageData(); }   // all pages
   saveSettings(); mqttSettingsDirty = true;
   syncTime();
   m5::rtc_datetime_t brightnessNow; getClockDateTime(&brightnessNow); applyDisplayBrightness(brightnessNow);
@@ -10295,6 +10435,7 @@ static void* tlsCalloc(size_t n, size_t size) {
 static void tlsFree(void* p) { heap_caps_free(p); }
 
 void setup() {
+  clearCompanionPageData();   // default labels for every page
   auto cfg = M5.config();
   cfg.internal_spk = true; cfg.internal_mic = true; cfg.internal_rtc = true; cfg.internal_imu = true;
   M5.begin(cfg);
@@ -10520,32 +10661,28 @@ void loop() {
   M5.update();
   if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); sdRawPump(); }
   if (sdRawBusy) sdUploadPump(sdRawReceived, (int)sdRawTotal);
-  if (companionWebSocketMode) {
-    companionWebSocket.loop();
-    probeAndPreferLocalCompanion(millis());
-    // Companion closes a satellite connection that stays silent for ~5 s. The TCP link already pinged every
-    // 2 s but the WebSocket link never did, so it was dropped about 5.5 s after every connect.
-    static uint32_t lastWsPing = 0;
-    if (companionWebSocketConnected && millis() - lastWsPing > 2000UL) { lastWsPing = millis(); sendCompanionMessage("PING " + String(millis()) + "\n"); }
+  if (companionWebSocketMode) probeAndPreferLocalCompanion(millis());   // the socket itself runs in companionWsTask
+  {
+    // Lines and connection markers from the Companion tasks (TCP or WebSocket): process them on the UI thread.
+    String* msg;
+    while (companionQueue && xQueueReceive(companionQueue, &msg, 0) == pdTRUE) { processCompanionLine(*msg); delete msg; }
   }
   // The link is only kept while the Companion panel is on screen: leave the panel and the satellite goes offline
   // (TCP or WebSocket).
-  if (screenNow != Screen::Companion && (companionWebSocketMode || companionConnected())) { Serial.println("[companion] panel closed: disconnecting"); stopCompanion(); }
+  if (screenNow != Screen::Companion && !companionSharedLink() && (companionWebSocketMode || companionConnected())) { Serial.println("[companion] panel closed: disconnecting"); stopCompanion(); }
   if (!companionWebSocketMode) {
     // Lines read by companionRxTask (key images, labels, BEGIN ...): process them here, on the UI thread.
     static bool wasConnected = false;
     bool nowConnected = companionConnected();
     if (wasConnected && !nowConnected) Serial.println("[companion] link lost");
     wasConnected = nowConnected;
-    String* msg;
-    while (companionQueue && xQueueReceive(companionQueue, &msg, 0) == pdTRUE) { processCompanionLine(*msg); delete msg; }
     // Reconnect (only on the panel) with a growing pause.
-    if (screenNow == Screen::Companion && !companionConnected() && WiFi.status() == WL_CONNECTED && !netPaused && !wifiPaused) {
+    if ((screenNow == Screen::Companion || companionSharedLink()) && !companionConnected() && WiFi.status() == WL_CONNECTED && !netPaused && !wifiPaused) {
       static uint32_t lastTry = 0, wait = 2000;
       if (millis() - lastTry >= wait) {
         lastTry = millis();
         connectCompanion();
-        wait = companionConnected() ? 2000 : min<uint32_t>(wait * 2, 15000UL);   // 2 s, 4 s ... 15 s
+        wait = companionConnected() ? 2000 : min<uint32_t>(wait * 2, screenNow == Screen::Companion ? 15000UL : 60000UL);   // 2 s ... 15 s on the panel, 60 s in the background
       }
     }
   }
