@@ -1,7 +1,7 @@
 {
-  "version": "3.0.31",
+  "version": "3.0.35",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "a715d2b3815e12fca7efb1abe6648ee58af56b1cb6c7f8b6311dbeec99dab22e",
-  "size": 5963216,
-  "notes": "Listening mode refinements (speed/skip setting pages, speaker or Bluetooth with remembered headphones, smoother 2X playback), 16 px message text, steadier Companion link (kept only while its panel is open), Wi-Fi networks are remembered automatically, adjustable light-blue unread-message LED, no standby during web SD uploads, SD card drop-out recovery."
+  "sha256": "0836c4d53156ea32ed0370ac8935d672757904820c04839da11993cbba9226cd",
+  "size": 5967664,
+  "notes": "Companion: one shared link carries all four pages (instant page switching, kept in the background, no more drop-outs every few seconds), key presses are queued while connecting. Emotion observation no longer freezes the UI while submitting or loading records. Soft-blue unread-message LED with adjustable brightness, 2X playback and Bluetooth improvements, SD upload and card recovery fixes."
 }
