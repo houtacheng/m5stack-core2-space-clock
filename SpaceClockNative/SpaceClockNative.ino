@@ -16,6 +16,7 @@
 #include <ArduinoJson.h>
 #include <mp3dec.h>
 #include <functional>
+#include "adb_serial.h"   // from here on `Serial` also feeds the network log (AdbSerial)
 #include "listen_player.h"
 void showListen();
 void showMessageHub();
@@ -27,6 +28,8 @@ bool listenModeActive = false;
 size_t listenEnterThreshold = 256;   // malloc size from which PSRAM is preferred while listening (t:thr to experiment)
 void enterListenMode();
 void leaveListenMode();
+AdbSerialClass AdbSerial;
+String adbToken;                    // remote-debug token (see the /adb routes)
 WiFiServer sdRawServer(8081);       // fast SD upload endpoint (see sdRawPump)
 bool sdRawStarted = false;
 uint32_t sdWifiAwakeUntil = 0;             // the web SD page / an upload is in use: Wi-Fi power saving stays off
@@ -299,6 +302,7 @@ bool companionWebSocketConnected = false;
 bool companionUsingInternet = false;
 // The WebSocket link (Internet/WSS) is serviced by companionWsTask: the TLS handshake blocks for ~1.2 s and must
 // not freeze the UI. loop() talks to it through these: a command, the target, and an outgoing queue.
+TaskHandle_t companionRxTaskHandle = nullptr, companionWsTaskHandle = nullptr;   // for the /adb/info stack report
 QueueHandle_t companionOutQueue = nullptr;     // String* messages for the WebSocket task
 volatile uint8_t companionWsCmd = 0;           // 1 = (re)connect, 2 = disconnect
 String companionWsHost, companionWsPath;
@@ -1190,6 +1194,25 @@ void syncTime() {
   }
 }
 
+// At boot (before Wi-Fi/NTP) set the time zone rule and start the system clock from the RTC, which holds local
+// time. From then on DST changes happen on their own even when the clock never goes online.
+void seedSystemClockFromRtc() {
+  setenv("TZ", TIME_ZONES[timeZoneIndex].rule, 1);
+  tzset();
+  m5::rtc_datetime_t dt;
+  M5.Rtc.getDateTime(&dt);
+  if (dt.date.year < 2024 || dt.date.year > 2099) return;
+  struct tm t = {};
+  t.tm_year = dt.date.year - 1900; t.tm_mon = dt.date.month - 1; t.tm_mday = dt.date.date;
+  t.tm_hour = dt.time.hours; t.tm_min = dt.time.minutes; t.tm_sec = dt.time.seconds;
+  t.tm_isdst = -1;
+  time_t epoch = mktime(&t);
+  if (epoch < 1700000000) return;
+  struct timeval tv = {epoch, 0};
+  settimeofday(&tv, nullptr);
+  Serial.printf("[time] system clock set from the RTC: %04d-%02d-%02d %02d:%02d:%02d (%s)\n", dt.date.year, dt.date.month, dt.date.date, dt.time.hours, dt.time.minutes, dt.time.seconds, TIME_ZONES[timeZoneIndex].city);
+}
+
 // A new Core2's RTC holds garbage (e.g. weekDay 0xFF), which crashed the clock
 // face on first boot. Reset any impossible value to the firmware build date;
 // NTP corrects it once Wi-Fi connects.
@@ -1214,8 +1237,11 @@ void sanitizeRtcOnBoot() {
 }
 
 void getClockDateTime(m5::rtc_datetime_t* dt) {
+  // The system clock (NTP-set or seeded from the RTC at boot) follows the time zone rule including daylight
+  // saving, with or without Wi-Fi. Only an unset system clock falls back to the RTC.
   struct tm t;
-  if (WiFi.status() == WL_CONNECTED && getLocalTime(&t, 20)) {
+  time_t nowEpoch = time(nullptr);
+  if (nowEpoch > 1700000000 && localtime_r(&nowEpoch, &t)) {
     dt->date.year = t.tm_year + 1900;
     dt->date.month = t.tm_mon + 1;
     dt->date.date = t.tm_mday;
@@ -2382,7 +2408,7 @@ static void startCompanionWsTask() {
   started = true;
   if (!companionQueue) companionQueue = xQueueCreate(16, sizeof(String*));
   companionOutQueue = xQueueCreate(16, sizeof(String*));
-  xTaskCreatePinnedToCore(companionWsTask, "companionWs", 12288, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(companionWsTask, "companionWs", 6144, nullptr, 1, &companionWsTaskHandle, 1);
 }
 
 void beginCompanionTarget(String target, bool isInternet) {
@@ -2412,7 +2438,7 @@ void beginCompanionTarget(String target, bool isInternet) {
 }
 
 void connectCompanion() {
-  startCompanionTask();
+  { String localHost = companionHosts[companionPage]; localHost.trim(); if (localHost.length()) startCompanionTask(); }   // the TCP task (5 KB stack) only when a local host is used
   if (WiFi.status() != WL_CONNECTED || companionConnected()) return;
   if (!companionHosts[companionPage].length() && !companionInternetUrls[companionPage].length()) return;
   stopCompanion();
@@ -2478,7 +2504,7 @@ void startCompanionTask() {
   if (started) return;
   started = true;
   if (!companionQueue) companionQueue = xQueueCreate(16, sizeof(String*));
-  xTaskCreatePinnedToCore(companionRxTask, "companion", 5120, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(companionRxTask, "companion", 5120, nullptr, 1, &companionRxTaskHandle, 1);
 }
 
 void probeAndPreferLocalCompanion(uint32_t nowMs) {
@@ -8801,12 +8827,8 @@ void handleTouch() {
 // Serial self-test commands (for checking a clock that is away from home):
 //   t:cal  download the calendar      t:emo  check the emotion journal API
 //   t:sig  call the Signal bridge     t:net  print network/heap state
-void handleSerialConfig() {
-  static String line;
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c != '\n' && c != '\r') { if (line.length() < 160) line += c; continue; }
-    String cmd = line; line = "";
+// Runs one debug command ("t:..."), from the serial port or over the network (/adb/cmd).
+void runDebugCommand(const String& cmd) {
     uint32_t t0 = millis();
     if (cmd == "t:cal") {
       bool ok = fetchCalendar(calLocalMidnight(time(nullptr)));
@@ -8875,6 +8897,14 @@ void handleSerialConfig() {
       Serial.printf("[test] key %s\n", k.c_str());
     } else if (cmd == "t:nosaved") {                      // pretend no headphones are remembered (RAM only)
       lbt::hasSaved = false; Serial.println("[test] saved headphones ignored until reboot");
+    } else if (cmd.startsWith("t:time")) {
+      // t:time            -> print system epoch, local time and zone
+      // t:time <epoch>    -> set the system clock (UTC epoch) to test daylight saving changes
+      if (cmd.length() > 7) { struct timeval tv = {(time_t)cmd.substring(7).toInt(), 0}; settimeofday(&tv, nullptr); }
+      time_t e = time(nullptr); struct tm lt; localtime_r(&e, &lt);
+      char buf[64]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z (isdst %d)", &lt);
+      m5::rtc_datetime_t shown; getClockDateTime(&shown);
+      Serial.printf("[test] epoch %lld local %s | clock face %02u:%02u:%02u | rule %s | RTC %s\n", (long long)e, buf, shown.time.hours, shown.time.minutes, shown.time.seconds, TIME_ZONES[timeZoneIndex].rule, "(local, set at sync)");
     } else if (cmd == "t:enter") {
       showListen();
     } else if (cmd.startsWith("t:glyph ")) {
@@ -8948,6 +8978,15 @@ void handleSerialConfig() {
                     homeLanReachable, signalStatus.c_str(), signalMessageCount, calEventCount, hassAssistAuthenticated,
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
+}
+
+void handleSerialConfig() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') { if (line.length() < 160) line += c; continue; }
+    String cmd = line; line = "";
+    runDebugCommand(cmd);
   }
 }
 
@@ -9648,6 +9687,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     }
   } else if (pageId == "firmware") {
     page += "<h2>" + tr("Firmware update", "韌體更新") + "</h2><p class='muted'>" + tr("Current version", "目前版本") + ": <b>" SPACE_CLOCK_VERSION "</b></p><a class='btn secondary' href='/update'>" + tr("Open wireless firmware update", "開啟無線韌體更新") + "</a>";
+    page += "<h2>" + tr("Remote debugging", "遠端除錯") + "</h2><p class='muted'>" + tr("Read the status and log, run test commands and take screenshots over the network (like adb). Token", "透過網路讀取狀態與記錄、執行測試指令、擷取螢幕畫面（類似 adb）。權杖") + ": <b><code>" + adbToken + "</code></b><br><code>python3 tools/clockctl.py " + WiFi.localIP().toString() + " --token " + adbToken + " info</code></p>";
     page += "<h2>" + tr("Automatic update", "自動更新") + "</h2><label class='check'><input type='checkbox' name='fwAuto'" + String(automaticFirmwareUpdate ? " checked" : "") + ">" + tr("Automatically install new firmware from GitHub", "從 GitHub 自動安裝新韌體") + "</label><label class='field'>" + tr("Daily check hour", "每日檢查時間") + "<select name='fwHour'>";
     for (int hour = 0; hour < 24; ++hour) { char label[7]; snprintf(label, sizeof(label), "%02d:00", hour); page += "<option value='" + String(hour) + "'" + (firmwareCheckHour == hour ? " selected" : "") + ">" + label + "</option>"; }
     page += "</select></label><p class='muted'>" + tr("If an update is available, the device downloads it and restarts automatically. Keep it powered and connected to Wi-Fi.", "發現更新時裝置會自動下載並重新啟動。請保持供電並連接 Wi-Fi。") + "</p>";
@@ -10068,9 +10108,126 @@ void setupSdWebRoutes() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Network debug interface (ADB-like): /adb/info, /adb/log, /adb/cmd, /adb/shot, /adb/reboot. Every call needs
+// the token (shown on the Firmware page of the settings and printed at boot). Use tools/clockctl.py.
+// ---------------------------------------------------------------------------
+bool adbAuthOk() {
+  if (adbToken.length() && settingsServer.arg("token") == adbToken) return true;
+  settingsServer.send(403, "text/plain", "missing or wrong token (see the Firmware page of the settings)\n");
+  return false;
+}
+
+void adbSendInfo() {
+  JsonDocument doc;
+  doc["version"] = SPACE_CLOCK_VERSION;
+  doc["uptime_s"] = millis() / 1000;
+  doc["reset_reason"] = (int)esp_reset_reason();
+  JsonObject mem = doc["memory"].to<JsonObject>();
+  mem["internal_free"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  mem["internal_min_free"] = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+  mem["internal_largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  mem["psram_free"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  doc["cpu_mhz"] = getCpuFrequencyMhz();
+  JsonObject wifi = doc["wifi"].to<JsonObject>();
+  wifi["connected"] = WiFi.status() == WL_CONNECTED;
+  wifi["ssid"] = WiFi.SSID(); wifi["rssi"] = WiFi.RSSI(); wifi["ip"] = WiFi.localIP().toString(); wifi["mac"] = WiFi.macAddress();
+  wifi["paused"] = (bool)wifiPaused;
+  JsonObject bat = doc["battery"].to<JsonObject>();
+  bat["percent"] = (int)M5.Power.getBatteryLevel(); bat["mv"] = (int)M5.Power.getBatteryVoltage();
+  bat["charging"] = (bool)M5.Power.isCharging(); bat["vbus_mv"] = (int)M5.Power.getVBUSVoltage(); bat["saver"] = powerSaveMode;
+  doc["screen"] = (int)screenNow;
+  doc["screen_sleeping"] = screenSleeping;
+  m5::rtc_datetime_t now; getClockDateTime(&now);
+  char clockText[40]; snprintf(clockText, sizeof(clockText), "%04u-%02u-%02u %02u:%02u:%02u", now.date.year, now.date.month, now.date.date, now.time.hours, now.time.minutes, now.time.seconds);
+  doc["clock"] = clockText; doc["timezone"] = TIME_ZONES[timeZoneIndex].city; doc["tz_rule"] = TIME_ZONES[timeZoneIndex].rule;
+  doc["epoch"] = (uint32_t)time(nullptr);
+  JsonObject listenInfo = doc["listen"].to<JsonObject>();
+  listenInfo["mode_active"] = listenModeActive; listenInfo["playing"] = listen::playing; listenInfo["paused"] = listen::paused;
+  listenInfo["sd_mounted"] = listen::sdMounted; listenInfo["bt_connected"] = lbt::connected(); listenInfo["bt_saved"] = lbt::hasSaved; listenInfo["speaker_mode"] = lbt::speakerMode;
+  JsonObject net = doc["services"].to<JsonObject>();
+  net["mqtt"] = mqttClient.connected(); net["companion"] = companionConnected(); net["companion_shared_link"] = companionSharedLink();
+  net["home_lan"] = homeLanReachable; net["hass"] = hassAssistAuthenticated;
+  doc["unread_messages"] = signalUnread;
+  doc["emotion_pending"] = emotionPendingCount;
+  doc["tasks"] = uxTaskGetNumberOfTasks();
+  JsonObject stacks = doc["stack_bytes_never_used"].to<JsonObject>();   // lowest free stack seen per task
+  stacks["loop"] = uxTaskGetStackHighWaterMark(nullptr);
+  if (companionWsTaskHandle) stacks["companion_ws"] = uxTaskGetStackHighWaterMark(companionWsTaskHandle);
+  if (companionRxTaskHandle) stacks["companion_tcp"] = uxTaskGetStackHighWaterMark(companionRxTaskHandle);
+  String out; serializeJsonPretty(doc, out);
+  settingsServer.send(200, "application/json", out + "\n");
+}
+
+void adbSendLog() {
+  uint32_t from = (uint32_t)settingsServer.arg("from").toInt(), next = 0;
+  static char* chunk = nullptr;
+  if (!chunk) chunk = (char*)ps_malloc(8193);
+  if (!chunk) { settingsServer.send(500, "text/plain", "no memory\n"); return; }
+  if (!settingsServer.hasArg("from")) from = AdbSerial.position() > 4096 ? AdbSerial.position() - 4096 : 0;   // default: the last 4 KB
+  size_t n = AdbSerial.copyFrom(from, chunk, 8192, next);
+  chunk[n] = 0;
+  settingsServer.sendHeader("X-Next", String(next));
+  settingsServer.send(200, "text/plain; charset=utf-8", String(chunk));
+}
+
+void adbRunCommand() {
+  String cmd = settingsServer.hasArg("cmd") ? settingsServer.arg("cmd") : settingsServer.arg("plain");
+  cmd.trim();
+  if (!cmd.length() || cmd.length() > 160) { settingsServer.send(400, "text/plain", "send the command in the 'cmd' field\n"); return; }
+  uint32_t from = AdbSerial.position(), next = 0;
+  runDebugCommand(cmd);
+  static char* chunk = nullptr;
+  if (!chunk) chunk = (char*)ps_malloc(8193);
+  if (!chunk) { settingsServer.send(200, "text/plain", "ok (no memory for the output)\n"); return; }
+  size_t n = AdbSerial.copyFrom(from, chunk, 8192, next);
+  chunk[n] = 0;
+  settingsServer.send(200, "text/plain; charset=utf-8", String(chunk));
+}
+
+// The screen as a 24-bit BMP (320 x 240).
+void adbSendScreenshot() {
+  const int w = M5.Display.width(), h = M5.Display.height();
+  const uint32_t rowBytes = ((w * 3 + 3) / 4) * 4, imageBytes = rowBytes * h;
+  uint8_t header[54] = {'B', 'M'};
+  uint32_t fileSize = 54 + imageBytes, offset = 54, dib = 40;
+  memcpy(header + 2, &fileSize, 4); memcpy(header + 10, &offset, 4); memcpy(header + 14, &dib, 4);
+  int32_t bw = w, bh = h; uint16_t planes = 1, bpp = 24;
+  memcpy(header + 18, &bw, 4); memcpy(header + 22, &bh, 4); memcpy(header + 26, &planes, 2); memcpy(header + 28, &bpp, 2);
+  memcpy(header + 34, &imageBytes, 4);
+  uint8_t* row = (uint8_t*)malloc(rowBytes);
+  uint8_t* rgb = (uint8_t*)malloc(w * 3);
+  if (!row || !rgb) { free(row); free(rgb); settingsServer.send(500, "text/plain", "no memory\n"); return; }
+  settingsServer.setContentLength(fileSize);
+  settingsServer.send(200, "image/bmp", "");
+  WiFiClient client = settingsServer.client();
+  client.write(header, 54);
+  for (int y = h - 1; y >= 0; --y) {                       // BMP rows run bottom-up
+    M5.Display.readRectRGB(0, y, w, 1, rgb);
+    memset(row, 0, rowBytes);
+    for (int x = 0; x < w; ++x) { row[x * 3] = rgb[x * 3 + 2]; row[x * 3 + 1] = rgb[x * 3 + 1]; row[x * 3 + 2] = rgb[x * 3]; }
+    client.write(row, rowBytes);
+  }
+  free(row); free(rgb);
+}
+
+void setupAdbRoutes() {
+  settingsServer.on("/adb/info", HTTP_GET, []() { if (adbAuthOk()) adbSendInfo(); });
+  settingsServer.on("/adb/log", HTTP_GET, []() { if (adbAuthOk()) adbSendLog(); });
+  settingsServer.on("/adb/cmd", HTTP_POST, []() { if (adbAuthOk()) adbRunCommand(); });
+  settingsServer.on("/adb/shot", HTTP_GET, []() { if (adbAuthOk()) adbSendScreenshot(); });
+  settingsServer.on("/adb/reboot", HTTP_POST, []() {
+    if (!adbAuthOk()) return;
+    settingsServer.send(200, "text/plain", "rebooting\n");
+    delay(300);
+    ESP.restart();
+  });
+}
+
 void setupSettingsServer() {
   settingsServer.on("/", HTTP_GET, []() { sendSettingsPage(); });
   setupSdWebRoutes();
+  setupAdbRoutes();
   settingsServer.on("/hass-status", HTTP_GET, []() { sendHassAssistStatus(); });
   settingsServer.on("/mqtt-guide", HTTP_GET, []() {
     settingsServer.send_P(200, "text/html; charset=utf-8", MQTT_GUIDE_HTML);
@@ -10483,6 +10640,17 @@ void setup() {
   }
   Serial.printf("[display] Matrix canvas: %s (%d bpp)\n", matrixCanvasReady ? "ready" : "FAILED", matrixCanvas.getColorDepth());
   loadSettings();
+  {
+    Preferences adbPrefs;
+    adbPrefs.begin("spaceclock", false);
+    adbToken = adbPrefs.getString("adbTok", "");
+    if (adbToken.length() < 8) {
+      char tok[17]; snprintf(tok, sizeof(tok), "%08x%08x", (unsigned)esp_random(), (unsigned)esp_random());
+      adbToken = tok;
+      adbPrefs.putString("adbTok", adbToken);
+    }
+    adbPrefs.end();
+  }
   if (!netMutex) netMutex = xSemaphoreCreateRecursiveMutex();
   mbedtls_platform_set_calloc_free(tlsCalloc, tlsFree);
   pendingMutex = xSemaphoreCreateMutex();
@@ -10501,6 +10669,7 @@ void setup() {
                   (unsigned)nvs.used_entries, (unsigned)nvs.free_entries, (unsigned)nvs.total_entries, profiles);
   }
   sanitizeRtcOnBoot();
+  seedSystemClockFromRtc();
   lastUserActivity = millis();
   m5::rtc_datetime_t startupTime; getClockDateTime(&startupTime); applyDisplayBrightness(startupTime);
   WiFi.mode(WIFI_STA); applyNetworkHostname(); WiFi.setAutoReconnect(true); WiFi.setSleep(true); WiFi.begin();
