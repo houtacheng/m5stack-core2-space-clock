@@ -90,6 +90,8 @@ static constexpr int SIGNAL_MAX_MESSAGES = 500;
 int signalMessageCount = 0;
 uint32_t signalLastId = 0;
 uint16_t signalUnread = 0;
+bool teamsLoginChanged = false;         // redraw the message hub when it flips
+bool teamsNeedsLogin = false;          // the bridge says Teams is set up but signed out (shown on the message hub)
 bool signalFirstPollDone = false;
 bool signalUsePublic = false;
 uint32_t signalLastPollAt = 0;
@@ -6574,6 +6576,14 @@ void pollSignalMessages(uint32_t nowMs) {
     String nextStatus = signalUsePublic ? "外網連線" : "內網連線";
     if (nextStatus != signalStatus) Serial.printf("[signal] connected via %s\n", signalUsePublic ? "public (Cloudflare)" : "LAN");
     signalStatus = nextStatus;
+    if (doc["teams"]["state"].is<const char*>()) {   // older bridges do not report it: leave the notice as it is
+      bool needsLogin = doc["teams"]["state"] == "login";
+      if (needsLogin != teamsNeedsLogin) {
+        teamsNeedsLogin = needsLogin;
+        Serial.printf("[signal] Teams %s\n", needsLogin ? "needs a new sign-in (bridge)" : "signed in");
+        teamsLoginChanged = true;
+      }
+    }
     if (doc["unread"].is<JsonArray>()) {
       // Shared read state: anything read on another clock, phone or desktop
       // is no longer in this list.
@@ -6853,7 +6863,16 @@ void drawMessageHubTile(int x, bool teams) {
   useUIMediumFont();
   M5.Display.setTextDatum(middle_center);
   M5.Display.setTextColor(calTheme.text, calTheme.panel);
-  M5.Display.drawString(teams ? "Teams" : "Signal", cx, y + 118);
+  bool relogin = teams && teamsNeedsLogin;
+  M5.Display.drawString(teams ? "Teams" : "Signal", cx, relogin ? y + 108 : y + 118);
+  if (relogin) {                                       // signed out: say so right on the tile
+    useUIFont(1);
+    M5.Display.setTextColor(0xFD20, calTheme.panel);
+    M5.Display.drawString("需重新登入", cx, y + 134);
+    M5.Display.fillCircle(cx + 28, cy - 28, 11, 0xFD20);    // warning badge on the logo
+    M5.Display.fillRect(cx + 27, cy - 34, 3, 9, TFT_BLACK);
+    M5.Display.fillRect(cx + 27, cy - 23, 3, 3, TFT_BLACK);
+  }
   int unread = messageUnreadFor(teams);
   if (unread) {
     M5.Display.fillRoundRect(x + w - 44, y + 8, 36, 22, 11, 0xFD20);
@@ -8897,6 +8916,11 @@ void runDebugCommand(const String& cmd) {
       Serial.printf("[test] key %s\n", k.c_str());
     } else if (cmd == "t:nosaved") {                      // pretend no headphones are remembered (RAM only)
       lbt::hasSaved = false; Serial.println("[test] saved headphones ignored until reboot");
+    } else if (cmd.startsWith("t:teams")) {
+      // t:teams 1|0 -> pretend the bridge says Teams needs a new sign-in (or not) and open the message hub
+      teamsNeedsLogin = cmd.length() > 8 && cmd[8] == '1';
+      showMessageHub();
+      Serial.printf("[test] Teams re-login notice %s\n", teamsNeedsLogin ? "on" : "off");
     } else if (cmd.startsWith("t:time")) {
       // t:time            -> print system epoch, local time and zone
       // t:time <epoch>    -> set the system clock (UTC epoch) to test daylight saving changes
@@ -9687,7 +9711,7 @@ void sendSettingsPage(const String& message = "", const String& requestedPage = 
     }
   } else if (pageId == "firmware") {
     page += "<h2>" + tr("Firmware update", "韌體更新") + "</h2><p class='muted'>" + tr("Current version", "目前版本") + ": <b>" SPACE_CLOCK_VERSION "</b></p><a class='btn secondary' href='/update'>" + tr("Open wireless firmware update", "開啟無線韌體更新") + "</a>";
-    page += "<h2>" + tr("Remote debugging", "遠端除錯") + "</h2><p class='muted'>" + tr("Read the status and log, run test commands and take screenshots over the network (like adb). Token", "透過網路讀取狀態與記錄、執行測試指令、擷取螢幕畫面（類似 adb）。權杖") + ": <b><code>" + adbToken + "</code></b><br><code>python3 tools/clockctl.py " + WiFi.localIP().toString() + " --token " + adbToken + " info</code></p>";
+    page += "<h2>" + tr("Remote debugging", "網路除錯") + "</h2><p class='muted'>" + tr("Read the status and log, run test commands and take screenshots over the network (like adb). Token", "透過網路讀取狀態與記錄、執行測試指令、讀取螢幕畫面（功能如同 adb）。權杖") + ": <b><code>" + adbToken + "</code></b><br><code>python3 tools/clockctl.py " + WiFi.localIP().toString() + " --token " + adbToken + " info</code></p>";
     page += "<h2>" + tr("Automatic update", "自動更新") + "</h2><label class='check'><input type='checkbox' name='fwAuto'" + String(automaticFirmwareUpdate ? " checked" : "") + ">" + tr("Automatically install new firmware from GitHub", "從 GitHub 自動安裝新韌體") + "</label><label class='field'>" + tr("Daily check hour", "每日檢查時間") + "<select name='fwHour'>";
     for (int hour = 0; hour < 24; ++hour) { char label[7]; snprintf(label, sizeof(label), "%02d:00", hour); page += "<option value='" + String(hour) + "'" + (firmwareCheckHour == hour ? " selected" : "") + ">" + label + "</option>"; }
     page += "</select></label><p class='muted'>" + tr("If an update is available, the device downloads it and restarts automatically. Keep it powered and connected to Wi-Fi.", "發現更新時裝置會自動下載並重新啟動。請保持供電並連接 Wi-Fi。") + "</p>";
@@ -10894,6 +10918,7 @@ void loop() {
   SLOW_SECTION("signal", pollSignalMessages(nowMs));
 
   if (emotionStatsDone) finishEmotionStatsFetch();
+  if (teamsLoginChanged) { teamsLoginChanged = false; if (screenNow == Screen::MessageHub && !screenSleeping) drawMessageHub(); }
   if (screenNow == Screen::EmotionObservation || screenNow == Screen::EmotionRecords || screenNow == Screen::EmotionSettings) {
     // The network work itself runs in the network task (maintainEmotionBackground); here only the redraws.
     bool redrawConnection = emotionRedrawNeeded;

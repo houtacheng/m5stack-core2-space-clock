@@ -623,7 +623,15 @@ class Handler(BaseHTTPRequestHandler):
                 unread = [m["id"] for m in messages if not m.get("read")]
                 latest = messages[-1]["id"] if messages else 0
                 out = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages if m["id"] > since][:100]
-            return self.send(200, {"latest": latest, "messages": out, "unread": unread})
+            # Teams sign-in state for the clocks: "off" (not set up), "login" (set up but signed out: the
+            # refresh token is missing or was rejected), "ok".
+            if not (config.get("teams_tenant") and config.get("teams_client")):
+                teams_login = "off"
+            elif not config.get("teams_refresh"):
+                teams_login = "login"
+            else:
+                teams_login = "ok"
+            return self.send(200, {"latest": latest, "messages": out, "unread": unread, "teams": {"state": teams_login}})
         if not self.is_local_admin():
             return self.send(403, {"error": "admin is LAN only"})
         if u.path == "/":
