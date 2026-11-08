@@ -29,6 +29,17 @@ size_t listenEnterThreshold = 256;   // malloc size from which PSRAM is preferre
 void enterListenMode();
 void leaveListenMode();
 AdbSerialClass AdbSerial;
+// Main-loop watchdog: loop() ticks loopHeartbeatMs; a small task restarts the clock if it stops for 30 s and writes
+// where it was stuck into RTC memory, which survives the restart (shown by /adb/info as previous_boot).
+volatile uint32_t loopHeartbeatMs = 0;
+volatile const char* loopSection = "loop";
+volatile int loopWatchdogHold = 0;           // > 0: a long blocking job is running on purpose (Wi-Fi portal ...)
+RTC_NOINIT_ATTR uint32_t rtcStallMagic;
+RTC_NOINIT_ATTR char rtcStallSection[40];
+RTC_NOINIT_ATTR uint32_t rtcStallUptimeS;
+RTC_NOINIT_ATTR uint32_t rtcStallFreeHeap;
+String previousStall;                        // what the previous run recorded before the watchdog restarted it
+bool externalPowerNow = true;                // USB/dock power or charging (Wi-Fi power saving stays off then)
 String adbToken;                    // remote-debug token (see the /adb routes)
 WiFiServer sdRawServer(8081);       // fast SD upload endpoint (see sdRawPump)
 bool sdRawStarted = false;
@@ -1301,6 +1312,7 @@ void updatePowerSaveMode(uint32_t nowMs) {
   if (nowMs - lastCheck >= 1000UL) {
     lastCheck = nowMs;
     bool external = M5.Power.getVBUSVoltage() >= 4000 || M5.Power.isCharging();
+    externalPowerNow = external;
     bool wanted = !external;
     if (wanted != candidate) { candidate = wanted; changedAt = nowMs; }
     if (candidate != powerSaveMode && nowMs - changedAt >= 3000UL) {
@@ -3855,6 +3867,7 @@ void showFirmwareUpdate() {
 }
 
 void drawFirmwareDownloadProgress(uint8_t percent, uint8_t attempt, uint8_t attempts, const char* label = "Downloading") {
+  loopHeartbeatMs = millis();   // a firmware download/upload is long but alive
   if (screenNow != Screen::FirmwareUpdate) return;
   percent = min((uint8_t)100, percent);
   String attemptText = attempts ? String(attempt) + "/" + String(attempts) : String("Web");
@@ -4208,7 +4221,10 @@ void runWifiPortal(bool automatic) {
   drawBottomBar("", "", "Back");
   // Non-blocking portal so the Back button works while waiting for a phone.
   wm.setConfigPortalBlocking(false);
+  ++loopWatchdogHold;                       // the portal blocks on purpose until it times out or is used
   wm.startConfigPortal(SPACE_CLOCK_WIFI_AP);
+  --loopWatchdogHold;
+  loopHeartbeatMs = millis();
   bool saved = false;
   uint32_t portalStartedAt = millis();
   while (millis() - portalStartedAt < 180000UL) {
@@ -6597,13 +6613,21 @@ void pollSignalMessages(uint32_t nowMs) {
       if (id <= signalLastId) continue;
       signalLastId = id;
       if (signalMessageCount == SIGNAL_MAX_MESSAGES) {
-        // Full: drop the oldest READ message; unread ones are never dropped.
-        int drop = 0;
-        while (drop < signalMessageCount && signalMessages[drop].unread) ++drop;
-        if (drop == signalMessageCount) drop = 0;
-        memmove(signalMessages + drop, signalMessages + drop + 1, sizeof(SignalMessage) * (signalMessageCount - drop - 1));
-        --signalMessageCount;
-        if (signalFullIndex >= drop) --signalFullIndex;
+        // Full: drop the oldest READ messages (unread ones are never dropped), 64 at a time. Each message is
+        // ~3.4 KB, so moving the whole list for every single new message froze the UI for ~0.4 s.
+        int dropped = 0, dst = 0, firstDropped = -1;
+        const int dropTarget = 64;
+        for (int i = 0; i < signalMessageCount; ++i) {
+          if (dropped < dropTarget && !signalMessages[i].unread) { if (firstDropped < 0) firstDropped = i; ++dropped; continue; }
+          if (dst != i) memcpy(&signalMessages[dst], &signalMessages[i], sizeof(SignalMessage));
+          ++dst;
+        }
+        if (!dropped) {                                  // everything unread: drop the very oldest
+          memmove(signalMessages, signalMessages + 1, sizeof(SignalMessage) * (signalMessageCount - 1));
+          dropped = 1; dst = signalMessageCount - 1; firstDropped = 0;
+        }
+        signalMessageCount = dst;
+        if (signalFullIndex >= firstDropped) signalFullIndex = max(-1, signalFullIndex - dropped);
       }
       SignalMessage& s = signalMessages[signalMessageCount++];
       s.id = id;
@@ -9459,7 +9483,9 @@ void maintainMqtt(uint32_t nowMs) {
   mqttClient.loop();
   if (mqttDiscoveryDirty) publishHomeAssistantDiscovery();
   if (mqttSettingsDirty) publishMqttSettings();
-  if(nowMs-lastMqttPublish >= mqttPublishGapMs) {
+  // The state changes every second only during a meditation countdown; otherwise 5 s is plenty (each publish blocks the UI for a moment).
+  uint32_t publishGap = max<uint32_t>(mqttPublishGapMs, meditationState == MeditationState::Running ? 1000UL : 5000UL);
+  if(nowMs-lastMqttPublish >= publishGap) {
     lastMqttPublish=nowMs;
     publishMqttState();
   }
@@ -9836,6 +9862,7 @@ void sdUploadFlush() {
 // The upload runs inside one handleClient() call, so loop() is not running:
 // keep the clock ticking and show the progress from here.
 void sdUploadPump(uint32_t received, int total = -1) {
+  loopHeartbeatMs = millis();
   static uint32_t last = 0;
   if (millis() - last < 900UL) return;
   last = millis();
@@ -10147,6 +10174,10 @@ void adbSendInfo() {
   doc["version"] = SPACE_CLOCK_VERSION;
   doc["uptime_s"] = millis() / 1000;
   doc["reset_reason"] = (int)esp_reset_reason();
+  doc["reset_reason_text"] = resetReasonText((int)esp_reset_reason());
+  if (previousStall.length()) doc["previous_boot_problem"] = previousStall;
+  doc["external_power"] = externalPowerNow;
+  doc["wifi_sleep"] = WiFi.getSleep();
   JsonObject mem = doc["memory"].to<JsonObject>();
   mem["internal_free"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   mem["internal_min_free"] = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
@@ -10332,6 +10363,7 @@ void setupSettingsServer() {
         if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) Update.printError(Serial);
       } else if (upload.status == UPLOAD_FILE_WRITE) {
         lastUserActivity = millis();
+        loopHeartbeatMs = millis();
         if (!Update.hasError() && Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial);
         int total = settingsServer.clientContentLength();
         int percent = total > 0 ? (int)min<uint64_t>(99, (uint64_t)upload.totalSize * 100ULL / (uint64_t)total) : 0;
@@ -10615,6 +10647,43 @@ static void* tlsCalloc(size_t n, size_t size) {
 }
 static void tlsFree(void* p) { heap_caps_free(p); }
 
+static void loopWatchdogTask(void*) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uint32_t beat = loopHeartbeatMs;
+    if (!beat || loopWatchdogHold > 0) continue;
+    if (millis() - beat > 30000UL) {
+      strncpy(rtcStallSection, (const char*)loopSection, sizeof(rtcStallSection) - 1);
+      rtcStallSection[sizeof(rtcStallSection) - 1] = 0;
+      rtcStallUptimeS = millis() / 1000;
+      rtcStallFreeHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+      rtcStallMagic = 0x57A11ED5;
+      Serial.printf("[watchdog] main loop stuck for 30 s in '%s': restarting\n", rtcStallSection);
+      delay(100);
+      esp_restart();
+    }
+  }
+}
+
+const char* resetReasonText(int r) {
+  switch (r) {
+    case 1: return "power on"; case 3: return "software restart"; case 4: return "panic (crash)"; case 5: return "interrupt watchdog";
+    case 6: return "task watchdog"; case 7: return "other watchdog"; case 8: return "deep sleep"; case 9: return "brown-out (power dip)";
+    default: return "other";
+  }
+}
+
+void reportPreviousBoot() {
+  int reason = (int)esp_reset_reason();
+  if (rtcStallMagic == 0x57A11ED5) {
+    previousStall = String("main loop was stuck in '") + rtcStallSection + "' after " + String(rtcStallUptimeS) + " s of uptime (free internal heap " + String(rtcStallFreeHeap) + " bytes); restarted by the watchdog";
+    rtcStallMagic = 0;
+  } else if (reason == 4 || reason == 5 || reason == 6 || reason == 7 || reason == 9) {
+    previousStall = String("restarted after: ") + resetReasonText(reason);
+  }
+  Serial.printf("[boot] reset reason: %s%s%s\n", resetReasonText(reason), previousStall.length() ? " - " : "", previousStall.c_str());
+}
+
 void setup() {
   clearCompanionPageData();   // default labels for every page
   auto cfg = M5.config();
@@ -10694,6 +10763,9 @@ void setup() {
   }
   sanitizeRtcOnBoot();
   seedSystemClockFromRtc();
+  reportPreviousBoot();
+  loopHeartbeatMs = millis();
+  xTaskCreatePinnedToCore(loopWatchdogTask, "loopWatchdog", 3072, nullptr, 6, nullptr, 0);
   lastUserActivity = millis();
   m5::rtc_datetime_t startupTime; getClockDateTime(&startupTime); applyDisplayBrightness(startupTime);
   WiFi.mode(WIFI_STA); applyNetworkHostname(); WiFi.setAutoReconnect(true); WiFi.setSleep(true); WiFi.begin();
@@ -10703,7 +10775,7 @@ void setup() {
 }
 
 // Report any loop section that blocks the UI for more than 300 ms.
-#define SLOW_SECTION(name, code) do { uint32_t _t0 = millis(); code; uint32_t _dt = millis() - _t0; \
+#define SLOW_SECTION(name, code) do { loopSection = name; uint32_t _t0 = millis(); code; loopSection = "loop"; uint32_t _dt = millis() - _t0; \
   if (_dt > 300) Serial.printf("[slow] %s took %lu ms rssi %d\n", name, (unsigned long)_dt, WiFi.RSSI()); } while (0)
 
 // Is the home network reachable? Try the Home Assistant / MQTT host briefly.
@@ -10851,6 +10923,8 @@ void leaveListenMode() {
 }
 
 void loop() {
+  loopHeartbeatMs = millis();
+  loopSection = "loop";
   M5.update();
   if (WiFi.status() == WL_CONNECTED) { settingsServer.handleClient(); sdRawPump(); }
   if (sdRawBusy) sdUploadPump(sdRawReceived, (int)sdRawTotal);
@@ -10880,13 +10954,13 @@ void loop() {
     }
   }
   {
-    // Wi-Fi modem sleep adds up to ~300 ms of delay and drops idle links: keep it off while the Companion panel is open.
-    static bool companionAwake = false;
-    bool want = screenNow == Screen::Companion && !screenSleeping;
-    if (want != companionAwake) {
-      companionAwake = want;
-      if (want) WiFi.setSleep(false);
-      else if (!sdWebActive(millis())) WiFi.setSleep(true);
+    // Wi-Fi modem sleep makes every request 100-800 ms slower (MQTT, messages, Companion): keep the radio awake whenever
+    // the clock has external power, a web upload is running or the Companion panel is open; sleep only on battery.
+    static uint32_t lastCheck = 0;
+    if (millis() - lastCheck >= 1000UL) {
+      lastCheck = millis();
+      bool sleepWanted = !(externalPowerNow || sdWebActive(millis()) || (screenNow == Screen::Companion && !screenSleeping));
+      if (!wifiPaused && WiFi.status() == WL_CONNECTED && WiFi.getSleep() != sleepWanted) WiFi.setSleep(sleepWanted);
     }
   }
   handleTouch();

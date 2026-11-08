@@ -18,6 +18,7 @@ Commands
 import argparse
 import json
 import os
+import socket
 import struct
 import sys
 import time
@@ -172,7 +173,7 @@ def main():
             cmd_ota(clock, args.file)
     except urllib.error.HTTPError as e:
         sys.exit("HTTP %d: %s" % (e.code, e.read().decode("utf-8", "replace").strip()))
-    except (urllib.error.URLError, TimeoutError) as e:
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as e:
         sys.exit("cannot reach the clock: %s" % e)
     except KeyboardInterrupt:
         pass
