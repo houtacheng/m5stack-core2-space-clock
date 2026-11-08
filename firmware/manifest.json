@@ -1,7 +1,7 @@
 {
-  "version": "3.0.35",
+  "version": "3.0.44",
   "url": "https://raw.githubusercontent.com/houtacheng/m5stack-core2-space-clock/main/firmware/SpaceClockNative-OTA.bin",
-  "sha256": "0836c4d53156ea32ed0370ac8935d672757904820c04839da11993cbba9226cd",
-  "size": 5967664,
-  "notes": "Companion: one shared link carries all four pages (instant page switching, kept in the background, no more drop-outs every few seconds), key presses are queued while connecting. Emotion observation no longer freezes the UI while submitting or loading records. Soft-blue unread-message LED with adjustable brightness, 2X playback and Bluetooth improvements, SD upload and card recovery fixes."
+  "sha256": "0d474d7354292b33d7e54c7f032493769fdda480c3173450508c8962fcce6eab",
+  "size": 5990096,
+  "notes": "Network debug interface (tools/clockctl.py), automatic daylight saving also offline, Teams 'sign in again' notice on the message hub, main-loop watchdog with previous-boot report, Wi-Fi stays awake on external power, smoother message list and MQTT, steadier Companion (shared link for all pages), faster emotion observation, Wi-Fi networks remembered automatically."
 }
